@@ -1,13 +1,11 @@
-# Save.ps1 — one-command backup of your code to the remote (Bitbucket/GitHub).
+# Save.ps1 - one-command backup of your code to GitHub.
 #
 # Solo-user flow: single branch = master, direct commits (no PR / no merge).
+# Remote is already set to: git@github.com:vegadkamlesh/trading-dashboard.git
+#
 # Usage:
 #   .\Save.ps1                 -> commits with an auto message
 #   .\Save.ps1 "my message"    -> commits with your message
-#
-# First time only, set your remote (replace URL with your empty repo):
-#   git remote add origin https://bitbucket.org/<you>/trading-dashboard.git
-#   git push -u origin master
 #
 # After that, just run:  .\Save.ps1 "what changed"
 
@@ -42,16 +40,19 @@ if (-not (git status --porcelain)) {
 
 $remote = git remote
 if (-not $remote) {
-    Write-Host "`nNo remote configured yet. Add one, then run again:" -ForegroundColor Yellow
-    Write-Host "  git remote add origin https://bitbucket.org/<you>/trading-dashboard.git"
+    Write-Host ""
+    Write-Host "No remote configured yet. Add one, then run again:" -ForegroundColor Yellow
+    Write-Host "  git remote add origin git@github.com:vegadkamlesh/trading-dashboard.git"
     Write-Host "  git push -u origin master"
     exit 0
 }
 
 git push origin master
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "`nSaved & pushed to remote. ✅" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Saved and pushed to GitHub. OK" -ForegroundColor Green
 } else {
-    Write-Host "`nPush failed — check your remote URL / login." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Push failed - check your remote URL / login." -ForegroundColor Red
     exit 1
 }
