@@ -123,10 +123,30 @@ export function SettingsPanel() {
             <div className="mt-1 text-xs text-slate-400">
               Aapka public IP:{" "}
               <span className="font-mono text-sky-300">{ip?.detectedIp ?? "detecting…"}</span>
-              {" · "}
+            </div>
+            <div className="mt-0.5 text-xs text-slate-400">
+              Dhan aapko is IP se dekhta hai:{" "}
+              <span className="font-mono text-sky-300">{ip?.dhanSeenIp ?? "-"}</span>
+            </div>
+            <div className="mt-0.5 text-xs text-slate-400">
               Dhan par registered:{" "}
               <span className="font-mono text-slate-300">
                 {ip?.registered ? formatIp(ip.registered) : "-"}
+              </span>
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+              <span
+                className={
+                  "rounded px-2 py-0.5 font-bold " +
+                  (ip?.ordersAllowed
+                    ? "bg-green-500/20 text-green-300"
+                    : "bg-red-500/20 text-red-300")
+                }
+              >
+                ordersAllowed: {String(ip?.ordersAllowed ?? "?")}
+              </span>
+              <span className="rounded bg-slate-700/40 px-2 py-0.5 font-mono text-slate-300">
+                {ip?.ipMatchStatus ?? "-"}
               </span>
             </div>
             {ip?.match === false && (
@@ -135,8 +155,10 @@ export function SettingsPanel() {
                 "Invalid IP" aata hai. Neeche button dabao (ya Dhan web se Static IP set karo).
               </p>
             )}
-            {ip?.match === true && (
-              <p className="mt-1 text-xs text-green-400">✓ IP match ho raha hai.</p>
+            {ip?.match === true && ip?.ordersAllowed && (
+              <p className="mt-1 text-xs text-green-400">
+                ✓ IP match ho raha hai — orders allowed. Sab theek hai.
+              </p>
             )}
           </div>
           <button

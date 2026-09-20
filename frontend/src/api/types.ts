@@ -322,6 +322,10 @@ export interface IpStatus {
   registeredError: unknown;
   detectedIp: string | null;
   match: boolean | null;
+  // Direct verdict from Dhan's /ip/getIP response:
+  dhanSeenIp?: string | null;
+  ipMatchStatus?: string | null;
+  ordersAllowed?: boolean | null;
 }
 
 export interface AppSettings {
