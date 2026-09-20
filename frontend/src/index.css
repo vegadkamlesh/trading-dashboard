@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-950 text-slate-100 antialiased;
+}
+
+/* Thin scrollbars for dense tables */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 #0f172a;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-1 rounded-md px-3 py-1.5 text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-buy {
+    @apply btn bg-buy hover:bg-green-700 text-white;
+  }
+  .btn-sell {
+    @apply btn bg-sell hover:bg-red-700 text-white;
+  }
+  .btn-ghost {
+    @apply btn bg-slate-800 hover:bg-slate-700 text-slate-100;
+  }
+  .card {
+    @apply rounded-xl border border-slate-800 bg-panel p-4;
+  }
+  .input {
+    @apply w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm outline-none focus:border-sky-500;
+  }
+  .tab {
+    @apply px-3 py-1.5 rounded-md text-sm font-medium text-slate-300 hover:bg-slate-800 cursor-pointer;
+  }
+  .tab-active {
+    @apply bg-sky-600 text-white hover:bg-sky-600;
+  }
+  .code {
+    @apply rounded bg-slate-800 px-1 py-0.5 font-mono text-xs text-sky-300;
+  }
+}

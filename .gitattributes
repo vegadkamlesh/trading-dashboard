@@ -1,0 +1,20 @@
+# Normalise line endings: keep LF in the repo, convert to CRLF only for the
+# Windows launcher .bat files (so they keep working when checked out on Windows).
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.py  text eol=lf
+*.ts  text eol=lf
+*.tsx text eol=lf
+*.js  text eol=lf
+*.json text eol=lf
+*.md  text eol=lf
+
+# Treat these as binary (never try to merge/normalise).
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.ico binary
