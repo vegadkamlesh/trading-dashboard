@@ -108,6 +108,22 @@ class HistoryEngine:
             return None
         return study
 
+    def _empty(self, inst: IndexInstrument, option_type: str, strike_offset: str) -> ExpiryStudy:
+        """A neutral, empty study (no data yet) — safe fallback for hot paths."""
+        return ExpiryStudy(
+            index_key=inst.key,
+            option_type=option_type,
+            strike_offset=strike_offset,
+            contract_win_rate=None,
+            avg_intraday_gain_pct=None,
+            avg_intraday_drawdown_pct=None,
+            avg_close_vs_open_pct=None,
+            sample_days=0,
+            iv_avg=None,
+            spot_move_avg_pct=None,
+            error="not warmed yet",
+        )
+
     async def study(
         self,
         inst: IndexInstrument,
@@ -117,10 +133,17 @@ class HistoryEngine:
         lookback_days: int = 90,
         expiry_flag: str = "WEEK",
         force: bool = False,
+        cached_only: bool = False,
     ) -> ExpiryStudy:
         """Return (cached) empirical stats for an index/option strike.
 
         `option_type` is 'CALL' or 'PUT'. `lookback_days` bounded by MAX_STUDY_DAYS.
+
+        `cached_only=True` NEVER blocks on a network fetch: it returns the cached
+        study, else a neutral empty one. Use this on hot paths (recommender,
+        signal refresh) so they stay fast — the background warm-up primes the
+        cache. Use `cached_only=False` (default) for the on-demand History panel
+        and the explicit warm-up, which may pay the fetch cost.
         """
         option_type = option_type.upper()
         strike_offset = strike_offset.upper()
@@ -130,6 +153,9 @@ class HistoryEngine:
             hit = self.cached(inst.key, option_type, strike_offset, lookback_days)
             if hit is not None:
                 return hit
+
+        if cached_only:
+            return self._empty(inst, option_type, strike_offset)
 
         study = await self._compute(
             inst, option_type, strike_offset, lookback_days, expiry_flag
@@ -169,33 +195,37 @@ class HistoryEngine:
         total = 0
         err: Optional[str] = None
 
+        # NOTE: Dhan's /charts/rollingoption rejects expiryCode=0 ("required"),
+        # even for the near expiry. Valid values are 1..~4. We sample codes 1 & 2
+        # (near + next expiry) so we get more sessions per window.
         for start, end in chunks[-3:]:  # limit to last ~90 days worth of chunks
-            try:
-                raw = await client.get_rolling_expired_options(
-                    security_id=str(inst.sec_id),
-                    exchange_segment=seg,
-                    instrument="OPTIDX",
-                    interval="60",
-                    expiry_flag=expiry_flag,
-                    expiry_code=0,
-                    strike=strike_offset,
-                    drv_option_type=option_type,
-                    required_data=["open", "high", "low", "close", "iv", "spot", "volume"],
-                    from_date=start.strftime("%Y-%m-%d"),
-                    to_date=end.strftime("%Y-%m-%d"),
-                )
-            except DhanAPIError as exc:
-                err = exc.error_message
-                logger.warning("rollingoption failed: %s", exc)
-                continue
+            for expiry_code in (1, 2):
+                try:
+                    raw = await client.get_rolling_expired_options(
+                        security_id=str(inst.sec_id),
+                        exchange_segment=seg,
+                        instrument="OPTIDX",
+                        interval="60",
+                        expiry_flag=expiry_flag,
+                        expiry_code=expiry_code,
+                        strike=strike_offset,
+                        drv_option_type=option_type,
+                        required_data=["open", "high", "low", "close", "iv", "spot", "volume"],
+                        from_date=start.strftime("%Y-%m-%d"),
+                        to_date=end.strftime("%Y-%m-%d"),
+                    )
+                except DhanAPIError as exc:
+                    err = exc.error_message
+                    logger.warning("rollingoption failed (code=%s): %s", expiry_code, exc)
+                    continue
 
-            data = (raw or {}).get("data") or {}
-            leg = data.get("ce") if option_type == "CALL" else data.get("pe")
-            if not leg:
-                continue
-            self._accumulate(
-                leg, all_close_vs_open, all_gain, all_drawdown, all_iv, spot_moves
-            )
+                data = (raw or {}).get("data") or {}
+                leg = data.get("ce") if option_type == "CALL" else data.get("pe")
+                if not leg:
+                    continue
+                self._accumulate(
+                    leg, all_close_vs_open, all_gain, all_drawdown, all_iv, spot_moves
+                )
 
         # Win rate: fraction of sampled sessions where close-vs-open was positive.
         wins = sum(1 for x in all_close_vs_open if x > 0)

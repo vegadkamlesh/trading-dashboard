@@ -287,6 +287,14 @@ DHAN_ACCESS_TOKEN=eyJ...aapka-pura-token...`}</pre>
           Note: IP badal sakta hai (router restart / ISP change) — tab dobara register karo. Dhan web
           (My Profile ▸ Static IP) se bhi set kar sakte ho.
         </p>
+        <div className="mt-3 rounded border border-sky-500/30 bg-sky-500/10 p-3 text-[11px] text-sky-200">
+          <strong>Ye bug theek ho gaya ✅</strong> — asli problem ye thi ki aapka net{" "}
+          <strong>IPv4 + IPv6 dono</strong> use karta hai, aur app kabhi IPv6 se Dhan ko call kar deta
+          tha, jisse <em>ipMatchStatus: MISMATCH</em> aata tha (chahe IPv4 register ho). Ab app{" "}
+          <strong>hamesha IPv4 se hi baat karta hai</strong>, isliye registered IP se match ho jata
+          hai aur <em>ordersAllowed: true</em> milta hai. Kuch karne ki zaroorat nahi — apne aap sahi
+          ho gaya.
+        </div>
       </Section>
 
       {/* Advisor */}

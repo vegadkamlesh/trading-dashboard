@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, ApiError } from "../api/client";
 import type { OrderPreviewResponse, OptionRow } from "../api/types";
+import { useAuth } from "../hooks/useAuth";
 import { useToast } from "../hooks/useToasts";
 
 export interface TicketSeed {
@@ -22,6 +23,7 @@ export function OrderTicket({
   onClose: () => void;
 }) {
   const { push } = useToast();
+  const { fastOrders } = useAuth();
   const leg = seed.optionType === "CE" ? seed.row.ce : seed.row.pe;
   // Default the "ref" price to LTP (fallback ask/bid). This is just the
   // starting value — the trader edits the LIMIT price to whatever they want.
@@ -73,7 +75,8 @@ export function OrderTicket({
   }, [body]);
 
   const place = async () => {
-    if (!pin) {
+    // FAST ORDERS ON → PIN is skipped (backend also skips it); 1 click places.
+    if (!fastOrders && !pin) {
       push("error", "Enter your order confirm PIN");
       return;
     }
@@ -95,7 +98,7 @@ export function OrderTicket({
         const d = e.detail as { errorMessage?: string; hint?: string; detail?: string };
         // Special-case the IP error so the user knows exactly what to do.
         if ((d?.errorMessage || "").toLowerCase().includes("invalid ip")) {
-          push("error", "Invalid IP: your IP isn't whitelisted in Dhan. Go to Connection ▸ Register IP, then retry.");
+          push("error", "Invalid IP: Dhan ne aapka IP whitelist nahi dekha. Settings ▸ Register IP dabao aur phir retry karo.");
         } else {
           push("error", d?.errorMessage || d?.detail || "Order failed");
         }
@@ -263,20 +266,26 @@ export function OrderTicket({
           </div>
         )}
 
-        <div className="mt-4">
-          <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
-            Order Confirm PIN
-          </label>
-          <input
-            className="input font-mono"
-            type="password"
-            inputMode="numeric"
-            value={pin}
-            onChange={(e) => setPin(e.target.value)}
-            placeholder="••••••"
-            autoComplete="off"
-          />
-        </div>
+        {fastOrders ? (
+          <div className="mt-4 rounded border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-[11px] text-sky-300">
+            ⚡ FAST ORDERS ON — PIN skip. 1 click pe order chala jayega.
+          </div>
+        ) : (
+          <div className="mt-4">
+            <label className="mb-1 block text-xs uppercase tracking-wide text-slate-400">
+              Order Confirm PIN
+            </label>
+            <input
+              className="input font-mono"
+              type="password"
+              inputMode="numeric"
+              value={pin}
+              onChange={(e) => setPin(e.target.value)}
+              placeholder="••••••"
+              autoComplete="off"
+            />
+          </div>
+        )}
 
         <div className="mt-5 flex justify-end gap-2">
           <button className="btn-ghost" onClick={onClose} disabled={busy}>

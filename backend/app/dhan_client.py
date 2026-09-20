@@ -18,6 +18,7 @@ import datetime as _dt
 import logging
 import math
 import random
+import socket
 import time
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +31,29 @@ logger = logging.getLogger("dhan.client")
 BASE_URL = "https://api.dhan.co/v2"
 
 MOCK_TOKEN_PREFIX = "mock"
+
+# ---------------------------------------------------------------------------
+# Force IPv4 for ALL outbound calls.
+#
+# Why: Dhan whitelists ONE static IP for live orders. On dual-stack networks
+# (most Indian ISPs = IPv4 + IPv6), Python may egress over IPv6, so Dhan sees a
+# different source IP than the whitelisted IPv4 and blocks orders with
+# "Invalid IP" / ipMatchStatus: MISMATCH. Pinning every DNS lookup to AF_INET
+# guarantees we always reach Dhan from the whitelisted IPv4 address.
+# ---------------------------------------------------------------------------
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _ORIG_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+
+
+def enable_ipv4_only() -> None:
+    """Patch socket resolution to IPv4 only (idempotent)."""
+    if socket.getaddrinfo is not _ipv4_only_getaddrinfo:
+        socket.getaddrinfo = _ipv4_only_getaddrinfo
+        logger.info("Outbound connections pinned to IPv4 (Dhan static-IP safe)")
+
 
 # Endpoints that are heaviest on Dhan's rate limits. We serialise these through a
 # single global gate so that concurrent callers (guidance + seasonality +
@@ -76,6 +100,8 @@ class DhanClient:
     _last_heavy_at: float = 0.0
 
     def __init__(self, timeout: float = 15.0) -> None:
+        # Pin outbound traffic to IPv4 so Dhan always sees the whitelisted IP.
+        enable_ipv4_only()
         s = get_settings()
         self._client_id = s.dhan_client_id
         self._headers = {

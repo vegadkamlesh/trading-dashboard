@@ -35,8 +35,22 @@ async def login(response: Response):
     # Warm the daily-OHLC cache in the background (non-blocking) so predictions
     # and seasonality are instant on first open — the heavy historical pull
     # happens once, here, instead of on every signal refresh.
+    #
+    # The HEAVY history studies are primed in a SEPARATE, sequenced background
+    # task that runs only AFTER the fast daily-OHLC pull — so they never delay
+    # login or the first recommend call.
+    async def _warm_all() -> None:
+        try:
+            await marketdata.warm_up()
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("marketdata warm-up failed: %s", exc)
+        try:
+            await marketdata.prime_history_studies()
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.info("history study priming failed: %s", exc)
+
     try:
-        asyncio.create_task(marketdata.warm_up())
+        asyncio.create_task(_warm_all())
     except RuntimeError:  # pragma: no cover - already-running loop edge case
         logger.warning("could not schedule marketdata warm-up")
 

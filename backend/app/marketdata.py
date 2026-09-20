@@ -181,15 +181,23 @@ async def _warm_history_studies(inst: IndexInstrument) -> None:
             logger.info("history warm-up (%s/%s) failed: %s", inst.key, opt, exc)
 
 
+# History studies are the HEAVIEST warm-up item (each hits the 1.1s heavy gate).
+# We only prime the indices a user actually opens, and we do it as a BACKGROUND
+# task so login + the first recommend call are never stuck waiting on it.
+_HISTORY_WARM_INDICES = ("NIFTY", "SENSEX")
+
+
 async def warm_up(
     days: int = DEFAULT_LOOKBACK_DAYS, keys: Optional[List[str]] = None
 ) -> Dict[str, bool]:
-    """Pre-fetch daily OHLC (+ history studies) for the indices we poll.
+    """Pre-fetch daily OHLC for the indices we poll (fast, shared by all panels).
 
-    Called at login so the first prediction/second is instant. Defaults to
-    OC_POLLED_INDICES (usually NIFTY + SENSEX) to keep login snappy. Runs
-    sequentially through the throttled client so we never burst the API.
-    Safe to call multiple times (cached). Returns index -> success.
+    Called at login so the first prediction is instant. Runs sequentially through
+    the throttled client so we never burst the API. Safe to call multiple times
+    (cached). Returns index -> success.
+
+    NOTE: the heavy 5-yr history studies are primed SEPARATELY in the background
+    (see `prime_history_studies`) so they don't delay login/recommend.
     """
     wanted = {k.upper() for k in (keys or get_settings().oc_polled_indices)}
     targets = [i for i in INDEX_REGISTRY.values() if i.key.upper() in wanted] or list(
@@ -203,10 +211,24 @@ async def warm_up(
         except Exception as exc:  # pragma: no cover
             logger.warning("warm_up failed for %s: %s", inst.key, exc)
             results[inst.key] = False
-        # Also prime the history studies (best-effort, non-fatal).
-        await _warm_history_studies(inst)
     logger.info("marketdata warm-up complete: %s", results)
     return results
+
+
+async def prime_history_studies(keys: Optional[List[str]] = None) -> None:
+    """Prime the heavy 5-yr expired-option studies in the BACKGROUND.
+
+    Only NIFTY + SENSEX by default (what users actually open). Runs sequentially
+    so it shares the heavy-call gate politely with live requests. Best-effort.
+    """
+    wanted = {k.upper() for k in (keys or _HISTORY_WARM_INDICES)}
+    targets = [i for i in INDEX_REGISTRY.values() if i.key.upper() in wanted]
+    for inst in targets:
+        try:
+            await _warm_history_studies(inst)
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.info("history study warm-up failed for %s: %s", inst.key, exc)
+    logger.info("history studies primed for: %s", [t.key for t in targets])
 
 
 def cache_state() -> Dict[str, Any]:

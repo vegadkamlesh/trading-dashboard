@@ -119,11 +119,17 @@ async def recommend(
 
     # Shared, long-TTL daily-OHLC cache (warmed at login) → no per-refresh fetch.
     ohlc = await marketdata.get_daily_ohlc(inst, days=180)
-    # history win-rates (cached, cheap after first hit)
+    # History win-rates — CACHE-ONLY so this hot path never blocks on the heavy
+    # 5-yr rollingoption fetch. The background warm-up primes ATM studies; until
+    # then we simply proceed without the history weight (neutral).
     ce_win = pe_win = None
     try:
-        ce = await history_engine.study(inst, "CALL", "ATM", lookback_days=90)
-        pe = await history_engine.study(inst, "PUT", "ATM", lookback_days=90)
+        ce = await history_engine.study(
+            inst, "CALL", "ATM", lookback_days=90, cached_only=True
+        )
+        pe = await history_engine.study(
+            inst, "PUT", "ATM", lookback_days=90, cached_only=True
+        )
         ce_win = ce.contract_win_rate
         pe_win = pe.contract_win_rate
     except Exception:  # pragma: no cover - history is best-effort

@@ -58,11 +58,28 @@ async def ip_status(_session: str = Depends(require_session)):
     except DhanAPIError as exc:
         registered_err = exc.to_dict()
     detected = await client.detect_public_ip()
+
+    # Dhan tells us directly whether orders are allowed from this IP, and what
+    # IP IT sees us as (detectedIP). Prefer Dhan's own verdict over our guess.
+    orders_allowed = None
+    ip_match_status = None
+    dhan_seen_ip = None
+    if isinstance(registered, dict):
+        orders_allowed = registered.get("ordersAllowed")
+        ip_match_status = registered.get("ipMatchStatus")
+        dhan_seen_ip = registered.get("detectedIP")
+
     return {
         "registered": registered,
         "registeredError": registered_err,
         "detectedIp": detected,
-        "match": _ip_match(registered, detected),
+        "dhanSeenIp": dhan_seen_ip,
+        "ipMatchStatus": ip_match_status,
+        "ordersAllowed": orders_allowed,
+        # Dhan uses variants like "PRIMARY_MATCH" / "SECONDARY_MATCH".
+        "match": ("MATCH" in str(ip_match_status).upper())
+        if ip_match_status
+        else _ip_match(registered, detected),
     }
 
 
@@ -110,13 +127,40 @@ async def register_ip(
             payload={"ip": ip, "flag": flag},
         )
         raise HTTPException(status_code=502, detail=exc.to_dict())
+
+    # Dhan returns HTTP 200 even when the IP is rejected — read the real status.
+    dhan_status = str(result.get("status", "")).upper() if isinstance(result, dict) else ""
+    message = str(result.get("message", "")) if isinstance(result, dict) else ""
+    # "IP already added." is a benign success (the IP IS registered).
+    already = "already" in message.lower()
+    ok = dhan_status in ("SUCCESS", "") or already
+
     audit.log_order(
-        action="set_ip", success=True, dry_run=False,
-        status=str(result.get("status", "SUCCESS")) if isinstance(result, dict) else "SUCCESS",
-        message=f"Registered {flag} IP {ip}",
+        action="set_ip", success=ok, dry_run=False,
+        status=dhan_status or "SUCCESS",
+        message=f"{flag} IP {ip}: {message or dhan_status}",
         payload={"ip": ip, "flag": flag, "result": result},
     )
-    return {"ok": True, "ip": ip, "flag": flag, "result": result}
+
+    # Re-read the live verdict so the UI shows whether orders are now allowed.
+    verdict: Dict[str, Any] = {}
+    try:
+        verdict = await client.get_ip() or {}
+    except DhanAPIError:
+        verdict = {}
+
+    return {
+        "ok": ok,
+        "ip": ip,
+        "flag": flag,
+        "status": dhan_status,
+        "message": message,
+        "alreadyAdded": already,
+        "ordersAllowed": verdict.get("ordersAllowed"),
+        "ipMatchStatus": verdict.get("ipMatchStatus"),
+        "dhanSeenIp": verdict.get("detectedIP"),
+        "result": result,
+    }
 
 
 class SquareOffBody(BaseModel):
@@ -198,6 +242,7 @@ async def warm_cache(
 ):
     """Manually (re)warm the history cache — useful after a token/IP change."""
     result = await marketdata.warm_up()
+    await marketdata.prime_history_studies()
     return {"ok": True, "indices": result}
 
 

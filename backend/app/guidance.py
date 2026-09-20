@@ -190,7 +190,12 @@ async def advise(
     hist_up: Optional[float] = None
     hist_dict: Dict[str, Any] = {}
     if use_history:
-        study = await history_engine.study(inst, opt, "ATM", lookback_days=history_days)
+        # CACHE-ONLY: never block this (often-polled) advisor on the heavy 5-yr
+        # fetch. The background warm-up primes ATM studies; if not ready yet we
+        # simply proceed without the history weight.
+        study = await history_engine.study(
+            inst, opt, "ATM", lookback_days=history_days, cached_only=True
+        )
         hist_dict = study.to_dict()
         hist_win = study.contract_win_rate
         hist_up = study.avg_intraday_gain_pct
