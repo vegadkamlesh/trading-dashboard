@@ -23,14 +23,16 @@ class IndexInstrument:
 
 # Dhan index security IDs (IDX_I segment).
 # These are stable Dhan identifiers for the index value itself.
+# Lot sizes are set by the exchange and can change. Keep them current so the
+# order ticket's lot→units math is correct (quantity is entered in LOTS).
 INDEX_REGISTRY: Dict[str, IndexInstrument] = {
-    "NIFTY": IndexInstrument("NIFTY", "NIFTY 50", 13, lot_size=25),
-    "SENSEX": IndexInstrument("SENSEX", "SENSEX", 51, lot_size=10),
+    "NIFTY": IndexInstrument("NIFTY", "NIFTY 50", 13, lot_size=65),
+    "SENSEX": IndexInstrument("SENSEX", "SENSEX", 51, lot_size=20),
     # The following are included for convenience; only NIFTY & SENSEX are
     # polled by default (see OC_POLLED_INDICES).
-    "BANKNIFTY": IndexInstrument("BANKNIFTY", "BANK NIFTY", 25, lot_size=15),
-    "FINNIFTY": IndexInstrument("FINNIFTY", "FIN NIFTY", 27, lot_size=25),
-    "MIDCPNIFTY": IndexInstrument("MIDCPNIFTY", "MIDCAP NIFTY", 442, lot_size=50),
+    "BANKNIFTY": IndexInstrument("BANKNIFTY", "BANK NIFTY", 25, lot_size=30),
+    "FINNIFTY": IndexInstrument("FINNIFTY", "FIN NIFTY", 27, lot_size=60),
+    "MIDCPNIFTY": IndexInstrument("MIDCPNIFTY", "MIDCAP NIFTY", 442, lot_size=120),
 }
 
 

@@ -40,7 +40,7 @@ class OrderRequest:
     option_type: str          # CE | PE
     transaction_type: str     # BUY | SELL
     side: str                 # informational
-    quantity: int
+    quantity: int             # raw value as entered (LOTS, unless lots=False)
     price: float
     target_pct: float
     product_type: str = "INTRADAY"
@@ -53,6 +53,19 @@ class OrderRequest:
     no_stop_loss: bool = True
     # Optional user-specified stop distance (%). Ignored when no_stop_loss=True.
     stop_loss_pct: Optional[float] = None
+    # When True (default), `quantity` is interpreted as LOTS and multiplied by
+    # the index's lot size to get the exchange UNITS sent to Dhan. Set False to
+    # pass raw units through (e.g. square-off which already sends units).
+    lots: bool = True
+
+
+def units_for(req: OrderRequest) -> int:
+    """Exchange units = lots × lot size (or the raw quantity if lots=False)."""
+    if not req.lots:
+        return int(req.quantity)
+    inst = get_index(req.index_key)
+    lot_size = inst.lot_size if inst else 1
+    return int(req.quantity) * int(lot_size)
 
 
 def _round_tick(value: float, tick: float = 0.05) -> float:
@@ -114,7 +127,7 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
         "productType": req.product_type,
         "orderType": req.order_type,
         "securityId": str(req.security_id),
-        "quantity": int(req.quantity),
+        "quantity": units_for(req),
         "price": float(req.price),
         "targetPrice": float(target_price),
         "stopLossPrice": float(stop_loss_price),
@@ -125,11 +138,16 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
 def preview(req: OrderRequest) -> Dict[str, Any]:
     """What the confirm popup should display. No network call."""
     payload = build_super_order(req)
+    inst = get_index(req.index_key)
+    lot_size = inst.lot_size if inst else 1
     return {
         "index": req.index_key,
         "optionType": req.option_type,
         "side": req.side,
         "quantity": req.quantity,
+        "lots": req.quantity,
+        "lotSize": lot_size,
+        "units": payload["quantity"],
         "entryPrice": payload["price"],
         "targetPrice": payload["targetPrice"],
         "expectedProfitPerUnit": round(payload["targetPrice"] - payload["price"], 2)

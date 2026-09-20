@@ -91,6 +91,120 @@ def _ip_match(registered: Any, detected: Any) -> bool | None:
     return str(detected) in blob
 
 
+@router.get("/ip/diagnose")
+async def ip_diagnose(_session: str = Depends(require_session)):
+    """End-to-end IP diagnostic for the order path.
+
+    Dhan's /ip/getIP endpoint can report `PRIMARY_MATCH` + `ordersAllowed: true`
+    while the ORDER engine still rejects with DH-905 "Invalid IP" (a known
+    Dhan-side inconsistency where the two subsystems hold different IP records).
+
+    This probe compares BOTH: the getIP verdict AND a REAL (harmless) order
+    probe — an invalid securityId that Dhan rejects for a *different* reason
+    when the IP is accepted. If the probe comes back "Invalid IP", the problem
+    is on Dhan's side (their order engine's IP record is stale/corrupt), not
+    ours, and the fix is to remove & re-add the static IP from Dhan's website.
+    """
+    client = get_dhan_client()
+
+    # 1) What Dhan's IP endpoint says.
+    verdict: Dict[str, Any] = {}
+    err = None
+    try:
+        verdict = await client.get_ip() or {}
+    except DhanAPIError as exc:
+        err = exc.to_dict()
+
+    getip_ok = bool(verdict.get("ordersAllowed")) or "MATCH" in str(
+        verdict.get("ipMatchStatus", "")
+    ).upper()
+
+    # 2) What the ORDER engine actually does — a deliberately bad order. If the
+    #    IP is accepted, Dhan complains about the (bogus) securityId instead of
+    #    the IP. If it still says "Invalid IP", the IP is being rejected.
+    probe_ok: bool | None = None
+    probe_code: str | None = None
+    probe_message: str | None = None
+    try:
+        await client.place_order(
+            {
+                "dhanClientId": get_settings().dhan_client_id,
+                "transactionType": "BUY",
+                "exchangeSegment": "NSE_FNO",
+                "productType": "INTRADAY",
+                "orderType": "LIMIT",
+                "validity": "DAY",
+                "securityId": "0",  # bogus on purpose → never executes
+                "quantity": 1,
+                "price": 1,
+                "triggerPrice": 0,
+                "afterMarketOrder": False,
+            }
+        )
+        # If it somehow succeeds, the IP is definitely fine.
+        probe_ok = True
+    except DhanAPIError as exc:
+        probe_code = exc.error_code
+        probe_message = exc.error_message
+        # If the complaint is NOT about the IP, then the IP is accepted.
+        probe_ok = "invalid ip" not in (exc.error_message or "").lower()
+
+    return {
+        "getIpReports": {
+            "ordersAllowed": verdict.get("ordersAllowed"),
+            "ipMatchStatus": verdict.get("ipMatchStatus"),
+            "detectedIP": verdict.get("detectedIP"),
+            "primaryIP": verdict.get("primaryIP"),
+            "secondaryIP": verdict.get("secondaryIP"),
+            "modifyDatePrimary": verdict.get("modifyDatePrimary"),
+            "error": err,
+        },
+        "orderEngineProbe": {
+            "ipAccepted": probe_ok,
+            "errorCode": probe_code,
+            "errorMessage": probe_message,
+        },
+        # The real verdict: does the ORDER engine accept our IP?
+        "orderPathHealthy": probe_ok,
+        # A human-readable diagnosis for the UI.
+        "diagnosis": _diagnose(getip_ok, probe_ok, verdict),
+    }
+
+
+def _diagnose(getip_ok: bool, probe_ok: bool | None, verdict: Dict[str, Any]) -> Dict[str, Any]:
+    if probe_ok:
+        return {
+            "level": "ok",
+            "title": "IP sahi hai — orders chalenge",
+            "detail": "Dhan ke order engine ne aapka IP accept kar liya. Sab theek hai.",
+            "action": "",
+        }
+    if getip_ok and probe_ok is False:
+        mod = verdict.get("modifyDatePrimary")
+        return {
+            "level": "dhan-side",
+            "title": "Dhan ke side pe IP record kharab hai (getIP match, par order reject)",
+            "detail": (
+                "Dhan ka /ip/getIP endpoint keh raha hai IP theek hai "
+                f"(PRIMARY_MATCH, ordersAllowed=true, modifyDate={mod}), LEKIN order engine "
+                "DH-905 'Invalid IP' de raha hai. Matlab Dhan ke andar do subsystem alag IP record "
+                "rakhte hain — ye Dhan ka bug hai, aapke system ka nahi."
+            ),
+            "action": (
+                "Fix: Dhan website (web.dhan.co) → My Profile → Static IP → apna IP DELETE karo, "
+                "phir dobara ADD/Verify karo. 5-10 min baad order try karo. Agar phir bhi na chale to "
+                "Dhan support (help@dhan.co) ko bolo: 'DH-905 Invalid IP aata hai par /ip/getIP "
+                "PRIMARY_MATCH batata hai — mera static IP record reset karo'."
+            ),
+        }
+    return {
+        "level": "client-side",
+        "title": "Aapka IP Dhan par whitelisted nahi hai",
+        "detail": "Dhan ne aapka outbound IP accept nahi kiya. Neeche 'Register my IP' dabao.",
+        "action": "Settings ▸ Register my IP dabao, phir diagnose dobara chalao.",
+    }
+
+
 class SetIpBody(BaseModel):
     ip: str | None = None  # if omitted, we auto-detect and register that
     flag: str = "PRIMARY"

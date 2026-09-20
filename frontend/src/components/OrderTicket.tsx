@@ -39,6 +39,11 @@ export function OrderTicket({
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<OrderPreviewResponse | null>(null);
 
+  // Lot size for this index (from the server preview). Each index differs
+  // (NIFTY 65, SENSEX 20, BANKNIFTY 30, ...), so units = lots × lotSize.
+  const lotSize = preview?.preview.lotSize ?? 1;
+  const units = quantity * lotSize;
+
   const body = useMemo(
     () => ({
       indexKey: seed.indexKey,
@@ -46,7 +51,8 @@ export function OrderTicket({
       optionType: seed.optionType,
       transactionType: seed.transactionType,
       side: `${seed.indexName} ${seed.row.strike} ${seed.optionType}`,
-      quantity,
+      quantity, // LOTS — server multiplies by lot size
+      lots: true,
       // MARKET price is validated server-side via the ref price.
       price: orderType === "MARKET" ? refPrice : price,
       targetPct,
@@ -98,7 +104,10 @@ export function OrderTicket({
         const d = e.detail as { errorMessage?: string; hint?: string; detail?: string };
         // Special-case the IP error so the user knows exactly what to do.
         if ((d?.errorMessage || "").toLowerCase().includes("invalid ip")) {
-          push("error", "Invalid IP: Dhan ne aapka IP whitelist nahi dekha. Settings ▸ Register IP dabao aur phir retry karo.");
+          push(
+            "error",
+            "Invalid IP (DH-905): Dhan ne order ke liye aapka IP reject kiya. Settings ▸ Register my IP dabao. Agar phir bhi aaye to Dhan ke account me Static IP record kharab hai — Dhan web (My Profile ▸ Static IP) se IP DELETE karke dobara add karo, ya Dhan support se contact karo (getIP match dikhata hai par order engine reject karta hai — ye Dhan ka bug hai)."
+          );
         } else {
           push("error", d?.errorMessage || d?.detail || "Order failed");
         }
@@ -158,14 +167,27 @@ export function OrderTicket({
             </select>
           </Field>
 
-          <Field label="Quantity (lots × units)">
-            <input
-              className="input font-mono"
-              type="number"
-              min={1}
-              value={quantity}
-              onChange={(e) => setQuantity(Math.max(1, Number(e.target.value) || 1))}
-            />
+          <Field label="Lots (1 lot = fixed units)">
+            <div className="flex items-center gap-1">
+              <input
+                className="input font-mono"
+                type="number"
+                min={1}
+                value={quantity}
+                onChange={(e) => setQuantity(Math.max(1, Number(e.target.value) || 1))}
+              />
+              <button
+                className="tab px-2 py-1 text-[10px]"
+                onClick={() => setQuantity((q) => q + 1)}
+                title="Add 1 lot"
+              >
+                +1
+              </button>
+            </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              {quantity} lot{quantity > 1 ? "s" : ""} × {lotSize} ={" "}
+              <span className="font-mono font-semibold text-sky-300">{units} units</span>
+            </div>
           </Field>
           <Field label="Limit Price — you decide">
             <div className="flex items-center gap-1">
@@ -259,8 +281,12 @@ export function OrderTicket({
             />
             <Row
               label="Est. total profit"
-              value={fmt(preview.preview.expectedProfitPerUnit * quantity)}
+              value={fmt(preview.preview.expectedProfitPerUnit * (preview.preview.units ?? units))}
               accent="green"
+            />
+            <Row
+              label="Lots × Units"
+              value={`${quantity} × ${preview.preview.lotSize ?? lotSize} = ${preview.preview.units ?? units}`}
             />
             <p className="mt-2 text-[11px] text-slate-500">{preview.preview.safetyStopNote}</p>
           </div>

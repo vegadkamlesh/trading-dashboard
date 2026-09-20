@@ -52,6 +52,9 @@ export interface OrderPreview {
   optionType: string;
   side: string;
   quantity: number;
+  lots?: number;
+  lotSize?: number;
+  units?: number;
   entryPrice: number;
   targetPrice: number;
   expectedProfitPerUnit: number;

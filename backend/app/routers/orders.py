@@ -33,6 +33,9 @@ class OrderPreviewBody(BaseModel):
     orderType: str = "LIMIT"
     noStopLoss: bool = True
     stopLossPct: float | None = None
+    # When True (default) `quantity` is LOTS; the server multiplies by the
+    # index's lot size to get exchange units. Set False to send raw units.
+    lots: bool = True
 
 
 class OrderPlaceBody(OrderPreviewBody):
@@ -53,6 +56,7 @@ def _to_order_request(body: OrderPreviewBody) -> order_logic.OrderRequest:
         order_type=body.orderType,
         no_stop_loss=body.noStopLoss,
         stop_loss_pct=body.stopLossPct,
+        lots=body.lots,
     )
 
 
