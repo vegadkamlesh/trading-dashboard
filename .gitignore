@@ -15,6 +15,7 @@ venv/
 node_modules/
 dist/
 .vite/
+*.tsbuildinfo
 
 # OS / IDE
 .DS_Store
