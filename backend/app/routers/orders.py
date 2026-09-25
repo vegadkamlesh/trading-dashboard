@@ -42,6 +42,34 @@ class OrderPlaceBody(OrderPreviewBody):
     pin: str
 
 
+async def _fund_check(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare the order's required cash against the available balance.
+
+    Returns a small dict the UI can render. Never raises: if the funds call
+    fails we simply report unknown so the trader isn't blocked spuriously.
+    """
+    required = order_logic.required_cash(payload)
+    available: float | None = None
+    try:
+        f = await get_dhan_client().get_fund_limit()
+        if isinstance(f, dict):
+            # Dhan spells it "availabelBalance"; fall back to SOD if absent.
+            raw = f.get("availabelBalance")
+            if raw is None:
+                raw = f.get("sodLimit")
+            if raw is not None:
+                available = float(raw)
+    except DhanAPIError:
+        available = None
+    sufficient = True if available is None else available >= required
+    return {
+        "requiredCash": required,
+        "availableBalance": available,
+        "sufficient": sufficient,
+        "shortfall": 0.0 if sufficient or available is None else round(required - available, 2),
+    }
+
+
 def _to_order_request(body: OrderPreviewBody) -> order_logic.OrderRequest:
     return order_logic.OrderRequest(
         index_key=body.indexKey.upper(),
@@ -73,6 +101,7 @@ async def preview(
         "ok": True,
         "preview": order_logic.preview(req),
         "dhanPayload": payload,  # shown in the confirm popup for transparency
+        "funds": await _fund_check(payload),
     }
 
 
@@ -89,6 +118,17 @@ async def place(
     payload["dhanClientId"] = s.dhan_client_id
 
     pv = order_logic.preview(req)
+
+    # Balance check: block an order that costs more than the available balance
+    # so the trader can reduce lots instead of getting a broker rejection.
+    funds = await _fund_check(payload)
+    if not funds["sufficient"]:
+        msg = (
+            f"Insufficient balance: order needs ₹{funds['requiredCash']:.2f} "
+            f"but only ₹{(funds['availableBalance'] or 0):.2f} available "
+            f"(short by ₹{funds['shortfall']:.2f}). Reduce the lots and try again."
+        )
+        raise HTTPException(status_code=400, detail=msg)
 
     if runtime.is_dry_run():
         audit.log_order(

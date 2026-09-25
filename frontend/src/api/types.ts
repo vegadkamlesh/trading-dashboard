@@ -65,10 +65,18 @@ export interface OrderPreview {
   productType: string;
 }
 
+export interface FundCheck {
+  requiredCash: number;
+  availableBalance: number | null;
+  sufficient: boolean;
+  shortfall: number;
+}
+
 export interface OrderPreviewResponse {
   ok: boolean;
   preview: OrderPreview;
   dhanPayload: Record<string, unknown>;
+  funds?: FundCheck;
 }
 
 export interface Funds {

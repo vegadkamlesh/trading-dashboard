@@ -4,10 +4,10 @@ import { api, ApiError } from "../api/client";
 import { useToast } from "../hooks/useToasts";
 import type { Position } from "../api/types";
 
-// Live P&L every ~7s (fetching positions is a light call; we stay well clear of
-// Dhan's rate limit). Each open position gets a one-click EXIT (market
-// square-off) so you can get out instantly, like a real terminal.
-const POLL_MS = 7000;
+// Live P&L every ~3s so profit/loss feels real-time. Positions is a light call
+// and Dhan's order-path limit is generous (10/s), so 3s stays well clear. Each
+// open position gets a one-click EXIT (market square-off), like a real terminal.
+const POLL_MS = 3000;
 
 export function Positions() {
   const { push } = useToast();

@@ -68,6 +68,22 @@ def units_for(req: OrderRequest) -> int:
     return int(req.quantity) * int(lot_size)
 
 
+def required_cash(payload: Dict[str, Any]) -> float:
+    """Approx cash the order needs, from the built Dhan payload.
+
+    For BUY options the outlay is simply the premium = price × units, which is
+    exactly what the exchange debits. (For SELL the exchange blocks SPAN+exposure
+    margin we can't compute exactly, so this figure is only a *lower-bound hint*;
+    we still surface it so the trader gets a heads-up.)
+    """
+    try:
+        price = float(payload.get("price") or 0)
+        units = int(payload.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(price * units, 2)
+
+
 def _round_tick(value: float, tick: float = 0.05) -> float:
     """Round to nearest exchange tick (NSE options tick = 0.05)."""
     if tick <= 0:

@@ -101,15 +101,20 @@ export function OrderTicket({
       onClose();
     } catch (e) {
       if (e instanceof ApiError) {
-        const d = e.detail as { errorMessage?: string; hint?: string; detail?: string };
-        // Special-case the IP error so the user knows exactly what to do.
-        if ((d?.errorMessage || "").toLowerCase().includes("invalid ip")) {
+        const d = e.detail as { errorMessage?: string; hint?: string; detail?: string } | string;
+        const msgText =
+          typeof d === "string" ? d : d?.errorMessage || d?.detail || "Order failed";
+        const low = msgText.toLowerCase();
+        // Special-case the balance error (backend returns a plain string).
+        if (low.includes("insufficient balance")) {
+          push("error", msgText);
+        } else if (low.includes("invalid ip")) {
           push(
             "error",
             "Invalid IP (DH-905): Dhan ne order ke liye aapka IP reject kiya. Settings ▸ Register my IP dabao. Agar phir bhi aaye to Dhan ke account me Static IP record kharab hai — Dhan web (My Profile ▸ Static IP) se IP DELETE karke dobara add karo, ya Dhan support se contact karo (getIP match dikhata hai par order engine reject karta hai — ye Dhan ka bug hai)."
           );
         } else {
-          push("error", d?.errorMessage || d?.detail || "Order failed");
+          push("error", msgText);
         }
       } else {
         push("error", "Order failed");
@@ -120,6 +125,8 @@ export function OrderTicket({
   };
 
   const isBuy = seed.transactionType === "BUY";
+  const funds = preview?.funds;
+  const insufficient = funds ? !funds.sufficient : false;
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4">
@@ -288,7 +295,31 @@ export function OrderTicket({
               label="Lots × Units"
               value={`${quantity} × ${preview.preview.lotSize ?? lotSize} = ${preview.preview.units ?? units}`}
             />
+            {funds && funds.availableBalance != null && (
+              <>
+                <Row
+                  label="Order needs (cash)"
+                  value={`₹${funds.requiredCash.toFixed(2)}`}
+                />
+                <Row
+                  label="Available balance"
+                  value={`₹${funds.availableBalance.toFixed(2)}`}
+                  accent={funds.sufficient ? "green" : undefined}
+                />
+              </>
+            )}
             <p className="mt-2 text-[11px] text-slate-500">{preview.preview.safetyStopNote}</p>
+          </div>
+        )}
+
+        {insufficient && funds && (
+          <div className="mt-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            <div className="font-bold">⚠️ Insufficient balance</div>
+            <div className="mt-0.5">
+              This order needs <span className="font-mono">₹{funds.requiredCash.toFixed(2)}</span>{" "}
+              but you only have <span className="font-mono">₹{(funds.availableBalance ?? 0).toFixed(2)}</span>{" "}
+              (short by <span className="font-mono">₹{funds.shortfall.toFixed(2)}</span>). Reduce the lots.
+            </div>
           </div>
         )}
 
@@ -320,7 +351,8 @@ export function OrderTicket({
           <button
             className={isBuy ? "btn-buy" : "btn-sell"}
             onClick={place}
-            disabled={busy || !preview}
+            disabled={busy || !preview || insufficient}
+            title={insufficient ? "Insufficient balance — reduce lots" : undefined}
           >
             {busy ? "Placing…" : `Confirm ${seed.transactionType}`}
           </button>

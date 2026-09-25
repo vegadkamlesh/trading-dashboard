@@ -232,17 +232,7 @@ export function OptionChainPage({ indices }: { indices: IndexInfo[] }) {
         </span>
       </div>
 
-      {/* Per-strike trade signals (shared data with the chain below) */}
-      <RecommendationsPanel
-        data={recData}
-        loading={recLoading}
-        reload={reloadRecs}
-        lastUpdated={recUpdated}
-        refreshMs={recRefreshMs}
-        onPick={onPickRec}
-        onInfo={setDetail}
-      />
-
+      {/* Option chain (Call/Put) — kept at the top so it's the first thing you see */}
       {windowed ? (
         <OptionChainTable
           snapshot={windowed}
@@ -253,6 +243,17 @@ export function OptionChainPage({ indices }: { indices: IndexInfo[] }) {
       ) : (
         <div className="p-8 text-center text-sm text-slate-500">Loading option chain…</div>
       )}
+
+      {/* Per-strike trade signals (shared data with the chain above) */}
+      <RecommendationsPanel
+        data={recData}
+        loading={recLoading}
+        reload={reloadRecs}
+        lastUpdated={recUpdated}
+        refreshMs={recRefreshMs}
+        onPick={onPickRec}
+        onInfo={setDetail}
+      />
 
       <SeasonalityPanel indexKey={active} />
 

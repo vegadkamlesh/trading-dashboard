@@ -6,7 +6,10 @@ import type { SuperOrder } from "../api/types";
 
 export function SuperOrders() {
   const { push } = useToast();
-  const { data, error } = usePolling<SuperOrder[]>(() => api.get("/api/orders/super"), 5000);
+  const { data, error, refresh } = usePolling<SuperOrder[]>(
+    () => api.get("/api/orders/super"),
+    3000
+  );
   const [pin, setPin] = useState("");
 
   const cancelAll = async (orderId: string) => {
@@ -19,6 +22,7 @@ export function SuperOrders() {
         pin: p,
       });
       push(res.dryRun ? "info" : "success", res.dryRun ? "DRY-RUN cancel logged" : "Cancelled");
+      refresh();
     } catch (e) {
       push("error", e instanceof ApiError ? String((e.detail as any)?.errorMessage || e.message) : "Cancel failed");
     }
@@ -31,6 +35,12 @@ export function SuperOrders() {
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 text-xs text-slate-400">
+        <span className="inline-block h-2 w-2 rounded-full bg-green-500" />
+        <span>Live · LTP auto-refresh every 3s</span>
+        <button className="tab px-2 py-0.5 text-[11px]" onClick={refresh} title="Refresh now">
+          ⟳ Refresh
+        </button>
+        <span className="mx-2 text-slate-600">|</span>
         <span>Cancel PIN:</span>
         <input
           className="input w-28 font-mono"
