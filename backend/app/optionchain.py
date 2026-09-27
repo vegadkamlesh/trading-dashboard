@@ -124,6 +124,10 @@ class OptionChainEngine:
     def set_expiry(self, index_key: str, expiry: str) -> None:
         self._expiry_override[index_key.upper()] = expiry
 
+    async def warm(self, index_key: str) -> None:
+        """Force-refresh one index now (used by the algo right before it trades)."""
+        await self._fetch_one(index_key.upper(), force=True)
+
     # ---------- fetching ----------
     async def _fetch_one(self, index_key: str, force: bool = False) -> None:
         key = index_key.upper()

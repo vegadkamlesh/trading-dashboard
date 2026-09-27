@@ -402,3 +402,216 @@ export interface AppSettings {
   logRetentionDays: number;
   logLevel: string;
 }
+
+// --------------------------------------------------------------------- //
+//  Algo (ORB auto-trader)
+// --------------------------------------------------------------------- //
+export interface AlgoConfig {
+  indices: string[];
+  sl_mult: number;
+  target_mult: number;
+  breakeven_at: number;
+  entry_cutoff: string;
+  exit_time: string;
+  strike_offset: number;
+  risk_pct: number;
+  max_capital_pct: number;
+  max_lots: number;
+  min_lots: number;
+  min_or_pct: number;
+  max_or_pct: number;
+  order_type: string;
+  product_type: string;
+  protective_sl: boolean;
+  protective_sl_mult: number;
+}
+
+export interface AlgoLeg {
+  index: string;
+  name: string;
+  status: "preopen" | "watching" | "active" | "locked" | "skipped" | "closed" | string;
+  orHigh: number | null;
+  orLow: number | null;
+  orRange: number | null;
+  spot: number | null;
+  toUpper: number | null;
+  toLower: number | null;
+  signal: string | null;
+  strike: number | null;
+  securityId: number | null;
+  expiry: string | null;
+  optionLtp: number | null;
+  plannedLots: number | null;
+  note: string;
+}
+
+export interface AlgoPosition {
+  index: string;
+  optionType: "CALL" | "PUT";
+  strike: number;
+  securityId: number;
+  expiry: string;
+  lots: number;
+  quantity: number;
+  entrySpot: number;
+  spot: number | null;
+  entryPremium: number;
+  premium: number | null;
+  entryTime: string;
+  targetSpot: number;
+  stopSpot: number;
+  initialStopSpot: number;
+  breakevenDone: boolean;
+  points: number;
+  rMultiple: number;
+  premiumPnl: number;
+  mfe: number;
+  mae: number;
+  dryRun: boolean;
+  orderId: string | null;
+  protectiveOrderId: string | null;
+}
+
+export interface AlgoEvent {
+  kind?: string;
+  level?: "info" | "warn" | "error" | "success" | string;
+  msg?: string;
+  time?: string;
+  ts?: number;
+  index?: string;
+  [k: string]: unknown;
+}
+
+export interface AlgoTrade {
+  date: string;
+  index: string;
+  direction: string;
+  strike: number;
+  lots: number;
+  quantity: number;
+  entryTime: string;
+  exitTime: string;
+  entrySpot: number;
+  exitSpot: number;
+  entryPremium: number;
+  exitPremium: number;
+  targetSpot: number;
+  stopSpot: number;
+  orRange: number;
+  points: number;
+  rMultiple: number;
+  mfe: number;
+  mae: number;
+  premiumPnl: number;
+  exitReason: string;
+  dryRun: boolean;
+}
+
+export interface AlgoFeedStatus {
+  mode: string;
+  connected: boolean;
+  webSocket: boolean;
+  ticks: number;
+  reconnects: number;
+  lastTickSecondsAgo: number | null;
+  instruments: number;
+  error: string | null;
+}
+
+export interface AlgoStatus {
+  enabled: boolean;
+  phase: string;
+  phaseLabel: string;
+  dryRun: boolean;
+  serverTime: string;
+  serverTimeShort: string;
+  day: string | null;
+  marketOpen: boolean;
+  config: AlgoConfig;
+  legs: AlgoLeg[];
+  position: AlgoPosition | null;
+  nextActions: string[];
+  todayTrades: AlgoTrade[];
+  stats: {
+    todayTrades: number;
+    todayPnl: number;
+    todayR: number;
+    todayWins: number;
+    weekTrades: number;
+    weekPnl: number;
+    weekR: number;
+    allTimePnl: number;
+  };
+  feed: AlgoFeedStatus;
+  recovered: string | null;
+  lastError: string | null;
+  paperBalance: number | null;
+  uptimeSeconds: number;
+  events: AlgoEvent[];
+}
+
+export interface AlgoGridCell {
+  sl: number;
+  target: number;
+  trades: number;
+  winRate: number;
+  expR: number;
+  pf: number;
+  netPoints: number;
+  maxDD: number;
+  avgWin: number;
+  avgloss: number;
+  rr: number | null;
+}
+
+export interface AlgoIndexStudy {
+  days: number;
+  from?: string;
+  to?: string;
+  lotSize?: number;
+  breakoutDays?: number;
+  avgOrRange?: number;
+  error?: string;
+  mfe?: Record<string, number>;
+  grid?: AlgoGridCell[];
+  baseline?: Array<Record<string, number>>;
+  best?: AlgoGridCell | null;
+  costBreakEvenRupees?: number | null;
+  grossRupeesPerTrade?: number | null;
+  tradesPerYear?: number | null;
+  shippedConfig?: { sl: number; target: number };
+  costCurve?: Array<{ cost: number; netPoints: number; pf: number; netRupees: number; maxDDRupees: number; winRate: number }>;
+}
+
+export interface AlgoStudy {
+  progress: {
+    status: "idle" | "running" | "ready" | "error" | string;
+    step: string;
+    percent: number;
+    startedAt: number | null;
+    finishedAt: number | null;
+    error: string | null;
+    years: number;
+  };
+  ageSeconds: number | null;
+  result: {
+    generatedAt: number;
+    generatedOn: string;
+    years: number;
+    range: { from: string; to: string };
+    indices: Record<string, AlgoIndexStudy>;
+    combined: Array<Record<string, unknown>>;
+    recommended: {
+      slMult: number;
+      targetMult: number;
+      expectedR: number;
+      avgR: number;
+      profitFactor: number;
+      minTrades: number;
+      maxDrawdownPoints: number;
+      costBreakEvenRupees: number | null;
+      reason: string;
+      alternatives: Array<Record<string, number>>;
+    };
+  } | null;
+}

@@ -10,12 +10,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import audit, runtime
+from .algo import algo
+from .algo_store import store as algo_store
 from .config import get_settings
 from .dhan_client import DhanAPIError, close_dhan_client
 from .logsetup import daily_cleanup_loop, setup_logging
 from .optionchain import engine
+from .orb_study import study as orb_study
 from .routers import (
     account,
+    algo as algo_router,
     audit as audit_router,
     auth,
     intel,
@@ -49,6 +53,9 @@ async def lifespan(app: FastAPI):
     if pruned:
         logger.info("Pruned %d audit row(s) older than %d days", pruned, s.log_retention_days)
 
+    # Algo journal retention: keep the last 7 days of ORB journalling.
+    algo_store.prune_journals()
+
     # Background thread: delete log files older than the retention window daily.
     threading.Thread(target=daily_cleanup_loop, daemon=True, name="log-cleanup").start()
 
@@ -61,9 +68,12 @@ async def lifespan(app: FastAPI):
     if s.is_configured():
         await engine.start()
         logger.info("Option chain poller started for: %s", s.oc_polled_indices)
+        await algo.start()
+        logger.info("ORB algo engine ready (arm it from the Algo tab)")
     try:
         yield
     finally:
+        await algo.stop()
         await engine.stop()
         await close_dhan_client()
         logger.info("Shutdown complete")
@@ -88,7 +98,12 @@ async def dhan_error_handler(_request, exc: DhanAPIError):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, **runtime.state()}
+    return {
+        "ok": True,
+        **runtime.state(),
+        "algo": {"enabled": algo.enabled, "phase": algo.phase},
+        "study": orb_study.progress.status,
+    }
 
 
 app.include_router(auth.router)
@@ -98,6 +113,7 @@ app.include_router(account.router)
 app.include_router(audit_router.router)
 app.include_router(intel.router)
 app.include_router(settings_router.router)
+app.include_router(algo_router.router)
 
 
 @app.middleware("http")

@@ -449,6 +449,15 @@ class DhanClient:
         )
         return data.get("data", {}) or {}
 
+    async def get_ltp(self, instruments: Dict[str, List[int]]) -> Dict[str, Any]:
+        """Batch last-traded-price snapshot (up to 1000 instruments, 1 req/sec).
+
+        `instruments` maps segment -> security ids, e.g.
+            {"IDX_I": [13, 51], "NSE_FNO": [49081]}
+        Response: {"data": {"IDX_I": {"13": {"last_price": 23100.5}}, ...}}
+        """
+        return await self._request("POST", "/marketfeed/ltp", json=instruments)
+
     # ---------------- historical / analytics data ----------------
     async def get_historical_daily(
         self,
@@ -561,11 +570,18 @@ class DhanClient:
     async def cancel_super_order(self, order_id: str, leg: str) -> Dict[str, Any]:
         return await self._request("DELETE", f"/super/orders/{order_id}/{leg}")
 
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancel a regular (non-super) order by id."""
+        return await self._request("DELETE", f"/orders/{order_id}")
+
     async def get_super_orders(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/super/orders")
 
     async def get_order_book(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/orders")
+
+    async def get_order_by_id(self, order_id: str) -> Dict[str, Any]:
+        return await self._request("GET", f"/orders/{order_id}")
 
     async def get_trades(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/trades")

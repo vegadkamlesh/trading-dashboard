@@ -5,6 +5,7 @@ import { api } from "../api/client";
 import type { IndexInfo } from "../api/types";
 import { ConnectionBar } from "../components/ConnectionBar";
 import { OptionChainPage } from "./OptionChainPage";
+import { AlgoPage } from "./AlgoPage";
 import { Positions } from "./Positions";
 import { SuperOrders } from "./SuperOrders";
 import { Funds } from "./Funds";
@@ -12,9 +13,10 @@ import { EodSummary } from "./EodSummary";
 import { SettingsPanel } from "../components/SettingsPanel";
 import { Readme } from "./Readme";
 
-type Tab = "chain" | "positions" | "orders" | "funds" | "eod" | "settings" | "readme";
+type Tab = "algo" | "chain" | "positions" | "orders" | "funds" | "eod" | "settings" | "readme";
 
 const TABS: Array<[Tab, string]> = [
+  ["algo", "🤖 Algo"],
   ["chain", "Option Chain"],
   ["positions", "Positions"],
   ["orders", "Super Orders"],
@@ -26,7 +28,7 @@ const TABS: Array<[Tab, string]> = [
 
 export function Dashboard() {
   const { logout } = useAuth();
-  const [tab, setTab] = useState<Tab>("chain");
+  const [tab, setTab] = useState<Tab>("algo");
   const { data: indices } = usePolling<IndexInfo[]>(() => api.get("/api/market/indices"), 60000);
 
   return (
@@ -50,6 +52,7 @@ export function Dashboard() {
       </header>
 
       <main className="flex-1 p-4">
+        {tab === "algo" && <AlgoPage />}
         {tab === "chain" && <OptionChainPage indices={indices ?? []} />}
         {tab === "positions" && <Positions />}
         {tab === "orders" && <SuperOrders />}

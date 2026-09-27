@@ -46,7 +46,7 @@ RECENT_SAMPLES = 20             # show the most recent N sessions
 # Bulk back-fill concurrency. Dhan's data API tolerates ~5 req/s; we stay well
 # under it with 3 in flight and retry on DH-904 (rate limit).
 FETCH_CONCURRENCY = 3
-RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_RETRIES = 5
 
 
 @dataclass
@@ -140,6 +140,104 @@ def _minute_of_day(ts: Any) -> Optional[int]:
     except (TypeError, ValueError, OverflowError, OSError):
         return None
     return dt.hour * 60 + dt.minute
+
+
+def chunk_ranges(start: date, end: date) -> List[Tuple[date, date]]:
+    """Split [start, end] into <=90-day windows (Dhan intraday hard limit)."""
+    chunks: List[Tuple[date, date]] = []
+    cursor = start
+    while cursor < end:
+        stop = min(cursor + timedelta(days=MAX_DAYS_PER_CALL), end)
+        chunks.append((cursor, stop))
+        cursor = stop + timedelta(days=1)
+    return chunks
+
+
+async def fetch_intraday_raw(
+    inst: IndexInstrument,
+    start: date,
+    end: date,
+    *,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[List[Any], Optional[str]]:
+    """Chunked, 3-way-parallel, 429-retrying 1-minute intraday fetch.
+
+    Shared by the opening-range study and the ORB backtest so the rate-limit
+    handling lives in exactly one place. Returns (raw_responses, error).
+    """
+    client = get_dhan_client()
+    seg = "IDX_I"
+    chunks = chunk_ranges(start, end)
+    sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+    results: List[Optional[Any]] = [None] * len(chunks)
+    errors: List[str] = []
+
+    async def fetch_chunk(i: int, a: date, b: date) -> Tuple[int, Optional[Any], Optional[str]]:
+        # Small per-chunk stagger so we don't fire a burst of 3 at the same
+        # instant (Dhan's data API allows ~5 req/s and is strict about bursts).
+        if i:
+            await asyncio.sleep(0.18 * i)
+        async with sem:
+            for attempt in range(RATE_LIMIT_RETRIES):
+                try:
+                    raw = await client.get_intraday(
+                        security_id=str(inst.sec_id),
+                        exchange_segment=seg,
+                        instrument="INDEX",
+                        interval="1",
+                        from_dt=a.strftime("%Y-%m-%d 09:15:00"),
+                        to_dt=b.strftime("%Y-%m-%d 15:30:00"),
+                        throttle=False,
+                    )
+                    return i, raw, None
+                except DhanAPIError as exc:
+                    if exc.error_code == "DH-904" and attempt < RATE_LIMIT_RETRIES - 1:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    logger.warning("intraday failed for %s: %s", inst.key, exc)
+                    return i, None, exc.error_message
+                except Exception as exc:  # pragma: no cover - network best effort
+                    return i, None, str(exc)
+        return i, None, "rate limited"
+
+    pending = [asyncio.ensure_future(fetch_chunk(i, a, b)) for i, (a, b) in enumerate(chunks)]
+    done = 0
+    for fut in asyncio.as_completed(pending):
+        i, raw, cerr = await fut
+        done += 1
+        if on_progress:
+            on_progress(done, len(chunks))
+        if cerr:
+            errors.append(cerr)
+        if raw is not None:
+            results[i] = raw
+
+    # Second pass on whatever is still missing. Failures here are almost always
+    # a transient DH-904 rate limit, and silently dropping a chunk means the
+    # study quietly runs on a SHORTER history - which then looks like "the
+    # strategy changed" when really the DATA changed. Retry, then report honestly.
+    missing = [i for i, r in enumerate(results) if r is None]
+    if missing:
+        logger.warning(
+            "%s: %d/%d intraday chunks missing, retrying once (%s)",
+            inst.key, len(missing), len(chunks), errors[0] if errors else "?",
+        )
+        await asyncio.sleep(1.0)
+        retry = [asyncio.ensure_future(fetch_chunk(i, *chunks[i])) for i in missing]
+        for fut in asyncio.as_completed(retry):
+            i, raw, cerr = await fut
+            if raw is not None:
+                results[i] = raw
+            elif cerr:
+                errors.append(cerr)
+
+    still_missing = [i for i, r in enumerate(results) if r is None]
+    if still_missing:
+        err = (f"{len(still_missing)}/{len(chunks)} chunks missing "
+               f"({errors[0] if errors else 'unknown'})")
+    else:
+        err = None
+    return [r for r in results if r is not None], err
 
 
 class OpeningRangeEngine:
@@ -241,67 +339,21 @@ class OpeningRangeEngine:
         years: int,
         progress_key: Optional[str] = None,
     ) -> OpeningRangeResult:
-        client = get_dhan_client()
-        seg = "IDX_I"  # index value series (same for NSE + BSE indices)
-
         today = date.today()
         start = today - timedelta(days=years * 365 + 30)
 
-        # Chunk into <=90-day intraday calls.
-        chunks: List[Tuple[date, date]] = []
-        cursor = start
-        while cursor < today:
-            end = min(cursor + timedelta(days=MAX_DAYS_PER_CALL), today)
-            chunks.append((cursor, end))
-            cursor = end + timedelta(days=1)
-
-        days: List[DayRange] = []
-        err: Optional[str] = None
-
+        chunks = chunk_ranges(start, today)
         total = len(chunks)
 
-        async def fetch_chunk(
-            i: int, c_start: date, c_end: date
-        ) -> Tuple[int, Optional[List[DayRange]], Optional[str]]:
-            # Bounded-concurrency bulk fetch with 429 (DH-904) back-off retry.
-            async with sem:
-                for attempt in range(RATE_LIMIT_RETRIES):
-                    try:
-                        raw = await client.get_intraday(
-                            security_id=str(inst.sec_id),
-                            exchange_segment=seg,
-                            instrument="INDEX",
-                            interval="1",
-                            from_dt=c_start.strftime("%Y-%m-%d 09:15:00"),
-                            to_dt=c_end.strftime("%Y-%m-%d 15:30:00"),
-                            throttle=False,  # bulk job manages its own pacing
-                        )
-                        return i, self._parse_chunk(raw), None
-                    except DhanAPIError as exc:
-                        if exc.error_code == "DH-904" and attempt < RATE_LIMIT_RETRIES - 1:
-                            await asyncio.sleep(0.6 * (attempt + 1))
-                            continue
-                        logger.warning("intraday failed for %s: %s", inst.key, exc)
-                        return i, None, exc.error_message
-                    except Exception as exc:  # pragma: no cover - network best effort
-                        return i, None, str(exc)
-            return i, None, "rate limited"
-
-        sem = asyncio.Semaphore(FETCH_CONCURRENCY)
-        pending = [
-            asyncio.ensure_future(fetch_chunk(i, a, b))
-            for i, (a, b) in enumerate(chunks)
-        ]
-        done = 0
-        for fut in asyncio.as_completed(pending):
-            i, parsed, chunk_err = await fut
-            done += 1
+        def _bump(done: int, tot: int) -> None:
             if progress_key is not None:
-                self._progress[progress_key] = {"done": done, "total": total}
-            if chunk_err:
-                err = chunk_err
-            if parsed:
-                days.extend(parsed)
+                self._progress[progress_key] = {"done": done, "total": tot}
+
+        raws, err = await fetch_intraday_raw(inst, start, today, on_progress=_bump)
+
+        days: List[DayRange] = []
+        for raw in raws:
+            days.extend(self._parse_chunk(raw))
 
         if progress_key is not None:
             self._progress[progress_key] = {"done": total, "total": total}
