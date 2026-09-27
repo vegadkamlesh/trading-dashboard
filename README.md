@@ -81,12 +81,13 @@ hidden).
 | ---- | ------------ | ----- |
 | **Option chain** (spot, LTP, IV, OI) | **every 5s** | backend polls Dhan ~3.5s/index, serves warm cache |
 | **Trade Signals** (per-strike prediction) | **every 20s** | re-runs the full engine (see below); also on tab focus |
-| **Open Positions** (live P&L) | **every 7s** | + one-click EXIT |
-| **Super Orders** | **every 5s** | |
+| **Open Positions** (live P&L) | **every 3s** | + one-click EXIT |
+| **Super Orders** | **every 3s** | live LTP refresh |
 | **Market News** | **every 5 min** | + on tab focus; manual ⟳ too |
 | **Daily OHLC (5-yr history)** | **once per session** | loaded at **login** into a 6h cache |
 | **Expired-option history study** | **cached 12h** | warmed at login |
 | **Seasonality** | **cached 6h** | uses the same warm history cache |
+| **Opening Range (9:15–9:25)** | **cached 6h** | background job (1Y/3Y/5Y); poll progress |
 
 **Prediction inputs (all live):** market trend / RSI / MACD, **live strike price
 (LTP)**, IV, delta & theta, strike-vs-spot (moneyness), **news sentiment**, and the
@@ -96,8 +97,24 @@ strike or signal to see exactly which inputs drove it.
 New backend endpoints: `GET /api/intel/guidance`, `/api/intel/history`,
 
 `/api/intel/news`, `/api/intel/recommend`, `/api/intel/seasonality`,
+`GET /api/intel/opening-range` (first-10-min high/low study, 1Y/3Y/5Y),
 `GET /api/account/cache-state`, `POST /api/account/warm-cache`,
 `POST /api/account/squareoff` (all require a session).
+
+### Opening Range study (9:15–9:25)
+
+Pichle **1/3/5 saal** me har din ke **pehle 10 minute (09:15–09:25)** ka high/low:
+
+- **Avg / median / p90 range** (points + %) — aapka stop isse tight nahi hona chahiye
+  (opening range ke andar ka stop noise me nikal jaata hai).
+- **Opening range ka share of the day's range** — din ki volatility ka early read.
+- **Breakout odds** — range ke upar/below break kitni baar hua, aur close band ke
+  andar hi raha (fakeout) kitni baar.
+- **Distribution** + **recent 20 sessions** table.
+
+5-yr study ~21 chunked Dhan calls hai (90-day/call limit), isliye backend ise
+**background job** ki tarah chalata hai aur UI progress dikhata hai — ek baar
+compute hone ke baad 6h tak cached (instant).
 
 > The advisor is **rule-based and educational**, not financial advice. It combines
 > live indicators with what history actually did — it cannot predict the future

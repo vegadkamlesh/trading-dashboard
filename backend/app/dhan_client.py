@@ -141,13 +141,17 @@ class DhanClient:
         path: str,
         *,
         json: Optional[Dict[str, Any]] = None,
+        throttle: bool = True,
     ) -> Any:
         if self._mock:
             return self._mock_response(method, path, json or {})
 
         # Serialise heavy chart calls through one gate so parallel panels can't
         # burst the data API and trip Dhan's rate limit (DH-904 / 429).
-        if any(p in path for p in _HEAVY_PATHS):
+
+        # `throttle=False` is used only by bulk back-fill jobs that do their own
+        # bounded-concurrency + 429-retry management.
+        if throttle and any(p in path for p in _HEAVY_PATHS):
             await self._await_heavy_slot()
 
         try:
@@ -194,7 +198,7 @@ class DhanClient:
         if path.endswith("/charts/historical"):
             return self._mock_historical()
         if path.endswith("/charts/intraday"):
-            return self._mock_historical(90)
+            return self._mock_intraday(body.get("fromDate", ""), body.get("toDate", ""))
         if path.endswith("/charts/rollingoption"):
             return self._mock_rolling(body.get("drvOptionType", "CALL"))
         if path.endswith("/profile"):
@@ -294,6 +298,56 @@ class DhanClient:
                 },
             }
         return {"last_price": spot, "oc": oc}
+
+    @staticmethod
+    def _mock_intraday(from_dt: str, to_dt: str) -> Dict[str, Any]:
+        """Synthetic 1-min candles: per day, the 09:15-09:25 window + a close.
+
+        Enough for the opening-range study to produce meaningful mock stats.
+        """
+        def _parse(s: str) -> Optional[_dt.datetime]:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return _dt.datetime.strptime(s, fmt)
+                except (ValueError, TypeError):
+                    continue
+            return None
+
+        start = _parse(from_dt) or _dt.datetime.now() - _dt.timedelta(days=90)
+        end = _parse(to_dt) or _dt.datetime.now()
+        out: Dict[str, List[Any]] = {
+            "open": [], "high": [], "low": [], "close": [], "volume": [], "timestamp": []
+        }
+        day = start.date()
+        while day <= end.date():
+            if day.weekday() < 5:  # skip weekends
+                base = 23000.0 + random.uniform(-400, 400)
+                # 09:16 .. 09:25 candles
+                px = base
+                for minute in range(16, 26):
+                    o = px
+                    c = o + random.uniform(-25, 25)
+                    hi = max(o, c) + random.uniform(0, 20)
+                    lo = min(o, c) - random.uniform(0, 20)
+                    ts = int(_dt.datetime.combine(day, _dt.time(9, minute)).timestamp())
+                    out["open"].append(round(o, 2))
+                    out["high"].append(round(hi, 2))
+                    out["low"].append(round(lo, 2))
+                    out["close"].append(round(c, 2))
+                    out["volume"].append(random.randint(1000, 50000))
+                    out["timestamp"].append(ts)
+                    px = c
+                # 15:30 close candle
+                ts = int(_dt.datetime.combine(day, _dt.time(15, 30)).timestamp())
+                cl = base + random.uniform(-120, 120)
+                out["open"].append(round(base, 2))
+                out["high"].append(round(max(base, cl) + 20, 2))
+                out["low"].append(round(min(base, cl) - 20, 2))
+                out["close"].append(round(cl, 2))
+                out["volume"].append(random.randint(1000, 50000))
+                out["timestamp"].append(ts)
+            day += _dt.timedelta(days=1)
+        return out
 
     @staticmethod
     def _mock_historical(days: int = 200) -> Dict[str, Any]:
@@ -432,6 +486,7 @@ class DhanClient:
         to_dt: str,
         *,
         oi: bool = False,
+        throttle: bool = True,
     ) -> Dict[str, Any]:
         """Intraday OHLC candles. Dates 'YYYY-MM-DD HH:MM:SS'. Max 90 days/call."""
         return await self._request(
@@ -446,6 +501,7 @@ class DhanClient:
                 "fromDate": from_dt,
                 "toDate": to_dt,
             },
+            throttle=throttle,
         )
 
     async def get_rolling_expired_options(

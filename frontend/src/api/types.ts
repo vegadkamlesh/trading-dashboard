@@ -239,6 +239,59 @@ export interface NewsResponse {
   error: string | null;
 }
 
+// ---- Opening range (9:15-9:25) study ----
+
+export interface OpeningRangeDay {
+  date: string;
+  open: number;
+  orHigh: number;
+  orLow: number;
+  rangePoints: number;
+  rangePct: number | null;
+  dayHigh: number;
+  dayLow: number;
+  dayClose: number;
+  brokeUp: boolean;
+  brokeDown: boolean;
+}
+
+export interface OpeningRangeBucket {
+  label: string;
+  count: number;
+  pct: number;
+}
+
+export interface OpeningRangeStudy {
+  index: string;
+  years: number;
+  windowStart: string;
+  windowEnd: string;
+  sampleDays: number;
+  avgRangePoints: number | null;
+  avgRangePct: number | null;
+  medianRangePct: number | null;
+  p90RangePct: number | null;
+  maxRangePct: number | null;
+  minRangePct: number | null;
+  avgDayRangePct: number | null;
+  openingShareOfDayPct: number | null;
+  breakUpRate: number | null;
+  breakDownRate: number | null;
+  closeAboveRate: number | null;
+  closeBelowRate: number | null;
+  closeInsideRate: number | null;
+  rangeBuckets: OpeningRangeBucket[];
+  recent: OpeningRangeDay[];
+  ageSeconds: number;
+  error: string | null;
+}
+
+export interface OpeningRangeResponse {
+  status: "idle" | "computing" | "ready";
+  progress: { done: number; total: number } | null;
+  data: OpeningRangeStudy | null;
+}
+
 // ---- Seasonality ----
 
 export interface SameDateSample {

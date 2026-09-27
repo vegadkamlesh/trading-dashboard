@@ -248,12 +248,38 @@ DHAN_ACCESS_TOKEN=eyJ...aapka-pura-token...`}</pre>
         </ul>
       </Section>
 
+      {/* Opening Range */}
+      <Section title="🕘 Opening Range (9:15–9:25)">
+        <ul className="list-disc space-y-1 pl-5 text-xs">
+          <li>
+            Pichle <strong>1 / 3 / 5 saal</strong> me har din ke <strong>pehle 10 minute</strong>{" "}
+            (09:15–09:25) ka <strong>high aur low</strong> ka study.
+          </li>
+          <li>
+            <strong>Avg / median range</strong> (points + %) — aapka stop isse tight nahi rakhna
+            chahiye, warna noise me nikal jayega.
+          </li>
+          <li>
+            <strong>Breakout odds:</strong> range ke upar/below break kitni baar hua, aur close
+            band ke andar (fakeout) kitni baar.
+          </li>
+          <li>
+            <strong>Distribution + recent 20 sessions</strong> table — aaj ka range compare karne
+            ke liye.
+          </li>
+          <li>
+            Pehli baar compute hone me ~10–20s lagta hai (background job + progress bar), phir{" "}
+            <strong>6 ghante tak cached</strong> — turant khulta hai.
+          </li>
+        </ul>
+      </Section>
+
       {/* Positions / EXIT */}
       <Section title="🚪 Open Positions + 1-click EXIT">
         <ul className="list-disc space-y-1 pl-5 text-xs">
           <li>
             <strong>Positions</strong> tab me har position ka <strong>live P&L</strong> dikhta hai
-            (auto-refresh ~7s).
+            (auto-refresh ~3s).
           </li>
           <li>
             <strong>EXIT</strong> button dabao → turant <strong>MARKET</strong> order se position
@@ -325,7 +351,7 @@ DHAN_ACCESS_TOKEN=eyJ...aapka-pura-token...`}</pre>
       {/* Tabs */}
       <Section title="📑 Tabs ka matlab">
         <ul className="list-disc space-y-1 pl-5 text-xs">
-          <li><strong>Option Chain:</strong> live strikes, Buy/Sell, Trade Signals, Seasonality, News.</li>
+          <li><strong>Option Chain:</strong> live strikes, Buy/Sell, Trade Signals, Seasonality, Opening Range, News.</li>
           <li><strong>Positions:</strong> live P&L + 1-click EXIT.</li>
           <li><strong>Super Orders:</strong> lagaye gaye super orders (target + SL legs).</li>
           <li><strong>Funds:</strong> account balance.</li>

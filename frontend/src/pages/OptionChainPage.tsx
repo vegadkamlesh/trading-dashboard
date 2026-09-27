@@ -12,6 +12,7 @@ import { OrderTicket, type TicketSeed } from "../components/OrderTicket";
 import { NewsPanel } from "../components/NewsPanel";
 import { RecommendationsPanel } from "../components/RecommendationsPanel";
 import { SeasonalityPanel } from "../components/SeasonalityPanel";
+import { OpeningRangePanel } from "../components/OpeningRangePanel";
 import { SignalDetailModal } from "../components/SignalDetailModal";
 import { useRecommendations } from "../hooks/useRecommendations";
 
@@ -256,7 +257,7 @@ export function OptionChainPage({ indices }: { indices: IndexInfo[] }) {
       />
 
       <SeasonalityPanel indexKey={active} />
-
+      <OpeningRangePanel indexKey={active} />
       <NewsPanel />
 
       <p className="text-xs text-slate-500">

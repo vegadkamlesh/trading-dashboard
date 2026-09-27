@@ -20,6 +20,7 @@ from ..config import get_settings
 from ..history import history_engine
 from ..instruments import get_index
 from ..news import fetch_news
+from ..opening_range import opening_range_engine
 from ..optionchain import engine as oc_engine
 from ..recommender import recommend as recommend_engine
 from ..seasonality import seasonality_engine
@@ -80,6 +81,32 @@ async def news(
     limit("news", max_calls=12, window_seconds=60.0, message="Slow down")
     feeds = _news_feeds()
     return await fetch_news(force=refresh, feeds=feeds or None)
+
+
+@router.get("/opening-range")
+async def opening_range(
+    index: str = Query(..., description="Index key e.g. NIFTY"),
+    years: int = Query(5, ge=1, le=5),
+    refresh: bool = Query(False),
+    _session: str = Depends(require_session),
+):
+    """First-10-minutes (09:15-09:25) high/low study over the last N years.
+
+    A 5-year study is ~21 chunked API calls, so it runs as a BACKGROUND JOB:
+    this returns `{status: computing|ready|idle}` and the UI polls until ready.
+    """
+    key = index.upper()
+    inst = get_index(key)
+    if inst is None:
+        raise HTTPException(status_code=404, detail="Unknown index")
+    limit(f"openrange:{key}", max_calls=60, window_seconds=60.0, message="Slow down")
+
+    snap = opening_range_engine.status(key, years)
+    if snap["status"] == "ready" and not refresh:
+        return snap
+    # Start (or force-refresh) the background job.
+    opening_range_engine.start(inst, years, force=refresh)
+    return opening_range_engine.status(key, years)
 
 
 @router.get("/seasonality")
