@@ -55,6 +55,20 @@ MARKET_CLOSE_MIN = 15 * 60 + 30
 OR_READY_MIN = 9 * 60 + 26          # start computing the OR at/after this minute
 TICKER = 15
 
+# Order-placement retry policy. `_evaluate` runs on EVERY feed tick, so without a
+# cap+backoff a rejected entry is retried many times per second. On 2026-09-28 a
+# DH-905 (invalid IP) rejection produced 586 order calls in 2.5 minutes.
+ENTRY_MAX_ATTEMPTS = 3
+ENTRY_RETRY_BACKOFF = (2.0, 5.0, 15.0)   # seconds, indexed by attempt-1
+# Errors that will NOT fix themselves during the session. Retrying these just
+# hammers Dhan and risks an API block, so we stop and disarm instead.
+FATAL_ORDER_CODES = {
+    "DH-901",  # invalid/expired token
+    "DH-902",  # no Trading API access
+    "DH-903",  # account/segment issue
+    "DH-905",  # input exception - in practice "Invalid IP" (static IP not set)
+}
+
 
 def now_ist() -> datetime:
     return datetime.now(IST)
@@ -133,6 +147,9 @@ class DayLeg:
     option_ltp: Optional[float] = None
     planned_lots: Optional[int] = None
     note: str = ""
+    entry_attempts: int = 0
+    next_try_at: float = 0.0        # epoch seconds; entry retried only after this
+    error: str = ""
 
     @property
     def or_range(self) -> Optional[float]:
@@ -640,6 +657,8 @@ class AlgoEngine:
             leg = self._legs.get(key)
             if leg is None or leg.status != "watching" or leg.or_high is None or leg.spot is None:
                 continue
+            if time.time() < leg.next_try_at:
+                continue   # backing off after a rejected entry
             rng = leg.or_range or 0.0
             if rng <= 0:
                 continue
@@ -715,10 +734,48 @@ class AlgoEngine:
             tag="entry",
         )
         if not fill.get("ok"):
-            self._log(f"Entry order FAILED: {fill.get('error')}", level="error")
-            leg.status = "watching"
+            code = str(fill.get("code") or "")
+            msg = str(fill.get("error") or "order failed")
+            leg.entry_attempts += 1
             leg.signal = None
-            self._last_error = str(fill.get("error"))
+            leg.error = f"{code}: {msg}" if code else msg
+            self._last_error = msg
+
+            if code in FATAL_ORDER_CODES:
+                # A config problem (e.g. static IP not whitelisted). Every future
+                # order fails the same way, so do NOT retry - stop and disarm.
+                leg.status = "error"
+                leg.note = f"entry rejected ({code}): {msg}"
+                self._log(
+                    f"{leg.index_key}: FATAL order error {code} - {msg}. "
+                    f"Orders cannot be placed; DISARMING without retry. "
+                    f"Fix the cause (e.g. register the static IP in your Dhan "
+                    f"profile) and re-arm.",
+                    level="error", index=leg.index_key, code=code,
+                )
+                self.disarm(f"fatal order error {code}")
+                self._persist()
+                return
+
+            if leg.entry_attempts >= ENTRY_MAX_ATTEMPTS:
+                leg.status = "error"
+                leg.note = f"entry failed {leg.entry_attempts}x: {msg}"
+                self._log(
+                    f"{leg.index_key}: entry failed {leg.entry_attempts} times "
+                    f"({msg}) - giving up for today",
+                    level="error", index=leg.index_key,
+                )
+            else:
+                i = min(leg.entry_attempts - 1, len(ENTRY_RETRY_BACKOFF) - 1)
+                delay = ENTRY_RETRY_BACKOFF[i]
+                leg.next_try_at = time.time() + delay
+                leg.status = "watching"
+                self._log(
+                    f"{leg.index_key}: entry attempt {leg.entry_attempts}/"
+                    f"{ENTRY_MAX_ATTEMPTS} failed ({msg}) - retrying in {delay:.0f}s",
+                    level="warn", index=leg.index_key,
+                )
+            self._persist()
             return
 
         pos.order_id = fill.get("orderId")
@@ -866,7 +923,8 @@ class AlgoEngine:
             audit.log_order(action=f"algo_{tag}", success=False, dry_run=False,
                             status=exc.error_code, message=exc.error_message, payload=payload)
             self._last_error = exc.error_message
-            return {"ok": False, "error": exc.error_message}
+            return {"ok": False, "error": exc.error_message,
+                    "code": exc.error_code, "httpStatus": exc.status_code}
         order_id = str(res.get("orderId") or "")
         audit.log_order(action=f"algo_{tag}", success=True, dry_run=False, order_id=order_id,
                         status=str(res.get("orderStatus")), message=f"[algo] {tag}",
