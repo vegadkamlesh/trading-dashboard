@@ -147,6 +147,7 @@ class DayLeg:
     option_ltp: Optional[float] = None
     planned_lots: Optional[int] = None
     note: str = ""
+    prepared_side: str = ""        # CALL/PUT of the currently held security_id
     entry_attempts: int = 0
     next_try_at: float = 0.0        # epoch seconds; entry retried only after this
     error: str = ""
@@ -541,8 +542,15 @@ class AlgoEngine:
             asyncio.ensure_future(self._prepare_contract(leg))
         self._persist()
 
-    async def _prepare_contract(self, leg: DayLeg) -> None:
-        """Pick the ATM option contract now, so entry needs zero lookups."""
+    async def _prepare_contract(self, leg: DayLeg, direction: Optional[str] = None) -> None:
+        """Resolve the option contract for `direction`.
+
+        Before the breakout the side is unknown, so we warm BOTH and only
+        subscribe the feed. At entry the caller MUST pass the real direction:
+        the previous version looped ("CALL", "PUT") and broke on the first hit,
+        so security_id was ALWAYS the CE - a bearish breakout bought a CALL and
+        then managed it with PUT levels.
+        """
         if leg.or_high is None:
             return
         inst = get_index(leg.index_key)
@@ -566,23 +574,33 @@ class AlgoEngine:
             return
         leg.expiry = snap.get("expiry")
         leg.spot = spot
-        for direction in ("CALL", "PUT"):
-            strike = self._pick_strike(spot, step, direction, self.cfg.strike_offset)
+
+        sides = (direction,) if direction in ("CALL", "PUT") else ("CALL", "PUT")
+        for side in sides:
+            strike = self._pick_strike(spot, step, side, self.cfg.strike_offset)
             row = next((r for r in rows if abs(float(r["strike"]) - strike) < 1e-6), None)
             if row is None:
                 continue
-            node = row["ce" if direction == "CALL" else "pe"] or {}
+            node = row["ce" if side == "CALL" else "pe"] or {}
+            sec = _as_int(node.get("securityId"))
+            if not sec:
+                continue
+            # Always subscribe, so the tick feed is warm either way.
+            feed.subscribe(sec, inst.derivative_segment if inst else "NSE_FNO")
+            if direction is None:
+                continue          # pre-breakout: warming only, do not commit
             leg.strike = strike
-            leg.security_id = _as_int(node.get("securityId"))
+            leg.security_id = sec
             leg.option_ltp = _as_float(node.get("ltp"))
-            break
-        if leg.security_id:
-            feed.subscribe(leg.security_id, inst.derivative_segment if inst else "NSE_FNO")
+            leg.prepared_side = side
             self._log(
-                f"{leg.index_key} contract ready: {int(leg.strike)} "
-                f"{'CE' if leg.strike else ''} (ATM{'+' if self.cfg.strike_offset > 0 else ''}"
-                f"{self.cfg.strike_offset}) premium ~{leg.option_ltp}",
-                level="info")
+                f"{leg.index_key} contract ready: {int(strike)} "
+                f"{'CE' if side == 'CALL' else 'PE'} "
+                f"(ATM{'+' if self.cfg.strike_offset > 0 else ''}{self.cfg.strike_offset}) "
+                f"premium ~{leg.option_ltp}",
+                level="info", index=leg.index_key, side=side, strike=strike,
+            )
+            return
 
     @staticmethod
     def _strike_step(rows: List[Dict[str, Any]], fallback: int) -> int:
@@ -686,12 +704,26 @@ class AlgoEngine:
         spot = leg.spot or 0.0
         if rng <= 0 or spot <= 0:
             return
-        await self._prepare_contract(leg)
+        await self._prepare_contract(leg, direction)
         if not leg.security_id or leg.strike is None:
             leg.note = "contract not ready - cannot enter"
-            self._log(f"{leg.index_key}: breakout seen but contract not ready", level="error")
+            self._log(f"{leg.index_key}: breakout seen but {direction} contract not ready",
+                      level="error")
+            return
+        if leg.prepared_side != direction:
+            # Fail-safe: never send an order whose option side disagrees with the
+            # breakout. Silence here is how a PUT signal buys a CALL.
+            leg.note = f"contract side mismatch ({leg.prepared_side} != {direction})"
+            self._log(
+                f"{leg.index_key}: ABORT entry - prepared {leg.prepared_side or '?'} "
+                f"contract but breakout is {direction}",
+                level="error", index=leg.index_key)
+            leg.status = "error"
+            self._persist()
             return
 
+        # Set the signal BEFORE sizing so _delta_for resolves the right leg.
+        leg.signal = direction
         sizing = await self._size_position(leg)
         if sizing["lots"] < max(1, self.cfg.min_lots):
             leg.status = "skipped"
@@ -820,7 +852,7 @@ class AlgoEngine:
         premium = leg.option_ltp or 0.0
         rng = leg.or_range or 0.0
         sl_points = self.cfg.sl_mult * rng
-        delta = self._delta_for(leg) or get_settings().algo_paper_delta
+        delta = self._delta_for(leg, leg.signal) or get_settings().algo_paper_delta
         balance = await self._balance()
         risk_per_lot = max(sl_points * delta * lot, 1e-6)
         premium_per_lot = max(premium * lot, 1e-6)
@@ -860,13 +892,19 @@ class AlgoEngine:
             ),
         }
 
-    def _delta_for(self, leg: DayLeg) -> Optional[float]:
+    def _delta_for(self, leg: DayLeg, direction: Optional[str] = None) -> Optional[float]:
+        """Option delta for the leg we are about to trade.
+
+        `direction` must be explicit; falling back to "CALL" silently looked up
+        the wrong side on PUT entries.
+        """
+        side = direction or leg.prepared_side or leg.signal or "CALL"
         snap = chain_engine.snapshot(leg.index_key)
         if not snap:
             return None
         for row in snap.get("rows") or []:
             if abs(float(row["strike"]) - float(leg.strike or 0)) < 1e-6:
-                node = row["ce" if (leg.signal or "CALL") == "CALL" else "pe"] or {}
+                node = row["ce" if side == "CALL" else "pe"] or {}
                 d = (node.get("greeks") or {}).get("delta")
                 return abs(float(d)) if d else None
         return None
