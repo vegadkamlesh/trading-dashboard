@@ -352,7 +352,57 @@ class AlgoEngine:
         return result
 
     # ---------------------------------------------------------------- toggles
+    async def _preflight_ip(self) -> Dict[str, Any]:
+        """Refuse to arm LIVE when Dhan would reject our outbound IP.
+
+        Dhan whitelists order APIs against a static IP, so a mismatch means
+        DH-905 on every entry. Catching it at arm time beats discovering it at
+        the 09:25 breakout, which is exactly what happened on 2026-09-28.
+        """
+        s = get_settings()
+        if not s.is_configured():
+            return {"ok": False, "reason": "Dhan credentials are not configured"}
+        try:
+            info = await get_dhan_client().get_ip() or {}
+        except DhanAPIError as exc:
+            return {"ok": False, "reason": f"could not read static IP: {exc.error_message}"}
+        status = str(info.get("ipMatchStatus") or "").upper()
+        # NOTE: never substring-match "MATCH" - "MISMATCH" contains it.
+        allowed = info.get("ordersAllowed")
+        if allowed is not None:
+            ok = bool(allowed)
+        else:
+            ok = status in ("PRIMARY_MATCH", "SECONDARY_MATCH")
+        if ok:
+            return {"ok": True, "reason": f"Dhan accepts our IP ({status or 'ordersAllowed'})"}
+        detected = info.get("detectedIP")
+        if not detected:
+            detected = await get_dhan_client().detect_public_ip()
+        return {
+            "ok": False,
+            "reason": (
+                f"Dhan would reject our orders: registered="
+                f"{info.get('primaryIP') or '-'} / {info.get('secondaryIP') or '-'} "
+                f"but we egress as {detected} ({status or 'MISMATCH'}). "
+                f"Register {detected} via Settings > Static IP."
+            ),
+            "primary": info.get("primaryIP"),
+            "secondary": info.get("secondaryIP"),
+            "detected": detected,
+            "ipMatchStatus": status,
+            "ordersAllowed": info.get("ordersAllowed"),
+            "modifyDatePrimary": info.get("modifyDatePrimary"),
+            "modifyDateSecondary": info.get("modifyDateSecondary"),
+        }
+
     async def arm(self) -> Dict[str, Any]:
+        # LIVE preflight: never arm into a state where every order will bounce.
+        if not runtime.is_dry_run():
+            check = await self._preflight_ip()
+            if not check.get("ok"):
+                self._log(f"ARM REFUSED (live): {check['reason']}", level="error")
+                return {**self.status(), "armed": False, "armError": check}
+            self._log(f"IP preflight OK: {check['reason']}", level="info")
         self.enabled = True
         self._log(f"ALGO ARMED ({'DRY-RUN' if runtime.is_dry_run() else 'LIVE'})", level="success")
         await self.reconcile()

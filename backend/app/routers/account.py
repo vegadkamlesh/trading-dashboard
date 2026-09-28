@@ -48,6 +48,26 @@ async def holdings(_session: str = Depends(require_session)):
         raise HTTPException(status_code=502, detail=exc.to_dict())
 
 
+def _ip_match_status(registered: Any) -> bool | None:
+    """Dhan's own verdict on whether our outbound IP is whitelisted.
+
+    Dhan returns `ordersAllowed` (bool) plus `ipMatchStatus` such as
+    "PRIMARY_MATCH"/"SECONDARY_MATCH"/"MISMATCH".
+
+    Do NOT substring-match "MATCH": "MISMATCH" contains it, which made every
+    mismatch report as a match - so the UI blamed Dhan for a stale local IP.
+    """
+    if not isinstance(registered, dict):
+        return None
+    allowed = registered.get("ordersAllowed")
+    if allowed is not None:
+        return bool(allowed)
+    status = str(registered.get("ipMatchStatus") or "").upper()
+    if not status:
+        return None
+    return status in ("PRIMARY_MATCH", "SECONDARY_MATCH")
+
+
 @router.get("/ip")
 async def ip_status(_session: str = Depends(require_session)):
     client = get_dhan_client()
@@ -77,8 +97,8 @@ async def ip_status(_session: str = Depends(require_session)):
         "ipMatchStatus": ip_match_status,
         "ordersAllowed": orders_allowed,
         # Dhan uses variants like "PRIMARY_MATCH" / "SECONDARY_MATCH".
-        "match": ("MATCH" in str(ip_match_status).upper())
-        if ip_match_status
+        "match": _ip_match_status(registered)
+        if _ip_match_status(registered) is not None
         else _ip_match(registered, detected),
     }
 
@@ -115,9 +135,7 @@ async def ip_diagnose(_session: str = Depends(require_session)):
     except DhanAPIError as exc:
         err = exc.to_dict()
 
-    getip_ok = bool(verdict.get("ordersAllowed")) or "MATCH" in str(
-        verdict.get("ipMatchStatus", "")
-    ).upper()
+    getip_ok = bool(_ip_match_status(verdict))
 
     # 2) What the ORDER engine actually does — a deliberately bad order. If the
     #    IP is accepted, Dhan complains about the (bogus) securityId instead of
