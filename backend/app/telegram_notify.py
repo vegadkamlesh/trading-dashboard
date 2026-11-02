@@ -21,6 +21,8 @@ EVENTS = {
     "heartbeat": "Notification worker heartbeat (not broker/trading readiness)",
     "algo_update": "Algo activity recorded; check dashboard journal",
     "algo_armed": "Algo armed by operator",
+    "auto_armed": "Startup defaults applied: algo auto-armed for the default accounts",
+    "auto_arm_failed": "Startup auto-arm FAILED or partial; algo may NOT trade. Check dashboard now",
     "algo_disarmed": "Algo disarmed; new entries stopped, open-position management continues",
     "algo_entry": "Algo entry confirmed",
     "algo_exit": "Algo exit recorded; check journal for reconciliation/estimates",

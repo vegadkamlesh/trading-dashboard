@@ -788,6 +788,16 @@ class CloudHelpersTest(unittest.TestCase):
         self.assertNotIn("real-token", command)
         script = command.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         compile(script, "remote", "exec")
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("APP_FAST_ORDERS=true\nALGO_AUTO_ARM=true\nDHAN_ACCESS_TOKEN=old\nAPP_DRY_RUN=true\n")
+            local = (script.replace('"/opt/trading/backend/.env"', repr(str(env)))
+                     .replace("os.chown(tmp, st.st_uid, st.st_gid)", ""))
+            raw = json.dumps({"DHAN_ACCESS_TOKEN": "new"}).encode()
+            with patch("subprocess.check_output", return_value=raw):
+                exec(compile(local, "remote", "exec"), {})
+            self.assertEqual(env.read_text().splitlines(), [
+                "APP_FAST_ORDERS=true", "ALGO_AUTO_ARM=true", "DHAN_ACCESS_TOKEN=new", "APP_DRY_RUN=false"])
         with self.assertRaises(ValueError):
             deploy.live_config_command("ap-south-1", "/x; rm -rf /", False)
 

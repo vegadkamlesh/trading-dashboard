@@ -612,6 +612,36 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(client_module._trading_clients["master"],
                          client_module._trading_clients["child"])
 
+    async def test_startup_auto_arm_arms_both_and_skips_ip_rejected_account(self):
+        from app.routers import trading_accounts
+
+        auto = Settings(_env_file=None, dhan_client_id="master-id", dhan_access_token="data-token",
+                        dhan_master_trading_token="token-master-id",
+                        dhan_child_client_id="child-id", dhan_child_access_token="token-child-id",
+                        TRADING_DEFAULT_ACCOUNTS="master,child", algo_auto_arm=True)
+        self.patch.object(trading_accounts, "get_settings", return_value=auto)
+        self.patch.object(accounts, "_selected", ("master",))
+        algo_module.engines.entry_accounts = ()
+        for engine in self.manager.items.values():
+            engine.enabled = False
+        ip_ok = {"master": True, "child": True}
+        for account, engine in self.manager.items.items():
+            async def preflight(account=account):
+                return {"ok": ip_ok[account], "reason": "test"}
+            self.patch.object(engine, "_preflight_ip", new=preflight)
+        result = await trading_accounts.apply_startup_defaults()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(accounts.selected_accounts(), ("master", "child"))
+        self.assertEqual(algo_module.engines.entry_accounts, ("master", "child"))
+        self.assertTrue(all(e.enabled for e in self.manager.items.values()))
+
+        await self.http.post("/api/trading/algo", json={"action": "disarm"})
+        ip_ok["child"] = False
+        result = await trading_accounts.apply_startup_defaults()
+        self.assertFalse(result["ok"])
+        self.assertEqual(algo_module.engines.entry_accounts, ("master",))
+        self.assertFalse(self.manager.items["child"].enabled)
+
     async def test_algo_exit_both_reports_pending_broker_error_not_false_success(self):
         for account, engine in self.manager.items.items():
             result = {"position": {"executionError": "Broker exit timed out"}} if account == "child" else {"position": None}

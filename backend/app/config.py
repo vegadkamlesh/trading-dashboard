@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     # Fast orders: when True, the order PIN is NOT required (1-click scalping).
     # Set to True only while actively scalping; keep False otherwise.
     app_fast_orders: bool = False
+    # Accounts enabled for orders/algo at startup, e.g. "master,child".
+    trading_default_accounts_raw: str = Field("master", validation_alias="TRADING_DEFAULT_ACCOUNTS")
+    # When True, the algo is armed for the default accounts right after startup
+    # (same IP preflight as a manual ARM). Keep False unless unattended trading is intended.
+    algo_auto_arm: bool = False
+
+    @property
+    def trading_default_accounts(self) -> list[str]:
+        return [s.strip().lower() for s in self.trading_default_accounts_raw.split(",") if s.strip()]
 
     # --- Logging ---
     # Directory for the app log files (relative to backend/, or absolute).

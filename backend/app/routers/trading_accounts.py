@@ -225,6 +225,38 @@ async def algo_action(body: AlgoAction):
         return {"ok": all(r["ok"] for r in results), "results": results}
 
 
+async def apply_startup_defaults() -> dict:
+    """Apply .env account selection and optional auto-arm once, right after engines start."""
+    s = get_settings()
+    try:
+        async with engines.selection_lock:
+            select_accounts(s.trading_default_accounts)
+    except HTTPException as exc:
+        logger.error("startup_defaults selection failed: %s", exc.detail,
+                     extra={"telegram_event": "auto_arm_failed" if s.algo_auto_arm else "error"})
+        return {"ok": False, "error": exc.detail}
+    logger.info("startup_defaults recipients=%s autoArm=%s", selected_accounts(), s.algo_auto_arm)
+    if not s.algo_auto_arm:
+        return {"ok": True, "armed": False}
+    try:
+        result = await algo_action(AlgoAction(action="arm"))
+    except HTTPException as exc:
+        logger.error("startup_auto_arm refused: %s", exc.detail, extra={"telegram_event": "auto_arm_failed"})
+        return {"ok": False, "error": exc.detail}
+    except Exception:
+        logger.exception("startup_auto_arm failed", extra={"telegram_event": "auto_arm_failed"})
+        return {"ok": False, "error": "unexpected"}
+    mode = "DRY-RUN" if runtime.is_dry_run() else "LIVE"
+    armed = ",".join(engines.entry_accounts) or "none"
+    if result.get("ok"):
+        logger.info("startup_auto_arm armed=%s", armed,
+                    extra={"telegram_event": "auto_armed", "telegram_account": armed, "telegram_mode": mode})
+    else:
+        logger.error("startup_auto_arm partial armed=%s results=%s", armed, result.get("results"),
+                     extra={"telegram_event": "auto_arm_failed", "telegram_account": armed, "telegram_mode": mode})
+    return result
+
+
 class ExitBoth(BaseModel):
     securityId: str
     exchangeSegment: str

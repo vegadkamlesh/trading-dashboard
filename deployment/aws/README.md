@@ -109,7 +109,9 @@ grants only the instance role read access (a reviewed change that may modify
 only `InstanceRole`), rewrites the managed keys in the instance `.env` through
 SSM without placing secrets in the command, and restarts the service. Rerun it
 after refreshing a Dhan token locally. Without `--keep-dry-run` real orders are
-enabled (`APP_DRY_RUN=false`, PIN still required); the algo stays disarmed.
+enabled (`APP_DRY_RUN=false`). Existing `APP_FAST_ORDERS`,
+`TRADING_DEFAULT_ACCOUNTS` and `ALGO_AUTO_ARM` values in the instance `.env`
+are preserved (fast orders default to `false` only when absent).
 Stop the local backend first: never run two engines against one Dhan account.
 
 The app refuses to start when saved algo state belongs to another Dhan client
@@ -156,8 +158,21 @@ next-morning reconciliation cannot protect overnight exposure. Always inspect
 the broker's actual positions and orders before taking further action.
 
 On application startup, new algo entries are disarmed, but a persisted live
-position may still be managed according to its original execution mode. Merely
-setting dry-run does not make an imported live state harmless. Never copy or
+position may still be managed according to its original execution mode.
+
+### Unattended daily startup (opt-in)
+
+`TRADING_DEFAULT_ACCOUNTS=master,child` selects the order/algo recipients at
+every startup (default `master`). With `ALGO_AUTO_ARM=true` the app then runs
+the same guarded shared ARM as the Algo tab: each account must pass the live
+static-IP preflight, an account that fails is skipped, and ARM is refused while
+a position is tracked. Telegram receives `auto_armed` or `auto_arm_failed`.
+Current owner-approved live setting: `APP_DRY_RUN=false`, `APP_FAST_ORDERS=true`
+(no PIN), both accounts, auto-arm on. Auto-arm cannot succeed with an expired
+Dhan token, so tokens must be refreshed before each trading day. Set
+`ALGO_AUTO_ARM=false` to return to manual ARM.
+
+Merely setting dry-run does not make an imported live state harmless. Never copy or
 restore old trading state blindly, and never run local and cloud engines against
 the same account simultaneously. Real Dhan credentials, static-IP registration,
 state migration, broker reconciliation and LIVE/ARM each require separate

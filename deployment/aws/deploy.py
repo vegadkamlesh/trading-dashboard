@@ -1340,11 +1340,14 @@ import json, os, subprocess, tempfile
 raw = subprocess.check_output(["aws", "ssm", "get-parameter", "--region", "{region}", "--name", "{parameter}",
     "--with-decryption", "--query", "Parameter.Value", "--output", "text"])
 creds = json.loads(raw)
-managed = {set(LIVE_CREDENTIAL_KEYS)!r} | {{"APP_DRY_RUN", "APP_FAST_ORDERS"}}
+managed = {set(LIVE_CREDENTIAL_KEYS)!r} | {{"APP_DRY_RUN"}}
 path = "/opt/trading/backend/.env"
 st = os.stat(path)
 lines = [l for l in open(path, encoding="utf-8").read().splitlines() if l.split("=", 1)[0] not in managed]
-lines += [f"{{k}}={{v}}" for k, v in creds.items()] + ["APP_DRY_RUN={dry}", "APP_FAST_ORDERS=false"]
+# Operator trading defaults (APP_FAST_ORDERS, TRADING_DEFAULT_ACCOUNTS, ALGO_AUTO_ARM) are preserved.
+if not any(l.startswith("APP_FAST_ORDERS=") for l in lines):
+    lines.append("APP_FAST_ORDERS=false")
+lines += [f"{{k}}={{v}}" for k, v in creds.items()] + ["APP_DRY_RUN={dry}"]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
 with os.fdopen(fd, "w", encoding="utf-8") as f:
     f.write("\\n".join(lines) + "\\n")
@@ -1415,7 +1418,8 @@ def push_live_credentials(profile: str, stack: str, approved: bool, dry_run: boo
         print(result.get("StandardOutputContent", "").strip())
         if result.get("Status") != "Success":
             print(result.get("StandardErrorContent", "").strip())
-    print(f"Live configuration applied; dryRun={'true' if dry_run else 'false'}, algo stays disarmed")
+    print(f"Live configuration applied; dryRun={'true' if dry_run else 'false'}; "
+          "fast-order/auto-arm defaults in the instance .env were preserved")
 
 
 def prepare_mock_release(profile: str, stack: str, data_recovery: str, confirmed: bool) -> None:

@@ -88,6 +88,8 @@ async def trading_lifespan(app: FastAPI):
         logger.info("Option chain poller started for: %s", s.oc_polled_indices)
         await engines.start()
         logger.info("ORB algo engine ready (arm it from the Algo tab)")
+        from .routers.trading_accounts import apply_startup_defaults
+        await apply_startup_defaults()
     try:
         yield
     finally:
