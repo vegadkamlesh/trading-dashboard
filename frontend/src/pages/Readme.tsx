@@ -43,6 +43,196 @@ export function Readme() {
         </div>
       </Section>
 
+      <Section title="Master paid Data API: benefits aur kya use ho raha hai">
+        <ul className="list-disc space-y-2 pl-5 text-xs">
+          <li><strong>Market data:</strong> tick-by-tick spot/option LTP; REST batched LTP/OHLC/quote
+            (up to 1,000 instruments/request); option chain IV, greeks, OI, volume, bid/ask, expiry list.
+            App Master ticker feed, chain aur LTP/OHLC fallback use karta hai.</li>
+          <li><strong>Historical:</strong> daily to inception; last 5 years intraday
+            1/5/15/25/60-minute candles, max 90 days/request. Expired rolling options max 30 days/request,
+            OHLC/IV/OI/spot/volume. OR, charts aur history studies ke liye; long cache sirf historical.</li>
+          <li><strong>Future:</strong> richer quote/full-feed parser, liquidity filters, 20/200-level
+            depth (NSE only, SENSEX nahi), more backtested strategies. Depth entitlement Dhan se confirm
+            karo; purchased Data plan unlimited calls ya profit guarantee nahi.</li>
+          <li><strong>Trading APIs free aur separate:</strong> orders/Super Orders, portfolio/funds,
+            live order updates used. GTT/OCO, conditional triggers, margin calculators, ledger,
+            broker kill switch/P&amp;L exit future options hain; silently enabled nahi. DISARM kill switch nahi.</li>
+          <li><a className="text-sky-300 underline" href="https://dhanhq.co/docs/v2/"
+            target="_blank" rel="noreferrer">Official Dhan API docs / limits</a>.
+            Master data subscription dono views ko feed karti hai; Child token trading/account-only.</li>
+        </ul>
+      </Section>
+
+      <Section title="Master Dhan + Child Dhan: toggles, same signal, separate accounts">
+        <ul className="list-disc space-y-2 pl-5 text-xs">
+          <li><strong>Data:</strong> market data, quotes, history aur ek WebSocket sirf Master se.
+            Child ka Data API nahi chahiye. Dono ka Trading API/client ID alag hai.</li>
+          <li><strong>Trading checkboxes = NEW entry recipients.</strong> Master only, Child only,
+            both ya none. Viewing dropdown sirf kiska funds/orders/positions/IP/journal dikhana hai;
+            recipient selection nahi badalta. View change par purana ticket/panel clear hota hai.</li>
+          <li><strong>Manual:</strong> same contract/direction/lots har selected account ko.
+            Funds preview account-wise. Ek ke funds kam ya rejection ho to doosra continue;
+            successful trade automatically reverse nahi hota. Dono results alag check karo.</li>
+          <li><strong>Algo:</strong> Master view se shared config edit karo. ARM har recipient ka IP
+            check karta hai; failed account clearly report aur disarm, healthy account continue.
+            Master trading OFF ho tab bhi Master signal coordinator rehta hai, Master trade nahi.
+            Same contract/direction/target anchor; lots har account ke apne balance se.
+            Fill price aur premium SL account ke actual fill ke hisab se alag ho sakte hain.
+            ON/OFF toggle shared hai: kisi bhi view se ON = checked recipients arm,
+            OFF = sab disarm. Algo ready list actual armed recipients dikhati hai;
+            Viewing se toggle ka shared status nahi badalta.</li>
+          <li><strong>EXIT:</strong> viewed account only. EXIT BOTH exact contract dono configured
+            accounts mein; ALGO EXIT BOTH unke apne tracked algo positions mein. Entry OFF karna
+            existing holding management/exit band nahi karta. Exit pending/error ko CLOSED mat samjho.</li>
+          <li><strong>Restart:</strong> selection Master-only; new algo entries disarmed, old positions
+            reconcile/manage hote hain. Dono account ki tracked position par unsafe mode/config/selection
+            changes blocked. Ek shared signal attempt/day; reject/timeout par blind replay nahi.
+            Dono fills atomic ya same price par hone ki guarantee nahi.</li>
+          <li><strong>Backend .env:</strong> DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN = Master data;
+            optional DHAN_MASTER_TRADING_TOKEN = Master trading (same client ID).
+            DHAN_CHILD_CLIENT_ID + DHAN_CHILD_ACCESS_TOKEN = Child trading. Dono Child values fill karo,
+            distinct client ID use karo, phir restart. Secrets frontend/Git mein mat dalo.
+            Master ka same token trading + data dono ke liye use karna ho to
+            DHAN_MASTER_TRADING_TOKEN blank rakho.
+            Har account ka funds aur static IP check karke hi LIVE/ARM karo.</li>
+          <li><strong>Same static IP:</strong> Dhan ke official FAQ ke hisab se eligible family accounts
+            verification/approval ke baad ek IP share kar sakte hain. Registered email se
+            apihelp@dhan.co ko mapping request bhejo, respective family accounts ke registered emails
+            CC mein rakho. Sirf dono mein IP register karna approval nahi hai. Apne accounts ki eligibility
+            Dhan se confirm karo; app ka IP preflight approval certify nahi karta.{" "}
+            <a className="text-sky-300 underline"
+              href="https://dhan.co/support/platforms/dhanhq-api/can-multiple-family-member-accounts-use-the-same-static-ip-for-api-trading/"
+              target="_blank" rel="noreferrer">Official Dhan FAQ</a>.</li>
+          <li><strong>Debug:</strong> account-master-YYYY-MM-DD.log / account-child-YYYY-MM-DD.log;
+            batch/correlation ID aur broker reason se trace karo. Separate audit-child.sqlite3 aur
+            data/algo/child state. Data gates shared, trading budgets account-wise; ek backend process
+            hi chalao. Offline tests real credentials, broker availability ya fills certify nahi karte.</li>
+        </ul>
+      </Section>
+
+      <Section title="ORB Algo: BUY, SL, target aur exit ka exact flow">
+        <ol className="list-decimal space-y-2 pl-5 text-xs">
+          <li>
+            <strong>Range:</strong> 09:26 IST ke baad 09:15 se 09:25 inclusive candle timestamps
+            ka high/low lock hota hai (existing window: 11 one-minute timestamps).
+            Spot high se strictly upar = CALL BUY; low se strictly neeche = PUT BUY.
+            First index trade leta hai; doosra lock. Default 15:00 se fresh entry band.
+            Index quotes 2 decimals pe compare hote hain, float noise breakout nahi banta.
+          </li>
+          <li>
+            <strong>Contract:</strong> offset 0 = ATM; +1 = one strike OTM.
+            Spot aur option premium 5 seconds se purane hon to fresh entry wait karti hai.
+            Entry bhejne se pehle breakout recheck hota hai.
+          </li>
+          <li>
+            <strong>Order accepted != filled:</strong> TRANSIT/PENDING par position filled nahi
+            maani jaati. Broker ka confirmed filled quantity + average price chahiye.
+            Partial BUY ka remainder cancel-confirm hone ke baad actual filled units manage hote hain.
+            Unknown network result par correlation ID se check hota hai, blind duplicate order nahi.
+          </li>
+          <li>
+            <strong>Target-only (default ON):</strong> software spot SL aur break-even exit OFF.
+            R = OR high - OR low, S = shared breakout dispatch ka spot.
+            CALL target = S + 2R; PUT target = S - 2R (default multiplier).
+            Example CALL S=22,750, R=100: target 22,950. Spot 22,730 ya neeche aane
+            se software stop exit nahi hoga. Fresh spot target hit par market exit request.
+          </li>
+          <li>
+            <strong>Classic mode only:</strong> Target-only untick karoge tab 0.20R spot SL
+            aur configured break-even apply ho sakte hain. Study results classic mode ke hain;
+            target-only performance unse assume mat karo.
+          </li>
+          <li>
+            <strong>Protective premium SL:</strong> confirmed fill ke baad Dhan pe pending
+            STOP_LOSS_MARKET SELL at 10% of entry premium (90% door), minimum 0.05, tick 0.05.
+            Rs100 BUY ho to far SL Rs10. Close software SL nahi. Large loss possible;
+            SL hit na hone ki guarantee nahi, gap mein aur loss ho sakta hai.
+            Pending SELL dikhna matlab BUY ke turant baad actual SELL fill hona nahi hai.
+            Trigger already crossed ho to safe exit request hoti hai.
+          </li>
+          <li>
+            <strong>Safe exit:</strong> protective SL cancel/fill confirm → actual broker qty recheck
+            → zaroorat ho tab MARKET SELL. Duplicate PANIC / auto / Positions EXIT serialized hain.
+            Exit PENDING ya rejected ho to dashboard CLOSED nahi bolta.
+            Broker zero qty aur pending SELL clear hone par trade journal mein close hota hai.
+            Default ORB forced exit 15:12. Manual Super Orders par ye app-wide timer nahi hai.
+            Broker/connection failure ho to Dhan par manually check karo.
+          </li>
+          <li>
+            <strong>Lots:</strong> risk budget, premium affordability aur max lots se size.
+            Default minimum 1 lot risk/capital % ko override kar sakta hai, actual cash ko nahi.
+            Default max 10, capital 60%, effective risk 0.5%. Saved Settings defaults se alag ho sakti hain.
+            Target-only risk estimate 90% premium loss per lot leta hai, purana tight spot-stop estimate nahi.
+            Registry NIFTY 65 / SENSEX 20 ko LIVE se pehle current contract se verify karo.
+          </li>
+          <li>
+            <strong>OFF / restart:</strong> Disarm sirf fresh BUY band karta hai; existing holding ka
+            stop/target management aur broker sync continue. Open position par mode/config change blocked.
+            Restart pending order IDs aur holdings reconcile karta hai; next day surviving holding
+            silently delete nahi hoti. Server bandh ho to software SL/target nahi chalega.
+            Purani saved policy target-only mein migrate hoti hai; old broker SL cancel-confirm hone
+            tak purana SL still execute ho sakta hai. Broker warning check karo.
+            Prior-day INTRADAY stale tracking tabhi recover hoti hai jab do fresh holdings checks
+            flat aur current order/leg books safe hon. Unknown/same-day holding delete nahi hoti.
+            Recovered exit price estimated hota hai, actual historical fill nahi.
+            Restart par configured DRY-RUN default normal hai. Mode switch pe algo disarm hota hai;
+            settings verify karke explicitly ARM karo. Failure ka actual reason Settings mein dikhega.
+          </li>
+        </ol>
+      </Section>
+
+      <Section title="Manual orders: reference, retries aur safety">
+        <ul className="list-disc space-y-2 pl-5 text-xs">
+          <li>Ticket ka exact-contract Ref LTP shared chain se 3s pe refresh hota hai. LIMIT price khud change nahi hota; LTP button se reset karo. Stale quote ya preview error par Confirm disabled hai.</li>
+          <li>MARKET submit pe server fresh cached premium (maximum 12s old) se target/SL calculate karta hai, actual fill se nahi. Slippage ke kaaran quick target/stop fill phir bhi possible hai.</li>
+          <li>Whole exchange lots aur 0.05 tick validate hote hain. Rounding se target/SL entry ke barabar ya invalid ho to order reject hota hai. Manual aur algo lot override same hai.</li>
+          <li>Current balance unknown/malformed ho to order send nahi hota. Start-of-day balance available cash nahi hai. Short SELL ke liye premium estimate full exchange margin approval nahi hai.</li>
+          <li>Har ticket ka request ID aur broker correlation SQLite mein save hota hai. Same ID retry pe duplicate BUY/SELL nahi; unknown result pe block. Naya ticket naya intent hai: timeout ke baad Dhan check kiye bina reopen/reorder mat karo.</li>
+          <li>Manual EXIT identity restart ke baad bhi recover hoti hai. Pending entry pe pehle entry cancel karo; protective legs terminal-confirm hone aur actual holdings check ke baad exit order send hota hai.</li>
+          <li>Manual target/SL broker ke Super Order legs hain. 15:12 app timer sirf ORB holding ke liye hai; manual trades mein EXIT aur broker square-off rules follow karo.</li>
+        </ul>
+      </Section>
+
+      <Section title="Live sync aur Dhan API pacing">
+        <ul className="list-disc space-y-2 pl-5 text-xs">
+          <li>Algo UI, Positions, standard/Super Orders aur Funds 1s poll. Dono configured accounts
+            backend mein ~1s refresh hote hain, selected/viewed na ho tab bhi. Request latency/cooldown
+            se delay badh sakta hai; exact 1s guarantee nahi.</li>
+          <li>Alag Master/Child trading-token order-update sockets website/app/API orders ki
+            notification par fresh REST refresh trigger karte hain. Event alone holding flat ka proof nahi.</li>
+          <li>Website se exit ke baad Dhan netQty priority hai: partial exit par remaining qty,
+            full exit par broker FLAT. Unverified outstanding SL/exit tracking attention mein reh sakti
+            hai, open holding nahi. Unknown SELL par duplicate SELL nahi.</li>
+          <li>Algo P&amp;L mein available broker realized + unrealized contract total preferred.
+            Broker field missing ho to quote estimate clearly labelled; broker-flat par saved
+            premium profit ko live profit nahi dikhate. Missing order detail ko fresh current
+            book se exact ID/correlation par verify karte hain, guessed fill nahi.</li>
+          <li>Purana prior-day INTRADAY pending entry twice-fresh flat holdings aur no active/unknown
+            current orders/legs ke baad safely retire hota hai. Historical fill/P&amp;L UNKNOWN,
+            fake completed trade nahi; same-day/carry automatically clear nahi.</li>
+          <li>Header last broker-response age, per-resource errors aur stream/REST fallback dikhata hai.
+            Latest GET snapshots max 1s share hote hain, execution fresh reads use karti hai.
+            &gt;3s age/error = STALE/UNVERIFIED, old success ko live mat samjho.</li>
+          <li>Feed ONLINE ya ALGO ON ka matlab open trade nahi. Position state, spot age, broker-sync time alag dekho. Stale/error banner ignore mat karo.</li>
+          <li>Positions/Super Orders LTP segment-aware batched quotes se aata hai. Quote failure pe holdings/EXIT available rehte hain, price STALE dikhta hai. Broker P&amp;L, holdings aur quote snapshots same instant ke hone ki guarantee nahi.</li>
+          <li>Expiry list har IST day refresh hoti hai. Expiry change par old chain invalidate hoti hai; purana slow response new selection overwrite nahi karta.</li>
+          <li>WebSocket silent ho to batched quote fallback ~1–2s. Spot quote 5s se stale ho to software price-trigger evaluation wait karti hai; protective broker SL verify karo.</li>
+          <li>Socket healthy ho par ek option ka quote missing/5s stale ho to us subscription ka REST recovery hota hai. Feed cache aur tick consumers exchange segment + security ID use karte hain; NSE/BSE same ID ke prices mix nahi hote.</li>
+          <li>Published limits (1 Nov 2026): orders 10/s, 250/min, 1,000/hour, 7,000/day; data 5/s, 100,000/day; quotes 1/s; non-trading 20/s; option chain unique request / 3s.</li>
+          <li>Shared backend gates: orders per client 0.12s + rolling quotas; Master data 0.25s +
+            daily quota; quotes 1.05s; account reads per client 0.06s. Option-chain unique
+            client/underlying/expiry 3.1s + data budget; different chains ab same 3.1s queue mein nahi.</li>
+          <li>HTTP401 invalid/expired token par 60s retry pause; market socket reconnect backoff
+            handshake par reset nahi, valid price data ke baad reset. No blind order replay.</li>
+          <li>Available 25/27/29 Oct logs mein unknown entry/detail, old cancel, auth/feed/IP aur
+            history errors mile. Master IP error Dhan verification maangta hai; Market Closed/funds
+            guards bypass nahi. Rolling history DH-905 official-shape read-only request par bhi aaya:
+            study explicit unavailable, invalid request chunks repeat nahi; broker clarification pending.</li>
+          <li>429 par category cooldown (Retry-After, minimum 3s). Order auto-replay nahi. Ek hi backend chalao; doosre apps ki calls aur restart ke pehle usage local budgets mein count nahi hote.</li>
+          <li>Journal P&amp;L gross hai; broker fill unavailable ho to exitPriceEstimated mark hota hai. Fees/slippage aur historical study profit guarantee nahi hain.</li>
+        </ul>
+      </Section>
+
       {/* App run */}
       <Section title="▶️ App kaise chalaye">
         <ol className="list-decimal space-y-1 pl-5">
@@ -282,10 +472,11 @@ DHAN_ACCESS_TOKEN=eyJ...aapka-pura-token...`}</pre>
             (auto-refresh ~3s).
           </li>
           <li>
-            <strong>EXIT</strong> button dabao → turant <strong>MARKET</strong> order se position
-            square-off ho jayegi (on the spot).
+            <strong>EXIT</strong> button exit request bhejta hai; broker fill tak wait karo.
+            Algo position ho to wahi shared safe-exit flow chalega. Manual Super Order ke target/SL
+            cancel-confirm hone chahiye; pending entry/exit ho to duplicate order block hota hai.
           </li>
-          <li>P&L auto-refresh hote rehta hai bina rate-limit (429) trigger kiye.</li>
+          <li>Zero qty rows CLOSED hain aur EXIT disabled hai. API error aaye to stale data ko live mat samjho.</li>
         </ul>
       </Section>
 
@@ -314,12 +505,10 @@ DHAN_ACCESS_TOKEN=eyJ...aapka-pura-token...`}</pre>
           (My Profile ▸ Static IP) se bhi set kar sakte ho.
         </p>
         <div className="mt-3 rounded border border-sky-500/30 bg-sky-500/10 p-3 text-[11px] text-sky-200">
-          <strong>Ye bug theek ho gaya ✅</strong> — asli problem ye thi ki aapka net{" "}
-          <strong>IPv4 + IPv6 dono</strong> use karta hai, aur app kabhi IPv6 se Dhan ko call kar deta
-          tha, jisse <em>ipMatchStatus: MISMATCH</em> aata tha (chahe IPv4 register ho). Ab app{" "}
-          <strong>hamesha IPv4 se hi baat karta hai</strong>, isliye registered IP se match ho jata
-          hai aur <em>ordersAllowed: true</em> milta hai. Kuch karne ki zaroorat nahi — apne aap sahi
-          ho gaya.
+          App outbound connections <strong>IPv4 pe pin</strong> karta hai, lekin isse valid token,
+          registered static IP ya order acceptance guarantee nahi hoti. Dhan ka actual rejection
+          message check karo. DH-901 par token renew karo; DH-905 par IP/input verify karo.
+          Sirf getIP match dekhkar order filled ya broker bug assume mat karo.
         </div>
       </Section>
 

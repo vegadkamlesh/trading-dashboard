@@ -3,15 +3,15 @@
 What it does, once you flip it ON
 ---------------------------------
   09:15-09:25  builds the opening range (OR high / OR low) for NIFTY + SENSEX
-  09:25        locks the levels, pre-picks the option contract, sizes the lots
-  after 09:25  watches BOTH indices tick-by-tick. The FIRST one to break its
+  09:26        locks the levels, pre-picks the option contract, sizes the lots
+  after 09:26  watches BOTH indices tick-by-tick. The FIRST one to break its
                range takes the trade; the other is locked out for the day.
                break UP   -> buy CALL (ATM, or ATM +/- offset)
                break DOWN -> buy PUT
-  in trade     manages on SPOT levels:
-                   stop   = entry -/+ (sl_mult x OR range)
-                   target = entry +/- (target_mult x OR range)
-               and moves the stop to break-even once +breakeven x OR is reached
+  in trade     target = entry spot +/- (target_mult x OR range)
+               target-only default: spot SL and break-even OFF
+               broker premium SL = 10% of entry premium (90% away)
+               classic spot stops require explicit target_only=False
   15:12        force square-off
   15:30        day closed, everything archived to the journal
 
@@ -19,12 +19,10 @@ Safety model (read this)
 ------------------------
 * DRY-RUN is the default. In dry-run NOTHING is sent to Dhan; fills are
   simulated from live prices so you can paper-trade the real signals.
-* The primary stop/target are SPOT levels monitored in software, because the
-  strategy is defined on spot. That is precise but depends on this process
-  staying alive.
-* To cover that, a SECOND, much wider stop is parked at Dhan as a real
-  STOP_LOSS_MARKET order the moment the entry fills (protective_sl, on by
-  default). If this server dies, you are not left naked.
+* Software spot targets depend on this process and fresh quotes. Target-only
+  has no tight software stop. The far broker STOP_LOSS_MARKET SELL can still
+  hit, fail or slip; losses can approach the whole premium. Classic study
+  statistics do not validate target-only behavior.
 * State is persisted to disk after every meaningful change and re-synced with
   Dhan's own position book on startup, so a crash/restart resumes mid-day.
 """
@@ -32,20 +30,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from fastapi import HTTPException
+
 from . import audit, runtime
 from .algo_store import store
 from .config import get_settings
-from .dhan_client import DhanAPIError, get_dhan_client
+from .dhan_client import DhanAPIError, get_trading_client as get_dhan_client, get_dhan_client as get_data_client
+from .accounts import ACCOUNT_IDS, AccountId, account_credentials, account_scope, current_account
 from .feed import feed
 from .instruments import get_index, lot_size_for
 from .optionchain import engine as chain_engine
 from .opening_range import WINDOW_END_MIN, WINDOW_START_MIN
+from .orders import MAX_SAFETY_SL_PCT, _round_tick
 
 logger = logging.getLogger("dhan.algo")
 
@@ -54,6 +57,9 @@ MARKET_OPEN_MIN = 9 * 60 + 15
 MARKET_CLOSE_MIN = 15 * 60 + 30
 OR_READY_MIN = 9 * 60 + 26          # start computing the OR at/after this minute
 TICKER = 15
+RECONCILE_SECONDS = 1.0
+MAX_PRICE_AGE = 5.0
+TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 
 # Order-placement retry policy. `_evaluate` runs on EVERY feed tick, so without a
 # cap+backoff a rejected entry is retried many times per second. On 2026-09-28 a
@@ -92,6 +98,7 @@ def _fmt_min(m: int) -> str:
 @dataclass
 class AlgoConfig:
     indices: List[str] = field(default_factory=lambda: ["NIFTY", "SENSEX"])
+    target_only: bool = True       # no software spot stop/break-even; broker SL 90% away
     sl_mult: float = 0.2            # stop   = sl_mult     x OR range
     target_mult: float = 2.0        # target = target_mult x OR range
     breakeven_at: float = 0.0       # move stop to entry after this many x OR (0=off)
@@ -114,6 +121,7 @@ class AlgoConfig:
         s = get_settings()
         return cls(
             indices=s.algo_indices or ["NIFTY", "SENSEX"],
+            target_only=s.algo_target_only,
             sl_mult=s.algo_sl_mult,
             target_mult=s.algo_target_mult,
             breakeven_at=s.algo_breakeven_at,
@@ -185,6 +193,21 @@ class Position:
     premium: Optional[float] = None
     mfe: float = 0.0
     mae: float = 0.0
+    execution_state: str = "open"  # entry_pending | open | exit_pending | attention
+    entry_correlation_id: Optional[str] = None
+    exit_order_id: Optional[str] = None
+    exit_correlation_id: Optional[str] = None
+    protective_correlation_id: Optional[str] = None
+    exit_reason: str = ""
+    execution_error: str = ""
+    next_exit_try_at: float = 0.0
+    entry_confirmed_ts: float = 0.0
+    broker_exit_premium: Optional[float] = None
+    entry_quantity: int = 0
+    entry_cancel_requested: bool = False
+    partial_exit: bool = False
+    protective_cancel_requested: bool = False
+    protective_policy_pending: bool = False
 
     @property
     def risk_points(self) -> float:
@@ -212,7 +235,8 @@ class Position:
 #  Engine
 # --------------------------------------------------------------------------- #
 class AlgoEngine:
-    def __init__(self) -> None:
+    def __init__(self, account_id: Optional[AccountId] = None) -> None:
+        self.account_id = account_id
         self.cfg = AlgoConfig.from_settings()
         self.enabled = False
         self.phase = "off"
@@ -223,20 +247,33 @@ class AlgoEngine:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._busy = False
+        self._evaluation_task: Optional[asyncio.Task] = None
+        self._execution_lock = asyncio.Lock()
+        self._last_reconcile_at = 0.0
+        self._broker_sync_at: Optional[str] = None
+        self._broker_sync_error: Optional[str] = None
+        self._broker_net_qty: Optional[int] = None
+        self._broker_position_pnl: Optional[float] = None
         self._started_at = time.time()
         self._feed_connected = False
         self._last_error: Optional[str] = None
         self._today_trades: List[Dict[str, Any]] = []
         self._recovered: Optional[str] = None
+        self._signal_day: Optional[str] = None
 
     # ------------------------------------------------------------------ log
-    def _log(self, msg: str, level: str = "info", **extra: Any) -> None:
+    def _log(self, msg: str, level: str = "info", notification: str = "algo_update", **extra: Any) -> None:
+        msg = f"account={self.account_id or current_account()} {msg}"
         ev = {"kind": "algo", "level": level, "msg": msg, **extra}
         self._events.append(ev)
         if len(self._events) > 400:
             self._events = self._events[-400:]
         store.append_event(ev, day=self._day)
-        getattr(logger, {"warn": "warning"}.get(level, level), logger.info)(msg)
+        getattr(logger, {"warn": "warning"}.get(level, level), logger.info)(msg, extra={
+            "telegram_event": notification,
+            "telegram_account": self.account_id or current_account(),
+            "telegram_mode": "DRY-RUN" if runtime.is_dry_run() else "LIVE",
+        })
 
     # ------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -245,14 +282,23 @@ class AlgoEngine:
         self._running = True
         # Rolling retention: drop journals older than 7 days.
         store.prune_journals()
-        feed.set_on_tick(self._on_tick)
-        await feed.start()
+        if self.account_id is None:
+            feed.set_on_tick(self._on_tick)
+            await feed.start()
         self._restore()
+        self._subscribe_tracked()
         self._task = asyncio.create_task(self._supervisor(), name="algo-supervisor")
         logger.info("Algo engine started (enabled=%s, dryRun=%s)", self.enabled, runtime.is_dry_run())
 
     async def stop(self) -> None:
         self._running = False
+        if self._evaluation_task:
+            self._evaluation_task.cancel()
+            try:
+                await self._evaluation_task
+            except asyncio.CancelledError:
+                pass
+            self._evaluation_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -260,7 +306,8 @@ class AlgoEngine:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._task = None
-        await feed.stop()
+        if self.account_id is None:
+            await feed.stop()
         self._persist()
 
     # ---------------------------------------------------------------- state
@@ -275,6 +322,9 @@ class AlgoEngine:
                 "position": asdict(self._position) if self._position else None,
                 "todayTrades": self._today_trades,
                 "savedAt": time.time(),
+                "signalDay": self._signal_day,
+                "accountId": self.account_id or current_account(),
+                "clientId": account_credentials(self.account_id)[0] if self.account_id else None,
             }
         )
 
@@ -283,12 +333,16 @@ class AlgoEngine:
         data = store.load_state()
         if not data:
             return
+        if self.account_id and data.get("clientId") and data["clientId"] != account_credentials(self.account_id)[0]:
+            raise RuntimeError(f"{self.account_id}: saved trading state belongs to a different Dhan client ID. "
+                               "Restore the original credentials and reconcile before changing accounts.")
         try:
             cfg = AlgoConfig(**{**asdict(self.cfg), **(data.get("config") or {})})
             self.cfg = cfg
         except TypeError:
             pass
         self.enabled = bool(data.get("enabled"))
+        self._signal_day = data.get("signalDay")
         self._day = data.get("day")
         self._today_trades = list(data.get("todayTrades") or [])
         legs = data.get("legs") or {}
@@ -302,6 +356,12 @@ class AlgoEngine:
         if pos:
             try:
                 self._position = Position(**pos)
+                if "target_only" not in (data.get("config") or {}):
+                    self._position.protective_policy_pending = self.cfg.target_only
+                    if not self._position.exit_order_id and not self._position.exit_correlation_id:
+                        self._position.exit_reason = ""
+                    self._log("Migrating legacy position to target-only: software SL disabled; old broker SL must be verified/cancelled before replacement.",
+                              level="warn")
             except TypeError:
                 self._position = None
         if self._day:
@@ -313,35 +373,277 @@ class AlgoEngine:
 
     async def reconcile(self) -> Dict[str, Any]:
         """Compare our idea of the world with Dhan's actual position book."""
+        async with self._execution_lock:
+            return await self._reconcile_locked()
+
+    def _subscribe_tracked(self) -> None:
+        for key in self.cfg.indices:
+            inst = get_index(key)
+            if inst:
+                feed.subscribe(inst.sec_id, "IDX_I")
+        if self._position:
+            feed.subscribe(self._position.security_id, self._segment_for(self._position.index_key))
+
+    async def _order_state(self, order_id: Optional[str], correlation: Optional[str]) -> Dict[str, Any]:
+        client = get_dhan_client()
+        if order_id:
+            raw = await client.get_order_by_id(order_id)
+        elif correlation:
+            raw = await client.get_order_by_correlation(correlation)
+        else:
+            raise DhanAPIError(0, "UNKNOWN_ORDER", "Missing order identity; check Dhan before retrying.")
+        if isinstance(raw, list):
+            matches = [row for row in raw if isinstance(row, dict) and (
+                (order_id and str(row.get("orderId")) == str(order_id))
+                or (not order_id and correlation and row.get("correlationId") == correlation)
+            )]
+            raw = matches[0] if len(matches) == 1 else None
+        if not isinstance(raw, dict) or not raw.get("orderStatus"):
+            raise DhanAPIError(0, "UNKNOWN_ORDER", "Broker returned no order status; check Dhan.")
+        return raw
+
+    async def _recover_historical_flat(
+        self, pos: Position, rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Retire prior-session DAY orders only after fresh books and flat holdings."""
+        today = now_ist().date().isoformat()
+        if (self._position is not pos or pos.dry_run or not self._day
+                or self._day >= today or self.cfg.product_type != "INTRADAY"):
+            return False
+
+        def matches(row: Dict[str, Any]) -> bool:
+            return (str(row.get("securityId")) == str(pos.security_id)
+                    and row.get("exchangeSegment") == self._segment_for(pos.index_key)
+                    and row.get("productType") == self.cfg.product_type)
+
+        client = get_dhan_client()
+        try:
+            if rows is None:
+                rows = await client.get_positions(fresh=True)
+            if not isinstance(rows, list):
+                raise DhanAPIError(0, "BAD_POSITIONS", "Invalid broker positions response")
+            if any(matches(row) and int(row.get("netQty") or 0) != 0 for row in rows):
+                return False
+            book = await client.get_order_book(fresh=True)
+            supers = await client.get_super_orders(fresh=True)
+            if not isinstance(book, list) or not isinstance(supers, list):
+                raise DhanAPIError(0, "BAD_ORDERS", "Cannot verify current broker order books")
+            identities = {str(identity) for identity in (
+                pos.order_id, pos.protective_order_id, pos.exit_order_id,
+            ) if identity}
+            for order in [*book, *supers]:
+                if not matches(order) and str(order.get("orderId")) not in identities:
+                    continue
+                status = str(order.get("orderStatus") or "").upper()
+                if status not in TERMINAL_ORDERS | {"CLOSED"}:
+                    pos.execution_error = "Historical recovery blocked: a current contract order is pending/unknown at Dhan."
+                    self._persist()
+                    return False
+                if any(str(leg.get("orderStatus") or "").upper() not in TERMINAL_ORDERS
+                       for leg in order.get("legDetails") or []):
+                    pos.execution_error = "Historical recovery blocked: a Super Order leg may still execute."
+                    self._persist()
+                    return False
+            fresh = await client.get_positions(fresh=True)
+            if not isinstance(fresh, list):
+                raise DhanAPIError(0, "BAD_POSITIONS", "Invalid broker positions recheck")
+            if any(matches(row) and int(row.get("netQty") or 0) != 0 for row in fresh):
+                return False
+        except DhanAPIError as exc:
+            self._broker_sync_error = exc.error_message
+            pos.execution_error = f"Historical recovery not confirmed: {exc.error_message}. Check Dhan."
+            self._log(pos.execution_error, level="warn")
+            self._persist()
+            return False
+        self._broker_sync_at = now_ist().isoformat()
+        self._broker_sync_error = None
+        self._broker_net_qty = 0
+        if pos.execution_state == "entry_pending":
+            self._log(
+                f"Historical entry {pos.order_id or pos.entry_correlation_id}: broker flat twice, "
+                "no actionable current orders. Tracking retired; historical fill/P&L UNKNOWN, no order sent.",
+                level="warn", outcome="HISTORICAL_ENTRY_FLAT", fillKnown=False,
+            )
+            self._position = None
+            self.enabled = False
+            self._last_error = None
+            self.phase = "off"
+            self._persist()
+            return True
+        self._log(
+            f"Recovered stale {self._day} INTRADAY tracking: broker flat twice and no active "
+            "current orders/legs. Prior-session DAY orders are no longer actionable; no order sent.",
+            level="warn",
+        )
+        self._finalise_position(
+            pos, pos.broker_exit_premium or pos.premium or pos.entry_premium,
+            "BROKER_FLAT_RECOVERED", estimated=True,
+        )
+        self._last_error = None
+        return True
+
+    async def _reconcile_locked(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {"checkedAt": now_ist().strftime("%H:%M:%S")}
+        self._last_reconcile_at = time.monotonic()
+        pos = self._position
+        if pos is not None and pos.dry_run:
+            self._broker_net_qty = None
+            if pos.protective_policy_pending:
+                await self._migrate_protective_policy(pos)
+            result["skipped"] = "Paper position is not compared with live holdings"
+            return result
         if not get_settings().is_configured():
             result["skipped"] = "Dhan not configured"
             return result
         try:
-            rows = await get_dhan_client().get_positions()
+            self._broker_net_qty = None
+            self._broker_position_pnl = None
+            if pos is not None and pos.execution_state == "entry_pending":
+                if self._day and self._day < now_ist().date().isoformat():
+                    if await self._recover_historical_flat(pos):
+                        return result
+                await self._refresh_entry(pos)
+                if self._position is None or pos.execution_state == "entry_pending":
+                    return result
+            rows = await get_dhan_client().get_positions(fresh=True)
+            if not isinstance(rows, list):
+                raise DhanAPIError(0, "BAD_POSITIONS", "Invalid broker positions response")
+            self._broker_sync_at = now_ist().isoformat()
+            self._broker_sync_error = None
         except DhanAPIError as exc:
             result["error"] = exc.error_message
             self._last_error = exc.error_message
+            self._broker_sync_error = exc.error_message
+            logger.warning("Algo broker sync failed: %s", exc)
             return result
         net: Dict[str, int] = {}
         for r in rows or []:
+            if pos and (r.get("exchangeSegment") != self._segment_for(pos.index_key)
+                        or r.get("productType") != self.cfg.product_type):
+                continue
             sid = str(r.get("securityId") or "")
             net[sid] = net.get(sid, 0) + int(r.get("netQty") or 0)
         result["openPositions"] = {k: v for k, v in net.items() if v}
-        pos = self._position
         if pos is not None:
             held = net.get(str(pos.security_id), 0)
-            if held <= 0:
+            self._broker_net_qty = held
+            matching_rows = [
+                row for row in rows if str(row.get("securityId")) == str(pos.security_id)
+                and row.get("exchangeSegment") == self._segment_for(pos.index_key)
+                and row.get("productType") == self.cfg.product_type
+            ]
+            if matching_rows and all(
+                row.get("realizedProfit") is not None and row.get("unrealizedProfit") is not None
+                for row in matching_rows
+            ):
+                try:
+                    pnl = sum(float(row["realizedProfit"]) + float(row["unrealizedProfit"]) for row in matching_rows)
+                    if not math.isfinite(pnl):
+                        raise ValueError("P&L is not finite")
+                    self._broker_position_pnl = pnl
+                except (TypeError, ValueError):
+                    self._broker_sync_error = "Invalid broker contract P&L; holding quantity remains authoritative."
+                    logger.warning("account=%s %s", self.account_id, self._broker_sync_error)
+            if held > 0 and pos.protective_policy_pending:
+                if not await self._migrate_protective_policy(pos):
+                    return result
+                rows = await get_dhan_client().get_positions(fresh=True)
+                held = sum(int(r.get("netQty") or 0) for r in rows
+                           if str(r.get("securityId")) == str(pos.security_id)
+                           and r.get("exchangeSegment") == self._segment_for(pos.index_key)
+                           and r.get("productType") == self.cfg.product_type)
+                net[str(pos.security_id)] = held
+            if held == 0:
+                if pos.entry_confirmed_ts and time.time() - pos.entry_confirmed_ts < RECONCILE_SECONDS:
+                    return result
+                if self._day and self._day < now_ist().date().isoformat() and self.cfg.product_type == "INTRADAY":
+                    result["historicalRecovered"] = await self._recover_historical_flat(pos, rows)
+                    return result
+                pos.execution_state = "attention"
+                pos.execution_error = "Broker confirms zero holding; verifying outstanding exits/protection. No repeat SELL."
+                # Never clear a position while any SELL may still execute.
+                if not await self._cancel_protective(pos):
+                    return result
+                exit_price = pos.broker_exit_premium
+                if pos.exit_order_id or pos.exit_correlation_id:
+                    try:
+                        order = await self._order_state(pos.exit_order_id, pos.exit_correlation_id)
+                        if str(order["orderStatus"]).upper() not in TERMINAL_ORDERS:
+                            pos.execution_error = "Exit still pending at broker; no duplicate SELL will be sent."
+                            self._persist()
+                            return result
+                        exit_price = _as_float(order.get("averageTradedPrice")) or exit_price
+                    except DhanAPIError as exc:
+                        self._broker_sync_error = exc.error_message
+                        return result
+                if not exit_price or pos.partial_exit:
+                    matching = [r for r in rows if str(r.get("securityId")) == str(pos.security_id)
+                                and r.get("exchangeSegment") == self._segment_for(pos.index_key)
+                                and r.get("productType") == self.cfg.product_type]
+                    exit_price = next((_as_float(r.get("sellAvg")) for r in matching if r.get("sellAvg")), None) or exit_price
                 self._log(
                     f"Reconcile: {pos.index_key} {pos.option_type} no longer held at Dhan "
                     f"-> marking trade closed", level="warn")
-                self._finalise_position(pos, pos.premium or pos.entry_premium, "RECONCILED")
+                self._finalise_position(
+                    pos, exit_price or pos.premium or pos.entry_premium,
+                    pos.exit_reason or "BROKER_CLOSED", estimated=not bool(exit_price),
+                )
+            elif held < 0 or held > pos.quantity:
+                if held < 0:
+                    await self._cancel_protective(pos)
+                pos.execution_state = "attention"
+                pos.execution_error = f"Broker net qty {held} differs from tracked {pos.quantity}; manual review required."
+                self._log(pos.execution_error, level="error")
+                self._persist()
+            elif pos.exit_order_id or pos.exit_correlation_id:
+                try:
+                    order = await self._order_state(pos.exit_order_id, pos.exit_correlation_id)
+                    pos.exit_order_id = str(order.get("orderId") or pos.exit_order_id or "") or None
+                    status = str(order["orderStatus"]).upper()
+                    if status in TERMINAL_ORDERS:
+                        # A TRADED exit can precede the position book update.
+                        if status != "TRADED":
+                            pos.execution_error = f"Exit {status}: {order.get('omsErrorDescription') or 'retry after broker sync'}"
+                            pos.exit_order_id = pos.exit_correlation_id = None
+                            pos.execution_state = "open"
+                            if held != pos.quantity:
+                                pos.entry_quantity = pos.entry_quantity or pos.quantity
+                                pos.partial_exit = True
+                            pos.quantity = held
+                            pos.next_exit_try_at = time.time() + 3.0
+                    self._persist()
+                except DhanAPIError as exc:
+                    self._broker_sync_error = exc.error_message
             elif held != pos.quantity:
+                if not await self._cancel_protective(pos):
+                    return result
+                if pos.exit_order_id or time.time() < pos.next_exit_try_at:
+                    return result
+                if not pos.entry_quantity:
+                    pos.entry_quantity = pos.quantity
+                pos.partial_exit = True
                 self._log(
                     f"Reconcile: holding {held} but tracking {pos.quantity}; adopting Dhan qty",
                     level="warn")
                 pos.quantity = held
+                if self.cfg.protective_sl:
+                    await self._place_protective_sl(pos)
+                self._persist()
+            elif self.cfg.protective_sl and not pos.protective_order_id:
+                await self._place_protective_sl(pos)
+            elif pos.protective_order_id:
+                try:
+                    order = await self._order_state(pos.protective_order_id, pos.protective_correlation_id)
+                    status = str(order["orderStatus"]).upper()
+                    if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
+                        pos.execution_state = "attention"
+                        pos.execution_error = f"Protective SL {status}; broker protection is not active. Check Dhan."
+                        self._log(pos.execution_error, level="error")
+                        self._persist()
+                except DhanAPIError as exc:
+                    self._broker_sync_error = exc.error_message
         else:
+            self._broker_net_qty = None
             for sid, qty in net.items():
                 if qty > 0:
                     self._log(
@@ -404,7 +706,8 @@ class AlgoEngine:
                 return {**self.status(), "armed": False, "armError": check}
             self._log(f"IP preflight OK: {check['reason']}", level="info")
         self.enabled = True
-        self._log(f"ALGO ARMED ({'DRY-RUN' if runtime.is_dry_run() else 'LIVE'})", level="success")
+        self._log(f"ALGO ARMED ({'DRY-RUN' if runtime.is_dry_run() else 'LIVE'})", level="success",
+                  notification="algo_armed")
         await self.reconcile()
         # Run one supervisor pass immediately so the returned status already
         # shows the real phase (otherwise the UI briefly says "OFF").
@@ -415,7 +718,8 @@ class AlgoEngine:
     def disarm(self, reason: str = "operator") -> Dict[str, Any]:
         self.enabled = False
         self._log(f"ALGO DISARMED ({reason})"
-                  + (" - open position left as-is" if self._position else ""), level="warn")
+                  + (" - new entries stopped; open-position management continues" if self._position else ""),
+                  level="warn", notification="algo_disarmed")
         self._persist()
         return self.status()
 
@@ -428,16 +732,41 @@ class AlgoEngine:
         return self.status()
 
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        if self._position is not None or self._execution_lock.locked():
+            raise HTTPException(409, "Cannot change algo configuration while execution/position is active.")
         allowed = set(asdict(self.cfg).keys())
-        for k, v in (patch or {}).items():
-            if k in allowed and v is not None:
-                current = getattr(self.cfg, k)
-                try:
-                    setattr(self.cfg, k, type(current)(v) if not isinstance(current, list)
-                            else [str(x).upper() for x in v])
-                except (TypeError, ValueError):
-                    continue
+        cfg = AlgoConfig(**{**asdict(self.cfg), **{
+            k: v for k, v in (patch or {}).items() if k in allowed and v is not None
+        }})
+        for key in ("sl_mult", "target_mult", "risk_pct", "max_capital_pct", "protective_sl_mult"):
+            value = getattr(cfg, key)
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise HTTPException(400, f"{key} must be a finite positive number")
+        if (cfg.risk_pct > 100 or cfg.max_capital_pct > 100 or cfg.protective_sl_mult < 1
+                or cfg.min_lots < 1 or cfg.max_lots < cfg.min_lots):
+            raise HTTPException(400, "Invalid risk/capital percentage, lot bounds or protective multiplier")
+        for key in ("breakeven_at", "min_or_pct", "max_or_pct"):
+            value = getattr(cfg, key)
+            if not math.isfinite(value) or value < 0:
+                raise HTTPException(400, f"{key} must be finite and nonnegative")
+        if cfg.max_or_pct and cfg.min_or_pct > cfg.max_or_pct:
+            raise HTTPException(400, "min_or_pct cannot exceed max_or_pct")
+        if cfg.order_type not in {"MARKET", "LIMIT"} or cfg.product_type not in {"INTRADAY", "MARGIN"}:
+            raise HTTPException(400, "Unsupported algo order/product type")
+        if not cfg.indices or any(get_index(key) is None for key in cfg.indices):
+            raise HTTPException(400, "Select at least one supported index")
+        entry_min = _to_min(cfg.entry_cutoff, -1)
+        exit_min = _to_min(cfg.exit_time, -1)
+        for value in (cfg.entry_cutoff, cfg.exit_time):
+            try:
+                datetime.strptime(value, "%H:%M")
+            except ValueError:
+                raise HTTPException(400, "Use valid HH:MM times in IST")
+        if not OR_READY_MIN <= entry_min <= exit_min <= MARKET_CLOSE_MIN:
+            raise HTTPException(400, "Require 09:26 <= entry cutoff <= exit time <= 15:30 IST")
+        self.cfg = cfg
         self._log("Configuration updated by operator")
+        self._subscribe_tracked()
         self._persist()
         return self.status()
 
@@ -450,19 +779,39 @@ class AlgoEngine:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._last_error = str(exc)
-                logger.exception("algo supervisor error")
+                logger.exception("account=%s algo supervisor error", self.account_id or current_account())
             await asyncio.sleep(0.5)
 
     async def _tick_supervisor(self) -> None:
+        async with self._execution_lock:
+            await self._tick_supervisor_locked()
+
+    async def _tick_supervisor_locked(self) -> None:
         now = now_ist()
         today = now.date().isoformat()
         minute = now.hour * 60 + now.minute
         ft = feed.status()
         self._feed_connected = bool(ft.get("webSocket"))
 
-        if self._day != today:
+        if self._position is not None and time.monotonic() - self._last_reconcile_at >= RECONCILE_SECONDS:
+            await self._reconcile_locked()
+        if self._day != today and self._position is None:
             self._reset_day(today, now)
 
+        if self._position is not None:
+            self.phase = self._position.execution_state if self._position.execution_state != "open" else "in_trade"
+            if (self._position.execution_state == "entry_pending"
+                    and (self._day != today or minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12))):
+                await self._exit_position_locked(self._position, "TIME")
+                return
+            if self._position.execution_state in {"open", "attention"}:
+                if self._position.exit_reason:
+                    await self._exit_position_locked(self._position, self._position.exit_reason)
+                elif self._day != today or minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12):
+                    await self._exit_position_locked(self._position, "TIME")
+                else:
+                    await self._manage_position()
+            return
         if not self.enabled:
             self.phase = "off"
             return
@@ -479,11 +828,16 @@ class AlgoEngine:
 
         # OR build + watch
         if minute >= OR_READY_MIN:
-            await self._maybe_compute_or()
+            if self.account_id == "child":
+                master = engines.items["master"]
+                if master._signal_day != today and not self._today_trades:
+                    self._legs = {key: DayLeg(**asdict(leg)) for key, leg in master._legs.items()}
+            else:
+                await self._maybe_compute_or()
 
         # Forced square-off
         if self._position is not None and minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12):
-            await self._exit_position(self._position, "TIME")
+            await self._exit_position_locked(self._position, "TIME")
 
         if self._position is not None:
             self.phase = "in_trade"
@@ -515,7 +869,7 @@ class AlgoEngine:
 
     async def _intraday(self, **kwargs: Any) -> Dict[str, Any]:
         """Intraday fetch with throttle + 429 backoff (arming fires 2 back-to-back)."""
-        client = get_dhan_client()
+        client = get_data_client() if self.account_id is not None else get_dhan_client()
         last: Optional[DhanAPIError] = None
         for attempt, delay in enumerate((0.0, 1.5, 3.0, 6.0)):
             if delay:
@@ -617,13 +971,14 @@ class AlgoEngine:
             leg.note = "option chain not ready"
             return
         rows = snap["rows"]
-        spot = float(snap.get("underlyingLtp") or 0) or (leg.spot or 0)
+        spot = leg.spot or float(snap.get("underlyingLtp") or 0)
         step = self._strike_step(rows, inst.strike_step if inst else 50)
         if not spot or step <= 0:
             leg.note = "no spot / strike step"
             return
         leg.expiry = snap.get("expiry")
-        leg.spot = spot
+        if leg.spot is None:
+            leg.spot = spot
 
         sides = (direction,) if direction in ("CALL", "PUT") else ("CALL", "PUT")
         for side in sides:
@@ -667,32 +1022,53 @@ class AlgoEngine:
         return atm + offset * step if direction == "CALL" else atm - offset * step
 
     # ------------------------------------------------------------- tick loop
-    def _on_tick(self, security_id: int, ltp: float) -> None:
+    def _on_tick(self, security_id: int, ltp: float, segment: Optional[str] = None) -> None:
         """Called from the feed on every price change. Must stay non-blocking."""
         for leg in self._legs.values():
             if leg.index_key in self.cfg.indices and get_index(leg.index_key) and \
-                    get_index(leg.index_key).sec_id == security_id:
-                leg.spot = ltp
+                    get_index(leg.index_key).sec_id == security_id and segment in (None, "IDX_I"):
+                leg.spot = round(ltp, 2)
                 break
-        if self._position is not None and self._position.security_id == security_id:
-            self._position.premium = ltp
-        if self.enabled and not self._busy:
-            asyncio.ensure_future(self._evaluate())
+            if leg.security_id == security_id and segment in (None, self._segment_for(leg.index_key)):
+                leg.option_ltp = ltp
+        if self._position is not None:
+            inst = get_index(self._position.index_key)
+            if inst and inst.sec_id == security_id and segment in (None, "IDX_I"):
+                self._position.spot = round(ltp, 2)
+            elif (self._position.security_id == security_id
+                  and segment in (None, self._segment_for(self._position.index_key))):
+                self._position.premium = ltp
+        if self._running and (self.enabled or self._position is not None) and not self._busy:
+            self._busy = True
+            self._evaluation_task = asyncio.ensure_future(self._evaluate())
 
     async def _evaluate(self) -> None:
         """Decide whether to enter or exit, right now."""
-        self._busy = True
         try:
-            if self._position is not None:
-                await self._manage_position()
-            else:
-                await self._look_for_entry()
+            async with self._execution_lock:
+                if self._position is not None:
+                    await self._manage_position()
+                elif self.enabled:
+                    await self._look_for_entry()
+        except Exception as exc:
+            self._last_error = str(exc)
+            logger.exception("Algo tick evaluation failed")
         finally:
             self._busy = False
 
     async def _manage_position(self) -> None:
         pos = self._position
-        if pos is None or pos.spot is None:
+        if pos is None or pos.spot is None or pos.execution_state not in {"open", "attention"}:
+            return
+        if self.cfg.target_only and pos.dry_run and self.cfg.protective_sl:
+            premium_age = feed.age(pos.security_id, self._segment_for(pos.index_key))
+            if (pos.premium is not None and premium_age is not None and premium_age <= MAX_PRICE_AGE
+                    and pos.premium <= self._protective_trigger(pos)):
+                await self._exit_position_locked(pos, "PROTECTIVE_SL")
+                return
+        inst = get_index(pos.index_key)
+        age = feed.age(inst.sec_id, "IDX_I") if inst else None
+        if age is None or age > MAX_PRICE_AGE:
             return
         d = pos.spot - pos.entry_spot
         moved = d if pos.option_type == "CALL" else -d
@@ -700,7 +1076,7 @@ class AlgoEngine:
         pos.mae = min(pos.mae, moved)
 
         # Break-even ratchet
-        if (self.cfg.breakeven_at > 0 and not pos.breakeven_done
+        if (not self.cfg.target_only and self.cfg.breakeven_at > 0 and not pos.breakeven_done
                 and moved >= self.cfg.breakeven_at * pos.or_range):
             pos.breakeven_done = True
             pos.stop_spot = pos.entry_spot
@@ -710,16 +1086,20 @@ class AlgoEngine:
 
         hit_stop = (pos.spot <= pos.stop_spot) if pos.option_type == "CALL" else (pos.spot >= pos.stop_spot)
         hit_target = (pos.spot >= pos.target_spot) if pos.option_type == "CALL" else (pos.spot <= pos.target_spot)
-        if hit_stop:
-            await self._exit_position(pos, "BREAKEVEN" if pos.breakeven_done and
+        if hit_stop and not self.cfg.target_only:
+            await self._exit_position_locked(pos, "BREAKEVEN" if pos.breakeven_done and
                                       abs(pos.stop_spot - pos.entry_spot) < 1e-6 else "STOP")
         elif hit_target:
-            await self._exit_position(pos, "TARGET")
+            await self._exit_position_locked(pos, "TARGET")
 
     async def _look_for_entry(self) -> None:
+        if self.account_id == "child":
+            return
         now = now_ist()
         minute = now.hour * 60 + now.minute
-        if minute > _to_min(self.cfg.entry_cutoff, 15 * 60):
+        if (now.weekday() >= 5 or minute < OR_READY_MIN
+                or minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
+                or self._today_trades or self._signal_day == now.date().isoformat()):
             return
         for key in self.cfg.indices:
             leg = self._legs.get(key)
@@ -727,6 +1107,11 @@ class AlgoEngine:
                 continue
             if time.time() < leg.next_try_at:
                 continue   # backing off after a rejected entry
+            inst = get_index(key)
+            age = feed.age(inst.sec_id, "IDX_I") if inst else None
+            if age is None or age > MAX_PRICE_AGE:
+                leg.note = "Waiting for a fresh spot quote (maximum age 5s)"
+                continue
             rng = leg.or_range or 0.0
             if rng <= 0:
                 continue
@@ -742,10 +1127,16 @@ class AlgoEngine:
                 self._log(f"{key} skipped: {leg.note}", level="warn")
                 continue
             if leg.spot > leg.or_high:
-                await self._enter(leg, "CALL")
+                if self.account_id is not None:
+                    await engines.enter_signal(leg, "CALL")
+                else:
+                    await self._enter(leg, "CALL")
                 return
             if leg.spot < leg.or_low:
-                await self._enter(leg, "PUT")
+                if self.account_id is not None:
+                    await engines.enter_signal(leg, "PUT")
+                else:
+                    await self._enter(leg, "PUT")
                 return
 
     # ---------------------------------------------------------------- entry
@@ -754,7 +1145,8 @@ class AlgoEngine:
         spot = leg.spot or 0.0
         if rng <= 0 or spot <= 0:
             return
-        await self._prepare_contract(leg, direction)
+        if self.account_id is None or leg.prepared_side != direction or not leg.security_id:
+            await self._prepare_contract(leg, direction)
         if not leg.security_id or leg.strike is None:
             leg.note = "contract not ready - cannot enter"
             self._log(f"{leg.index_key}: breakout seen but {direction} contract not ready",
@@ -771,6 +1163,38 @@ class AlgoEngine:
             leg.status = "error"
             self._persist()
             return
+        premium = feed.price(leg.security_id, self._segment_for(leg.index_key))
+        premium_age = feed.age(leg.security_id, self._segment_for(leg.index_key))
+        if premium is None or premium_age is None or premium_age > MAX_PRICE_AGE:
+            leg.note = "Waiting for fresh option premium before entry (maximum age 5s)"
+            return
+        leg.option_ltp = premium
+
+        if not runtime.is_dry_run():
+            try:
+                client = get_dhan_client()
+                held = await client.get_positions(fresh=True)
+                book = await client.get_order_book(fresh=True)
+                supers = await client.get_super_orders(fresh=True)
+            except DhanAPIError as exc:
+                leg.note = f"Entry blocked: cannot verify broker holdings: {exc.error_message}"
+                self._log(leg.note, level="error")
+                return
+            def matches(row: Dict[str, Any]) -> bool:
+                return (str(row.get("securityId")) == str(leg.security_id)
+                        and row.get("exchangeSegment") == self._segment_for(leg.index_key)
+                        and row.get("productType") == self.cfg.product_type)
+            if any(matches(r) and int(r.get("netQty") or 0) != 0 for r in held):
+                leg.status = "skipped"
+                leg.note = "Contract already held at broker; refusing to mix manual/algo quantity."
+                self._log(leg.note, level="error")
+                self._persist()
+                return
+            if any(matches(row) and str(row.get("orderStatus") or "").upper() not in TERMINAL_ORDERS
+                   for row in [*book, *supers]):
+                leg.note = "Entry blocked: another order for this contract is pending at Dhan."
+                self._log(leg.note, level="warn")
+                return
 
         # Set the signal BEFORE sizing so _delta_for resolves the right leg.
         leg.signal = direction
@@ -782,6 +1206,16 @@ class AlgoEngine:
             self._persist()
             return
 
+        inst = get_index(leg.index_key)
+        spot_age = feed.age(inst.sec_id, "IDX_I") if inst else None
+        live_spot = leg.spot or 0.0
+        if spot_age is None or spot_age > MAX_PRICE_AGE or (
+            direction == "CALL" and live_spot <= (leg.or_high or 0)
+        ) or (direction == "PUT" and live_spot >= (leg.or_low or 0)):
+            leg.note = "Breakout no longer valid on a fresh spot quote; waiting."
+            return
+        if self.account_id is None:
+            spot = live_spot
         target = spot + self.cfg.target_mult * rng if direction == "CALL" \
             else spot - self.cfg.target_mult * rng
         stop = spot - self.cfg.sl_mult * rng if direction == "CALL" \
@@ -809,13 +1243,23 @@ class AlgoEngine:
         leg.planned_lots = sizing["lots"]
 
         # Place the entry
+        pos.execution_state = "entry_pending"
+        pos.entry_correlation_id = f"ORB-E-{uuid.uuid4().hex[:18]}"
+        self._position = pos
+        self._persist()
         fill = await self._send_order(
             side="BUY", security_id=pos.security_id, qty=pos.quantity,
             segment=self._segment_for(leg.index_key), order_type=self.cfg.order_type,
-            correlation_id=f"ORB-{leg.index_key}-{self._day}-{uuid.uuid4().hex[:6]}",
-            tag="entry",
+            price=pos.entry_premium, correlation_id=pos.entry_correlation_id,
+            tag="entry", dry_run=pos.dry_run,
         )
         if not fill.get("ok"):
+            if fill.get("uncertain"):
+                pos.execution_error = "Entry outcome unknown; checking correlation ID. No repeat BUY will be sent."
+                self._last_error = pos.execution_error
+                self._persist()
+                return
+            self._position = None
             code = str(fill.get("code") or "")
             msg = str(fill.get("error") or "order failed")
             leg.entry_attempts += 1
@@ -861,10 +1305,16 @@ class AlgoEngine:
             return
 
         pos.order_id = fill.get("orderId")
-        if fill.get("fillPrice"):
-            pos.entry_premium = float(fill["fillPrice"])
-        self._position = pos
-        self.phase = "in_trade"
+        if pos.dry_run:
+            pos.execution_state = "open"
+            pos.entry_confirmed_ts = time.time()
+        else:
+            try:
+                await self._refresh_entry(pos)
+            except DhanAPIError as exc:
+                pos.execution_error = f"Entry awaiting broker confirmation: {exc.error_message}"
+                self._log(pos.execution_error, level="warn")
+        self.phase = "in_trade" if pos.execution_state == "open" else pos.execution_state
 
         # Lock out the other index (one trade per day).
         for other in self.cfg.indices:
@@ -873,30 +1323,54 @@ class AlgoEngine:
                 o.status = "locked"
                 o.note = f"{leg.index_key} took today's trade"
 
-        if self.cfg.protective_sl:
+        if pos.dry_run and self.cfg.protective_sl:
             await self._place_protective_sl(pos)
         self._persist()
 
+    async def _refresh_entry(self, pos: Position) -> None:
+        order = await self._order_state(pos.order_id, pos.entry_correlation_id)
+        pos.order_id = str(order.get("orderId") or pos.order_id or "") or None
+        status = str(order["orderStatus"]).upper()
+        filled = int(order.get("filledQty") or 0)
+        average = _as_float(order.get("averageTradedPrice") or order.get("averagePrice"))
+        if status == "TRADED" and filled == 0:
+            filled = int(order.get("quantity") or 0)
+        if status == "PART_TRADED":
+            if pos.order_id and not pos.entry_cancel_requested:
+                pos.entry_cancel_requested = True
+                self._persist()
+                await get_dhan_client().cancel_order(pos.order_id)
+            pos.execution_error = "Partial entry: cancelling remainder; waiting for terminal broker status."
+        elif status in TERMINAL_ORDERS:
+            if filled > 0 and average and average > 0:
+                pos.quantity = filled
+                pos.entry_quantity = filled
+                pos.entry_premium = average
+                pos.premium = feed.price(pos.security_id, self._segment_for(pos.index_key)) or average
+                pos.execution_state = "open"
+                pos.entry_confirmed_ts = time.time()
+                pos.execution_error = ""
+                self._log(f"Entry confirmed: {pos.index_key} {filled} units @ {average:.2f}", level="success",
+                          notification="algo_entry")
+                if self.cfg.protective_sl:
+                    await self._place_protective_sl(pos)
+            elif status != "TRADED" and filled == 0:
+                leg = self._legs.get(pos.index_key)
+                if leg:
+                    leg.status = "error"
+                    leg.note = f"Entry {status}: {order.get('omsErrorDescription') or 'no fill'}"
+                self._log(f"Entry {status}; no position opened.", level="error")
+                self._position = None
+            else:
+                pos.execution_error = "Broker fill details incomplete; refusing to assume quantity or price."
+        self._persist()
+
     async def _size_position(self, leg: DayLeg) -> Dict[str, Any]:
-        """Lots from balance: risk-based, but NEVER fewer than min_lots (default 1).
+        """Size using policy-specific risk, available cash and the lot bounds.
 
-        The risk budget is per STREAK, not per trade - this strategy wins ~15%
-        of the time and 39-46 consecutive losses are normal. Scaling resolves to
-        roughly Rs1,00,000 of capital per lot:
-
-            Rs   10,000  ->  1 lot  (minimum enforced, if 1 lot is affordable)
-            Rs   30,000  ->  1 lot
-            Rs 1,00,000  ->  1 lot
-            Rs 2,00,000  ->  2 lots
-            Rs 4,00,000  ->  4 lots
-
-        The floor is deliberate: the operator wants at least one lot whenever the
-        balance can buy one outright, even if that is riskier than the streak
-        budget would allow. When even one lot is unaffordable we return 0 lots
-        with an "insufficient balance" reason and the caller skips the trade.
-
-        Note the floor only replaces the RISK cap, never affordability -
-        `cash_lots` still has the final say on whether the money is actually there.
+        Target-only estimates 90% premium loss (100% without protection).
+        Classic mode uses spot-stop distance x delta. The minimum-lot floor can
+        exceed percentage budgets but never actual cash; neither is a loss cap.
         """
         lot = lot_size_for(leg.index_key)
         premium = leg.option_ltp or 0.0
@@ -904,7 +1378,10 @@ class AlgoEngine:
         sl_points = self.cfg.sl_mult * rng
         delta = self._delta_for(leg, leg.signal) or get_settings().algo_paper_delta
         balance = await self._balance()
-        risk_per_lot = max(sl_points * delta * lot, 1e-6)
+        risk_per_lot = max(
+            premium * (MAX_SAFETY_SL_PCT / 100 if self.cfg.protective_sl else 1) * lot
+            if self.cfg.target_only else sl_points * delta * lot, 1e-6,
+        )
         premium_per_lot = max(premium * lot, 1e-6)
 
         risk_lots = int((balance * self.cfg.risk_pct / 100.0) // risk_per_lot)
@@ -915,8 +1392,8 @@ class AlgoEngine:
         # outright - even if the capital cap would rather it did not.
         floor = max(1, self.cfg.min_lots)
         risk_lots = max(floor, risk_lots)
-        if balance >= premium_per_lot:
-            cash_lots = max(floor, cash_lots)
+        affordable_lots = int(balance // premium_per_lot)
+        cash_lots = min(affordable_lots, max(floor, cash_lots))
 
         lots = max(0, min(risk_lots, cash_lots, self.cfg.max_lots))
         floored = lots >= floor and balance >= premium_per_lot \
@@ -968,13 +1445,41 @@ class AlgoEngine:
         try:
             f = await get_dhan_client().get_fund_limit()
             raw = f.get("availabelBalance") if isinstance(f, dict) else None
-            if raw is None and isinstance(f, dict):
-                raw = f.get("sodLimit")
-            return float(raw or 0.0)
-        except DhanAPIError:
-            return 0.0
+            try:
+                balance = float(raw)
+            except (ValueError, TypeError) as exc:
+                raise DhanAPIError(0, "BAD_FUNDS", "Broker available balance is missing/invalid") from exc
+            if not math.isfinite(balance) or balance < 0:
+                raise DhanAPIError(0, "BAD_FUNDS", "Broker available balance is invalid")
+            return balance
+        except DhanAPIError as exc:
+            self._last_error = f"Cannot size entry: broker balance unavailable: {exc.error_message}"
+            self._log(self._last_error, level="error")
+            raise
 
     # --------------------------------------------------------------- orders
+    def _protective_trigger(self, pos: Position) -> float:
+        if self.cfg.target_only:
+            return max(.05, _round_tick(pos.entry_premium * (1 - MAX_SAFETY_SL_PCT / 100)))
+        distance = abs(pos.entry_spot - pos.initial_stop_spot) * self.cfg.protective_sl_mult
+        return max(.05, _round_tick(pos.entry_premium - distance * get_settings().algo_paper_delta))
+
+    async def _migrate_protective_policy(self, pos: Position) -> bool:
+        if not await self._cancel_protective(pos):
+            pos.execution_error = "Target-only migration waiting for old SL cancellation. Check Dhan; old SL may still execute."
+            self._persist()
+            return False
+        if pos.exit_order_id or pos.exit_correlation_id:
+            return False
+        if pos.dry_run:
+            pos.next_exit_try_at = 0
+        pos.protective_policy_pending = False
+        pos.execution_error = ""
+        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 90%-away premium trigger.",
+                  level="warn")
+        self._persist()
+        return True
+
     def _segment_for(self, index_key: str) -> str:
         inst = get_index(index_key)
         return inst.derivative_segment if inst else "NSE_FNO"
@@ -982,11 +1487,11 @@ class AlgoEngine:
     async def _send_order(
         self, *, side: str, security_id: int, qty: int, segment: str,
         order_type: str = "MARKET", price: float = 0.0, trigger: float = 0.0,
-        correlation_id: str, tag: str,
+        correlation_id: str, tag: str, dry_run: Optional[bool] = None,
     ) -> Dict[str, Any]:
         s = get_settings()
         payload = {
-            "dhanClientId": s.dhan_client_id,
+            "dhanClientId": get_dhan_client()._client_id if self.account_id is not None else s.dhan_client_id,
             "transactionType": side,
             "exchangeSegment": segment,
             "productType": self.cfg.product_type,
@@ -994,13 +1499,14 @@ class AlgoEngine:
             "validity": "DAY",
             "securityId": str(security_id),
             "quantity": int(qty),
-            "price": 0.0 if order_type == "MARKET" else float(price),
+            "price": round(round(price / .05) * .05, 2) if order_type == "LIMIT" else 0.0,
             "triggerPrice": float(trigger),
             "disclosedQuantity": 0,
             "afterMarketOrder": False,
             "correlationId": correlation_id,
         }
-        if runtime.is_dry_run():
+        simulate = runtime.is_dry_run() if dry_run is None else dry_run
+        if simulate:
             audit.log_order(action=f"algo_{tag}", success=True, dry_run=True, status="DRY_RUN",
                             message=f"[algo] {tag} {side} x{qty} (dry-run)", payload=payload)
             return {"ok": True, "dryRun": True, "orderId": f"DRY-{correlation_id}",
@@ -1012,88 +1518,209 @@ class AlgoEngine:
                             status=exc.error_code, message=exc.error_message, payload=payload)
             self._last_error = exc.error_message
             return {"ok": False, "error": exc.error_message,
-                    "code": exc.error_code, "httpStatus": exc.status_code}
+                    "code": exc.error_code, "httpStatus": exc.status_code,
+                    "uncertain": exc.status_code == 0 or exc.status_code >= 500}
         order_id = str(res.get("orderId") or "")
         audit.log_order(action=f"algo_{tag}", success=True, dry_run=False, order_id=order_id,
                         status=str(res.get("orderStatus")), message=f"[algo] {tag}",
                         payload=payload)
-        fill_price = await self._await_fill(order_id)
-        return {"ok": True, "orderId": order_id, "fillPrice": fill_price,
+        return {"ok": True, "orderId": order_id or None,
                 "status": res.get("orderStatus")}
-
-    async def _await_fill(self, order_id: str, timeout: float = 10.0) -> Optional[float]:
-        """Poll the order book briefly for an average traded price."""
-        if not order_id:
-            return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                book = await get_dhan_client().get_order_book()
-            except DhanAPIError:
-                book = []
-            for o in book or []:
-                if str(o.get("orderId")) == order_id:
-                    status = str(o.get("orderStatus") or "").upper()
-                    avg = o.get("averageTradedPrice") or o.get("averagePrice")
-                    if status in ("TRADED", "PART_TRADED") and avg:
-                        return float(avg)
-                    if status in ("REJECTED", "CANCELLED", "EXPIRED"):
-                        return None
-            await asyncio.sleep(0.4)
-        return None
 
     async def _place_protective_sl(self, pos: Position) -> None:
         """Park a WIDE real SL at Dhan so a server crash can't leave us naked."""
-        delta = get_settings().algo_paper_delta
-        dist_spot = abs(pos.entry_spot - pos.initial_stop_spot) * self.cfg.protective_sl_mult
-        trigger_premium = pos.entry_premium - dist_spot * delta
-        if trigger_premium <= 0.05:
-            trigger_premium = 0.05
+        if pos.protective_order_id:
+            return
+        if pos.protective_correlation_id:
+            try:
+                order = await self._order_state(None, pos.protective_correlation_id)
+                pos.protective_order_id = str(order.get("orderId") or "") or None
+            except DhanAPIError as exc:
+                pos.execution_error = f"Protective SL outcome unknown: {exc.error_message}. Check Dhan."
+                self._log(pos.execution_error, level="error")
+            self._persist()
+            return
+        trigger_premium = self._protective_trigger(pos)
+        live_premium = feed.price(pos.security_id, self._segment_for(pos.index_key))
+        age = feed.age(pos.security_id, self._segment_for(pos.index_key))
+        if not pos.dry_run and (live_premium is None or age is None or age > MAX_PRICE_AGE):
+            pos.execution_error = "Waiting for fresh option price before parking protective SL."
+            self._log(pos.execution_error, level="warn")
+            return
+        if live_premium is not None and trigger_premium >= live_premium:
+            pos.execution_error = "Protective trigger already crossed; requesting safe market exit."
+            self._log(pos.execution_error, level="error")
+            await self._exit_position_locked(pos, "PROTECTIVE_LEVEL")
+            return
+        pos.protective_correlation_id = f"ORB-S-{uuid.uuid4().hex[:18]}"
+        pos.protective_cancel_requested = False
+        self._persist()
         res = await self._send_order(
             side="SELL", security_id=pos.security_id, qty=pos.quantity,
             segment=self._segment_for(pos.index_key), order_type="STOP_LOSS_MARKET",
-            trigger=round(trigger_premium, 1),
-            correlation_id=f"ORB-SL-{pos.index_key}-{uuid.uuid4().hex[:6]}", tag="protective_sl",
+            trigger=trigger_premium,
+            correlation_id=pos.protective_correlation_id, tag="protective_sl", dry_run=pos.dry_run,
         )
         if res.get("ok"):
             pos.protective_order_id = res.get("orderId")
             self._log(
                 f"{pos.index_key}: disaster stop parked at Dhan @ premium {trigger_premium:.1f} "
-                f"({'simulated' if res.get('dryRun') else 'LIVE'})", level="info")
+                f"({'simulated' if res.get('dryRun') else 'submitted; fill not assumed'})", level="info")
+            if not pos.dry_run and pos.protective_order_id:
+                order = await self._order_state(pos.protective_order_id, None)
+                status = str(order["orderStatus"]).upper()
+                if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
+                    pos.execution_error = f"Protective SL {status}; position needs manual attention."
+                    pos.execution_state = "attention"
+                    self._log(pos.execution_error, level="error")
+                else:
+                    pos.execution_error = ""
         else:
+            if not res.get("uncertain"):
+                pos.protective_correlation_id = None
+                pos.execution_state = "attention"
+            pos.execution_error = f"Protective SL FAILED - {res.get('error')}"
             self._log(f"{pos.index_key}: protective SL FAILED - {res.get('error')}", level="error")
+        self._persist()
+
+    async def _cancel_protective(self, pos: Position) -> bool:
+        if pos.dry_run:
+            pos.protective_order_id = pos.protective_correlation_id = None
+            return True
+        if not pos.protective_order_id and not pos.protective_correlation_id:
+            return True
+        try:
+            order = await self._order_state(pos.protective_order_id, pos.protective_correlation_id)
+            order_id = str(order.get("orderId") or pos.protective_order_id or "")
+            status = str(order["orderStatus"]).upper()
+            if status not in TERMINAL_ORDERS:
+                if not order_id:
+                    raise DhanAPIError(0, "UNKNOWN_ORDER", "Cannot cancel protective stop without order ID.")
+                if not pos.protective_cancel_requested:
+                    pos.protective_cancel_requested = True
+                    self._persist()
+                    await get_dhan_client().cancel_order(order_id)
+                order = await self._order_state(order_id, None)
+                status = str(order["orderStatus"]).upper()
+            if status not in TERMINAL_ORDERS:
+                pos.execution_error = f"Protective SL cancellation not confirmed ({status}); no market SELL sent."
+                pos.next_exit_try_at = time.time() + RECONCILE_SECONDS
+                self._persist()
+                return False
+            pos.protective_order_id = pos.protective_correlation_id = None
+            if status == "TRADED":
+                pos.broker_exit_premium = _as_float(order.get("averageTradedPrice"))
+                pos.exit_order_id = order_id
+                pos.exit_reason = "PROTECTIVE_SL"
+                pos.execution_state = "exit_pending"
+                pos.execution_error = ""
+            elif int(order.get("filledQty") or 0) > 0:
+                filled = int(order["filledQty"])
+                if not pos.entry_quantity:
+                    pos.entry_quantity = pos.quantity
+                pos.quantity = max(0, pos.quantity - filled)
+                pos.partial_exit = True
+                pos.next_exit_try_at = time.time() + RECONCILE_SECONDS
+            self._persist()
+            return True
+        except DhanAPIError as exc:
+            pos.execution_error = f"Cannot verify/cancel protective SL: {exc.error_message}; no duplicate SELL."
+            if 0 < exc.status_code < 500:
+                pos.protective_cancel_requested = False
+            pos.next_exit_try_at = time.time() + RECONCILE_SECONDS
+            self._log(pos.execution_error, level="error")
+            self._persist()
+            return False
 
     # ----------------------------------------------------------------- exit
     async def _exit_position(self, pos: Position, reason: str) -> None:
-        self._busy = True
-        try:
-            if pos.protective_order_id and not pos.dry_run:
-                try:
-                    await get_dhan_client().cancel_order(str(pos.protective_order_id))
-                    self._log(f"{pos.index_key}: disaster stop cancelled", level="info")
-                except Exception as exc:  # noqa: BLE001 - best effort
-                    self._log(
-                        f"{pos.index_key}: could not cancel disaster stop "
-                        f"({pos.protective_order_id}) - check Dhan: {exc}", level="error")
-            price = pos.premium or pos.entry_premium
-            res = await self._send_order(
-                side="SELL", security_id=pos.security_id, qty=pos.quantity,
-                segment=self._segment_for(pos.index_key), order_type="MARKET",
-                correlation_id=f"ORB-EXIT-{pos.index_key}-{uuid.uuid4().hex[:6]}", tag="exit",
-            )
-            exit_premium = res.get("fillPrice") or price
-            self._finalise_position(pos, exit_premium, reason, order_ok=res.get("ok", False))
-        finally:
-            self._busy = False
+        async with self._execution_lock:
+            await self._exit_position_locked(pos, reason)
+
+    async def _exit_position_locked(self, pos: Position, reason: str) -> None:
+        if self._position is not pos:
+            return
+        if pos.execution_state == "entry_pending":
+            try:
+                order = await self._order_state(pos.order_id, pos.entry_correlation_id)
+                if str(order["orderStatus"]).upper() not in TERMINAL_ORDERS:
+                    order_id = str(order.get("orderId") or pos.order_id or "")
+                    if not order_id:
+                        raise DhanAPIError(0, "UNKNOWN_ORDER", "Entry identity not confirmed; check Dhan.")
+                    pos.entry_cancel_requested = True
+                    self._persist()
+                    await get_dhan_client().cancel_order(order_id)
+                await self._refresh_entry(pos)
+            except DhanAPIError as exc:
+                pos.execution_error = f"Entry cancellation not confirmed: {exc.error_message}. Check Dhan."
+                self._log(pos.execution_error, level="error")
+            if self._position is not pos or pos.execution_state == "entry_pending":
+                return
+        if pos.exit_order_id or pos.exit_correlation_id or time.time() < pos.next_exit_try_at:
+            return
+        pos.exit_reason = reason
+        if not await self._cancel_protective(pos):
+            return
+        if pos.exit_order_id or time.time() < pos.next_exit_try_at:
+            await self._reconcile_locked()
+            return
+        if not pos.dry_run:
+            try:
+                rows = await get_dhan_client().get_positions(fresh=True)
+            except DhanAPIError as exc:
+                pos.execution_error = f"Exit blocked: broker holdings unknown: {exc.error_message}"
+                self._log(pos.execution_error, level="error")
+                return
+            held = sum(int(r.get("netQty") or 0) for r in rows
+                       if str(r.get("securityId")) == str(pos.security_id)
+                       and r.get("exchangeSegment") == self._segment_for(pos.index_key)
+                       and r.get("productType") == self.cfg.product_type)
+            if held == 0:
+                await self._reconcile_locked()
+                return
+            if held < 0 or held > pos.quantity:
+                pos.execution_state = "attention"
+                pos.execution_error = f"Unsafe exit quantity: broker {held}, tracked {pos.quantity}. Check Dhan."
+                self._log(pos.execution_error, level="error")
+                self._persist()
+                return
+            qty = held
+            pos.partial_exit = pos.partial_exit or held != pos.quantity
+        else:
+            qty = pos.quantity
+        pos.execution_state = "exit_pending"
+        pos.exit_correlation_id = f"ORB-X-{uuid.uuid4().hex[:18]}"
+        self._persist()
+        res = await self._send_order(
+            side="SELL", security_id=pos.security_id, qty=qty,
+            segment=self._segment_for(pos.index_key), order_type="MARKET",
+            correlation_id=pos.exit_correlation_id, tag="exit", dry_run=pos.dry_run,
+        )
+        pos.exit_order_id = res.get("orderId")
+        if not res.get("ok"):
+            pos.execution_error = f"Exit not confirmed: {res.get('error')}; position remains tracked."
+            self._log(pos.execution_error, level="error")
+            if not res.get("uncertain"):
+                pos.exit_order_id = pos.exit_correlation_id = None
+                pos.execution_state = "open"
+                pos.next_exit_try_at = time.time() + 3.0
+        elif pos.dry_run:
+            self._finalise_position(pos, pos.premium or pos.entry_premium, reason)
+        else:
+            self._log(f"Exit submitted ({pos.exit_order_id}); waiting for broker flat confirmation.")
+        self._persist()
 
     def _finalise_position(
-        self, pos: Position, exit_premium: float, reason: str, order_ok: bool = True
+        self, pos: Position, exit_premium: float, reason: str, estimated: bool = False
     ) -> None:
-        gross_premium_pnl = (exit_premium - pos.entry_premium) * pos.quantity
+        if self._position is not pos:
+            return
+        quantity = pos.entry_quantity or pos.quantity
+        gross_premium_pnl = (exit_premium - pos.entry_premium) * quantity
         trade = {
             "date": self._day, "index": pos.index_key, "direction": pos.option_type,
             "strike": pos.strike, "expiry": pos.expiry, "lots": pos.lots,
-            "quantity": pos.quantity,
+            "quantity": quantity,
             "entryTime": pos.entry_time, "exitTime": now_ist().strftime("%H:%M:%S"),
             "entrySpot": round(pos.entry_spot, 2), "exitSpot": round(pos.spot or pos.entry_spot, 2),
             "entryPremium": round(pos.entry_premium, 2), "exitPremium": round(exit_premium, 2),
@@ -1103,6 +1730,8 @@ class AlgoEngine:
             "mfe": round(pos.mfe, 2), "mae": round(pos.mae, 2),
             "premiumPnl": round(gross_premium_pnl, 2),
             "exitReason": reason, "dryRun": pos.dry_run,
+            "targetOnly": self.cfg.target_only,
+            "exitPriceEstimated": estimated,
         }
         self._today_trades.append(trade)
         store.append_trade(trade)
@@ -1111,15 +1740,16 @@ class AlgoEngine:
         level = "success" if exit_premium >= pos.entry_premium else "warn"
         self._log(
             f"EXIT {pos.index_key} {pos.option_type} {int(pos.strike)} @ {exit_premium:.2f} "
-            f"({reason})  spot {pos.points:+,.1f} pts  R {pos.r_multiple:+.2f}  "
+            f"({reason})  spot {pos.pnl_points:+,.1f} pts  R {pos.r_multiple:+.2f}  "
             f"premium P&L Rs{gross_premium_pnl:,.0f}"
-            + ("" if order_ok else "  [order may have failed - CHECK]"),
-            level=level, trade=trade,
+            + ("  [estimated exit price]" if estimated else ""),
+            level=level, notification="algo_exit", trade=trade,
         )
         leg = self._legs.get(pos.index_key)
         if leg:
             leg.status = "closed"
         self._position = None
+        self.phase = "day_done"
         self._persist()
 
     # --------------------------------------------------------------- status
@@ -1132,23 +1762,39 @@ class AlgoEngine:
             "in_trade": "In a trade - managing stop & target",
             "day_done": "Done for today (trade taken or no breakout)",
             "closed": "Market closed",
+            "entry_pending": "Entry submitted - waiting for confirmed broker fill",
+            "exit_pending": "Exit submitted - waiting for broker flat confirmation",
+            "attention": "Position needs attention - check execution warning",
         }.get(self.phase, self.phase)
 
     def _next_actions(self) -> List[str]:
         out: List[str] = []
         now = now_ist()
         minute = now.hour * 60 + now.minute
-        if not self.enabled:
-            out.append("Flip the switch ON to arm the algo.")
-            return out
         if self._position is not None:
             p = self._position
-            out.append(f"Watching spot against target {p.target_spot:,.1f} and stop {p.stop_spot:,.1f}.")
-            if not p.breakeven_done and self.cfg.breakeven_at > 0:
+            if p.execution_state == "entry_pending":
+                return ["Waiting for broker entry fill/cancellation; no protective SELL until filled.",
+                        "PANIC can request cancellation of the pending entry. Check Dhan if outcome is unknown."]
+            if p.execution_state == "exit_pending":
+                return ["Exit submitted or protective stop filled; waiting for broker flat confirmation.",
+                        "No duplicate SELL will be submitted while the outcome is unresolved."]
+            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (90% away)."
+                          if self.cfg.protective_sl else "Broker protective SL OFF.")
+            out.append(
+                f"Target-only: watching spot target {p.target_spot:,.1f}; software spot/break-even SL OFF. "
+                f"{protection}"
+                if self.cfg.target_only else
+                f"Watching spot against target {p.target_spot:,.1f} and stop {p.stop_spot:,.1f}."
+            )
+            if not self.cfg.target_only and not p.breakeven_done and self.cfg.breakeven_at > 0:
                 be = p.entry_spot + (self.cfg.breakeven_at * p.or_range
                                      * (1 if p.option_type == "CALL" else -1))
                 out.append(f"Stop moves to break-even when spot touches {be:,.1f}.")
             out.append(f"Forced square-off at {self.cfg.exit_time} unless target/stop hits first.")
+            return out
+        if not self.enabled:
+            out.append("Flip the switch ON to arm new entries.")
             return out
         if minute < 9 * 60 + 15:
             out.append("Waiting for the 09:15 open.")
@@ -1208,6 +1854,10 @@ class AlgoEngine:
             "feed": feed.status(),
             "recovered": self._recovered,
             "lastError": self._last_error,
+            "brokerSyncAt": self._broker_sync_at,
+            "brokerSyncError": self._broker_sync_error,
+            "brokerNetQty": self._broker_net_qty,
+            "brokerPositionPnl": self._broker_position_pnl,
             "paperBalance": getattr(self, "_paper_balance", None),
             "uptimeSeconds": round(time.time() - self._started_at, 0),
             "events": self._events[-60:],
@@ -1232,6 +1882,8 @@ class AlgoEngine:
             "entryTime": p.entry_time,
             "targetSpot": p.target_spot,
             "stopSpot": p.stop_spot,
+            "softwareStopEnabled": not self.cfg.target_only,
+            "protectiveTrigger": self._protective_trigger(p) if self.cfg.protective_sl else None,
             "initialStopSpot": p.initial_stop_spot,
             "breakevenDone": p.breakeven_done,
             "points": round(p.pnl_points, 2),
@@ -1242,6 +1894,10 @@ class AlgoEngine:
             "dryRun": p.dry_run,
             "orderId": p.order_id,
             "protectiveOrderId": p.protective_order_id,
+            "executionState": p.execution_state,
+            "executionError": p.execution_error,
+            "exitOrderId": p.exit_order_id,
+            "spotAgeSeconds": feed.age(get_index(p.index_key).sec_id, "IDX_I") if get_index(p.index_key) else None,
         }
 
     def _stats(self) -> Dict[str, Any]:
@@ -1274,4 +1930,94 @@ def _as_int(v: Any) -> Optional[int]:
         return None
 
 
-algo = AlgoEngine()
+class AccountEngines:
+    def __init__(self) -> None:
+        self.items = {account: AlgoEngine(account) for account in ACCOUNT_IDS}
+        self.selection_lock = asyncio.Lock()
+        self.entry_accounts: tuple[AccountId, ...] = ()
+
+    def current(self) -> AlgoEngine:
+        return self.items[current_account()]
+
+    async def start(self) -> None:
+        self.entry_accounts = ()
+        feed.set_on_tick(self.on_tick)
+        await feed.start()
+        for account, engine in self.items.items():
+            with account_scope(account):
+                # Restore management for both, never silently resume new entries.
+                await engine.start()
+                engine.enabled = False
+                engine._persist()
+                if all(account_credentials(account)):
+                    get_dhan_client().start_live_sync()
+
+    async def stop(self) -> None:
+        for account, engine in self.items.items():
+            with account_scope(account):
+                await engine.stop()
+        await feed.stop()
+
+    def on_tick(self, sid: int, price: float, segment: str) -> None:
+        for account, engine in self.items.items():
+            with account_scope(account):
+                engine._on_tick(sid, price, segment)
+
+    async def enter_signal(self, source: DayLeg, direction: str) -> None:
+        master = self.items["master"]
+        if not self.entry_accounts:
+            return
+        if source.prepared_side != direction or not source.security_id:
+            await master._prepare_contract(source, direction)
+        if source.prepared_side != direction or not source.security_id:
+            return
+        signal = asdict(source)
+        master._signal_day = now_ist().date().isoformat()
+        with account_scope("master"):
+            master._persist()
+        async def enter(account: AccountId) -> None:
+            engine = self.items[account]
+            with account_scope(account):
+                try:
+                    if engine._position is not None or engine._today_trades:
+                        engine._log("Shared signal skipped: existing position/trade.", level="warn")
+                        return
+                    leg = DayLeg(**signal)
+                    engine._legs[source.index_key] = leg
+                    if engine is master:
+                        await engine._enter(leg, direction)
+                    else:
+                        async with engine._execution_lock:
+                            leg = DayLeg(**signal)
+                            engine._legs[source.index_key] = leg
+                            await engine._enter(leg, direction)
+                    if engine._position is None:
+                        engine._last_error = leg.error or leg.note or "Signal did not open a position; inspect journal."
+                    engine._log(f"shared_signal direction={direction} index={source.index_key} "
+                                f"result={engine._position.execution_state if engine._position else leg.note}")
+                except Exception as exc:
+                    engine._last_error = str(exc)
+                    engine._log(f"Shared signal failed: {exc}", level="error")
+                    logger.exception("account=%s shared signal failed", account)
+                finally:
+                    try:
+                        engine._persist()
+                    except OSError as exc:
+                        engine._last_error = f"State persistence failed: {exc}. Check this account at Dhan."
+                        logger.exception("account=%s signal state persistence failed", account)
+        await asyncio.gather(*(enter(account) for account in self.entry_accounts))
+        source.status = "locked"
+        source.note = "Shared signal dispatched; inspect each account result. No blind replay."
+        with account_scope("master"):
+            master._persist()
+
+
+engines = AccountEngines()
+
+
+class AccountAlgo:
+    def __getattr__(self, name: str):
+        return getattr(engines.current(), name)
+
+
+algo = AccountAlgo()

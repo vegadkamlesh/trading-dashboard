@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -104,6 +105,7 @@ class OptionChainEngine:
     def __init__(self) -> None:
         self._snapshots: Dict[str, ChainSnapshot] = {}
         self._expiries: Dict[str, List[str]] = {}
+        self._expiry_day: Dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -122,11 +124,16 @@ class OptionChainEngine:
         return self._expiries.get(index_key.upper(), [])
 
     def set_expiry(self, index_key: str, expiry: str) -> None:
-        self._expiry_override[index_key.upper()] = expiry
+        key = index_key.upper()
+        if expiry not in self._expiries.get(key, []):
+            raise ValueError("Expiry is not in the current broker expiry list")
+        if self._expiry_override.get(key) != expiry:
+            self._snapshots.pop(key, None)
+        self._expiry_override[key] = expiry
 
     async def warm(self, index_key: str) -> None:
         """Force-refresh one index now (used by the algo right before it trades)."""
-        await self._fetch_one(index_key.upper(), force=True)
+        await self._fetch_one(index_key.upper())
 
     # ---------- fetching ----------
     async def _fetch_one(self, index_key: str, force: bool = False) -> None:
@@ -134,18 +141,19 @@ class OptionChainEngine:
         inst = get_index(key)
         if inst is None:
             return
-        # Cooldown: skip if we fetched this underlying too recently (unless the
-        # background poller forces it on its own schedule).
+        # Forced/on-demand calls share the same cooldown.
         now = time.monotonic()
-        if not force and (now - self._last_fetch.get(key, 0.0)) < self._min_gap:
+        if (now - self._last_fetch.get(key, 0.0)) < self._min_gap:
             return
         self._last_fetch[key] = now
         client = get_dhan_client()
-        # Expiry lists change at most once a day, so fetch ONCE and cache it.
-        # Re-fetching every cycle was doubling our Dhan calls and causing 429s.
-        if key not in self._expiries:
+        today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+        if self._expiry_day.get(key) != today:
             try:
                 self._expiries[key] = await client.get_expiry_list(inst.sec_id)
+                self._expiry_day[key] = today
+                if self._expiry_override.get(key) not in self._expiries[key]:
+                    self._expiry_override.pop(key, None)
             except DhanAPIError as exc:
                 self._record_error(key, f"expiry list: {exc.error_message}")
                 return
@@ -165,7 +173,11 @@ class OptionChainEngine:
 
         snap = _transform_chain(key, expiry, raw)
         async with self._lock:
-            self._snapshots[key] = snap
+            selected = self._expiry_override.get(key) or (
+                self._expiries[key][0] if self._expiries[key] else None
+            )
+            if selected == expiry:
+                self._snapshots[key] = snap
 
     def _record_error(self, key: str, message: str) -> None:
         prev = self._snapshots.get(key)
@@ -182,7 +194,7 @@ class OptionChainEngine:
         if not keys:
             keys = list(INDEX_REGISTRY.keys())[:1]
         # `interval` is the full gap between refreshes of the SAME underlying.
-        # Dhan's free tier allows 1 optionchain req / 3s per underlying, so we
+        # Dhan allows 1 unique optionchain request / 3s, so we
         # apply a hard floor of 3.5s (with a little headroom) per underlying.
         interval = max(3.5, float(s.oc_poll_interval_seconds))
         per_key_gap = interval / max(len(keys), 1)

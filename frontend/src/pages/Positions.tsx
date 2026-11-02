@@ -3,19 +3,37 @@ import { usePolling } from "../hooks/usePolling";
 import { api, ApiError } from "../api/client";
 import { useToast } from "../hooks/useToasts";
 import type { Position } from "../api/types";
+import { accountResultText, useTradingAccounts } from "../hooks/useTradingAccounts";
 
 // Live P&L every ~3s so profit/loss feels real-time. Positions is a light call
 // and Dhan's order-path limit is generous (10/s), so 3s stays well clear. Each
 // open position gets a one-click EXIT (market square-off), like a real terminal.
-const POLL_MS = 3000;
+const POLL_MS = 1000;
 
 export function Positions() {
   const { push } = useToast();
+  const { view } = useTradingAccounts();
   const { data, error, refresh } = usePolling<Position[]>(
     () => api.get("/api/account/positions"),
     POLL_MS
   );
   const [exiting, setExiting] = useState<string | null>(null);
+
+  const exitBoth = async (p: Position) => {
+    if (!confirm("EXIT BOTH accounts for this exact contract? Each account's actual holding will be checked.")) return;
+    setExiting(String(p.securityId));
+    try {
+      const response = await api.post<{results: Array<{accountId: string; ok: boolean; error?: unknown}>}>(
+        "/api/trading/exit-both", {
+          securityId: String(p.securityId), exchangeSegment: p.exchangeSegment,
+          productType: p.productType,
+        });
+      for (const r of response.results)
+        push(r.ok ? "info" : "error", `${r.accountId}: ${r.ok ? "Exit checked/requested; wait for broker sync" : accountResultText(r.error)}`);
+      refresh();
+    } catch (e) { push("error", e instanceof Error ? e.message : "EXIT BOTH failed"); }
+    finally { setExiting(null); }
+  };
 
   const exitPosition = async (p: Position) => {
     const qty = Math.abs(p.netQty ?? 0);
@@ -29,7 +47,7 @@ export function Positions() {
 
     setExiting(String(p.securityId));
     try {
-      const res = await api.post<{ dryRun: boolean; result?: { orderId?: string } }>(
+      const res = await api.post<{ dryRun: boolean; result?: { orderId?: string }; status?: { position?: { executionError?: string } | null } }>(
         "/api/account/squareoff",
         {
           securityId: String(p.securityId),
@@ -39,15 +57,20 @@ export function Positions() {
           transactionType: exitTxn,
         }
       );
+      if (res.status?.position?.executionError) {
+        push("error", res.status.position.executionError);
+        refresh();
+        return;
+      }
       push(
         res.dryRun ? "info" : "success",
-        res.dryRun ? "DRY-RUN: exit logged (not sent)" : `Exit placed: ${res.result?.orderId ?? ""}`
+        res.dryRun ? "DRY-RUN: exit logged (not sent)" : `Exit requested: ${res.result?.orderId ?? "algo managed exit"} — wait for broker confirmation`
       );
       refresh();
     } catch (e) {
       if (e instanceof ApiError) {
         const d = e.detail as { errorMessage?: string; detail?: string };
-        const msg = d?.errorMessage || d?.detail || "Exit failed";
+        const msg = typeof e.detail === "string" ? e.detail : d?.errorMessage || d?.detail || "Exit failed";
         if (msg.toLowerCase().includes("invalid ip")) {
           push("error", "Invalid IP: whitelist your IP in Connection ▸ Register IP, then retry.");
         } else {
@@ -74,7 +97,7 @@ export function Positions() {
     <div className="space-y-2">
       <div className="flex items-center justify-between px-1">
         <div className="text-xs text-slate-400">
-          Live P&amp;L · auto-refresh every {POLL_MS / 1000}s
+          {view === "master" ? "Master Dhan" : "Child Dhan"} P&amp;L · auto-refresh every {POLL_MS / 1000}s
         </div>
         <div className={"font-mono text-sm font-bold " + pnl(totalPnl)}>
           Total: {money(totalPnl)}
@@ -86,6 +109,7 @@ export function Positions() {
             <tr>
               {[
                 "Symbol",
+                "State",
                 "Prod",
                 "Qty",
                 "Buy Avg",
@@ -109,11 +133,14 @@ export function Positions() {
               return (
                 <tr key={i} className="border-b border-slate-900 hover:bg-slate-900/60">
                   <td className="px-3 py-2 font-medium">{sym(p)}</td>
+                  <td className="px-3 py-2">{p.netQty ? "OPEN" : "CLOSED"}</td>
                   <td className="px-3 py-2">{p.productType ?? "-"}</td>
                   <td className="px-3 py-2 font-mono">{p.netQty ?? 0}</td>
                   <td className="px-3 py-2 font-mono">{num(p.buyAvg)}</td>
                   <td className="px-3 py-2 font-mono">{num(p.sellAvg)}</td>
-                  <td className="px-3 py-2 font-mono text-sky-300">{num(p.ltp)}</td>
+                  <td className="px-3 py-2 font-mono text-sky-300" title={p.quoteError ?? undefined}>
+                    {p.quoteError ? "STALE" : num(p.ltp)}
+                  </td>
                   <td className="px-3 py-2 font-mono">{num(p.realizedProfit)}</td>
                   <td className={"px-3 py-2 font-mono " + pnl(p.unrealizedProfit ?? 0)}>
                     {num(p.unrealizedProfit)}
@@ -123,11 +150,13 @@ export function Positions() {
                     <button
                       className="rounded bg-red-600 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-red-700 disabled:opacity-50"
                       onClick={() => exitPosition(p)}
-                      disabled={exiting === sid}
+                      disabled={exiting === sid || !p.netQty}
                       title="Square off this position with a MARKET order"
                     >
                       {exiting === sid ? "…" : "EXIT"}
                     </button>
+                    <button className="btn-ghost ml-2 px-2 py-1 text-[10px]"
+                      disabled={exiting !== null} onClick={() => void exitBoth(p)}>EXIT BOTH</button>
                   </td>
                 </tr>
               );
@@ -135,7 +164,7 @@ export function Positions() {
           </tbody>
           <tfoot className="bg-slate-900">
             <tr>
-              <td colSpan={8} className="px-3 py-2 text-right font-semibold">
+              <td colSpan={9} className="px-3 py-2 text-right font-semibold">
                 Total P&amp;L
               </td>
               <td className={"px-3 py-2 font-mono font-bold " + pnl(totalPnl)}>

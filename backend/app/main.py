@@ -10,13 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import audit, runtime
-from .algo import algo
+from .algo import algo, engines
+from .accounts import ACCOUNT_IDS, account_scope
 from .algo_store import store as algo_store
 from .config import get_settings
 from .dhan_client import DhanAPIError, close_dhan_client
 from .logsetup import daily_cleanup_loop, setup_logging
 from .optionchain import engine
 from .orb_study import study as orb_study
+from .telegram_notify import notifier
 from .routers import (
     account,
     algo as algo_router,
@@ -26,6 +28,7 @@ from .routers import (
     market,
     orders,
     settings as settings_router,
+    trading_accounts,
 )
 
 # Configure file logging FIRST so startup is captured. Falls back to console-only
@@ -41,6 +44,19 @@ logger = logging.getLogger("dhan.app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    notifier.start()
+    try:
+        async with trading_lifespan(app):
+            yield
+    finally:
+        # The worker performs outbound I/O; do not block the event loop while joining.
+        import asyncio
+
+        await asyncio.to_thread(notifier.stop)
+
+
+@asynccontextmanager
+async def trading_lifespan(app: FastAPI):
     s = get_settings()
     if not s.is_configured():
         logger.error(
@@ -48,7 +64,9 @@ async def lifespan(app: FastAPI):
             "Create backend/.env (see backend/env.example.txt). "
             "Auth and order endpoints will fail until configured."
         )
-    audit.init_db()
+    for account_id in ACCOUNT_IDS:
+        with account_scope(account_id):
+            audit.init_db()
     pruned = audit.prune_old_logs()
     if pruned:
         logger.info("Pruned %d audit row(s) older than %d days", pruned, s.log_retention_days)
@@ -68,12 +86,12 @@ async def lifespan(app: FastAPI):
     if s.is_configured():
         await engine.start()
         logger.info("Option chain poller started for: %s", s.oc_polled_indices)
-        await algo.start()
+        await engines.start()
         logger.info("ORB algo engine ready (arm it from the Algo tab)")
     try:
         yield
     finally:
-        await algo.stop()
+        await engines.stop()
         await engine.stop()
         await close_dhan_client()
         logger.info("Shutdown complete")
@@ -87,7 +105,7 @@ app.add_middleware(
     allow_origins=settings.app_allowed_origins,  # explicit only, never "*"
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-CSRF-Token"],
+    allow_headers=["Content-Type", "X-CSRF-Token", "X-Trading-Account"],
 )
 
 
@@ -114,6 +132,16 @@ app.include_router(audit_router.router)
 app.include_router(intel.router)
 app.include_router(settings_router.router)
 app.include_router(algo_router.router)
+app.include_router(trading_accounts.router)
+
+
+@app.middleware("http")
+async def trading_account_context(request, call_next):
+    account = request.headers.get("X-Trading-Account", "master")
+    if account not in ACCOUNT_IDS:
+        return JSONResponse(status_code=400, content={"detail": "Unknown trading account"})
+    with account_scope(account):
+        return await call_next(request)
 
 
 @app.middleware("http")
@@ -122,7 +150,15 @@ async def access_log(request, call_next):
     import time as _t
 
     start = _t.perf_counter()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logging.getLogger("dhan.access").exception(
+            "account=%s %s %s -> unhandled error",
+            request.headers.get("X-Trading-Account", "master"),
+            request.method, request.url.path,
+        )
+        raise
     dur_ms = (_t.perf_counter() - start) * 1000
     if request.url.path.startswith("/api"):
         logging.getLogger("dhan.access").info(
@@ -131,6 +167,7 @@ async def access_log(request, call_next):
             request.url.path,
             response.status_code,
             dur_ms,
+            extra={"telegram_event": "api_error"} if response.status_code >= 500 else {},
         )
     return response
 
@@ -148,4 +185,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-

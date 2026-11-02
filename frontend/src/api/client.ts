@@ -3,6 +3,13 @@
 // - sends session cookies (same-origin)
 
 const CSRF_KEY = "dhan_csrf";
+let tradingAccount: "master" | "child" = "master";
+export function setTradingAccount(account: "master" | "child") {
+  tradingAccount = account;
+}
+export function getTradingAccount() {
+  return tradingAccount;
+}
 
 export function setCsrfToken(token: string | null) {
   if (token) sessionStorage.setItem(CSRF_KEY, token);
@@ -24,7 +31,9 @@ export class ApiError extends Error {
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json", "X-Trading-Account": tradingAccount,
+  };
   if (method !== "GET") {
     const csrf = getCsrfToken();
     if (csrf) headers["X-CSRF-Token"] = csrf;

@@ -58,6 +58,7 @@ class AlgoStore:
             os.replace(tmp, self._path("state.json"))
         except OSError as exc:
             logger.warning("Failed to persist algo state: %s", exc)
+            raise
 
     def load_state(self) -> Optional[Dict[str, Any]]:
         path = self._path("state.json")
@@ -179,4 +180,19 @@ class AlgoStore:
         return [t for t in self.read_trades(limit=5000) if str(t.get("date", "")) >= cutoff]
 
 
-store = AlgoStore()
+_master_store = AlgoStore()
+_child_store: Optional[AlgoStore] = None
+
+
+class AccountAlgoStore:
+    def __getattr__(self, name: str):
+        from .accounts import current_account
+        global _child_store
+        if current_account() == "master":
+            return getattr(_master_store, name)
+        if _child_store is None:
+            _child_store = AlgoStore(os.path.join(_BASE, "child"))
+        return getattr(_child_store, name)
+
+
+store = AccountAlgoStore()

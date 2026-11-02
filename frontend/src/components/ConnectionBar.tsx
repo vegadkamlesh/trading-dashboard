@@ -2,11 +2,14 @@ import { usePolling } from "../hooks/usePolling";
 import { api } from "../api/client";
 import type { StatusResponse } from "../api/types";
 import { useAuth } from "../hooks/useAuth";
+import { useTradingAccounts } from "../hooks/useTradingAccounts";
 
 // Shows order-path health + dry-run state + whitelisted IP. Non-blocking.
 export function ConnectionBar({ onLogout }: { onLogout: () => void }) {
   const { data } = usePolling<StatusResponse>(() => api.get("/api/account/status"), 30000);
   const { dryRun, fastOrders, refreshFlags } = useAuth();
+  const { view, data: accounts } = useTradingAccounts();
+  const mockBroker = accounts?.accounts.find((account) => account.id === view)?.mock ?? false;
 
   // Prefer the live auth-context flags (instant after a toggle); fall back to poll.
   const dry = dryRun ?? data?.dryRun ?? true;
@@ -20,7 +23,9 @@ export function ConnectionBar({ onLogout }: { onLogout: () => void }) {
           "rounded px-2 py-1 font-bold " +
           (dry ? "bg-amber-500/20 text-amber-300" : "bg-red-500/20 text-red-300")
         }
-        title={dry ? "Orders are validated & logged only" : "LIVE orders are being sent to Dhan"}
+        title={dry ? "Orders are validated & logged only" : mockBroker
+          ? "This account uses a mock broker; other configured accounts may send real orders"
+          : "LIVE orders are being sent to Dhan"}
       >
         {dry ? "DRY-RUN" : "LIVE"}
       </span>
@@ -48,10 +53,11 @@ export function ConnectionBar({ onLogout }: { onLogout: () => void }) {
         className={
           "flex items-center gap-1 " + (ok ? "text-green-400" : "text-red-400")
         }
-        title={data?.profileError ? JSON.stringify(data.profileError) : "Profile OK"}
+        title={data?.profileError ? JSON.stringify(data.profileError)
+          : mockBroker ? "Mock broker profile OK; not connected to Dhan" : "Profile OK"}
       >
         <span className={"inline-block h-2 w-2 rounded-full " + (ok ? "bg-green-500" : "bg-red-500")} />
-        {ok ? "API OK" : "API ERR"}
+        {ok ? mockBroker ? "MOCK API OK" : "API OK" : "API ERR"}
       </span>
       {data?.ip?.primaryIP && (
         <span className="text-slate-400" title="Whitelisted static IP on your Dhan account">

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
-import type { AppSettings, CacheState, IpStatus } from "../api/types";
+import type { AppSettings, CacheState, IpStatus, TelegramStatus } from "../api/types";
 import { useAuth } from "../hooks/useAuth";
 import { useToast } from "../hooks/useToasts";
+import { usePolling } from "../hooks/usePolling";
 
 // The two master switches + how-to info (Hinglish). Lets you flip safety modes
 // live from the browser — no .env editing, no restart.
@@ -15,6 +16,21 @@ export function SettingsPanel() {
   const [ipBusy, setIpBusy] = useState(false);
   const [cache, setCache] = useState<CacheState | null>(null);
   const [warmBusy, setWarmBusy] = useState(false);
+  const [telegramBusy, setTelegramBusy] = useState(false);
+  const telegram = usePolling(() => api.get<TelegramStatus>("/api/settings/telegram"), 5000);
+
+  const testTelegram = async () => {
+    setTelegramBusy(true);
+    try {
+      await api.post<{ delivery: "queued" }>("/api/settings/telegram/test", {});
+      push("info", "Telegram test queued hai, delivered nahi maana hai. Channel aur Sent counter check karo.");
+      telegram.refresh();
+    } catch (e) {
+      push("error", e instanceof Error ? e.message : "Telegram test failed");
+    } finally {
+      setTelegramBusy(false);
+    }
+  };
 
   useEffect(() => {
     api.get<AppSettings>("/api/settings").then(setInfo).catch(() => {});
@@ -57,9 +73,9 @@ export function SettingsPanel() {
     setBusy(true);
     try {
       await setDryRun(!dryRun);
-      push("info", !dryRun ? "LIVE mode: orders ab Dhan par jayenge!" : "DRY-RUN: orders simulate honge");
+      push("info", dryRun ? "LIVE mode selected. Algo disarmed; verify settings before ARM." : "DRY-RUN: new orders simulate honge. Algo disarmed.");
     } catch (e) {
-      push("error", e instanceof ApiError ? "Toggle failed" : "Toggle failed");
+      push("error", e instanceof Error ? e.message : "Mode switch failed");
     } finally {
       setBusy(false);
     }
@@ -109,6 +125,41 @@ export function SettingsPanel() {
             : "FALSE: Har order se pehle PIN maangega. Safe, par slow. Scalping ke time true kar do."
         }
       />
+
+      <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">Telegram updates</div>
+            <p className="mt-1 text-xs text-slate-400">
+              {telegram.error ? "Status unavailable / stale" : !telegram.data ? "Loading status..."
+                : !telegram.data.enabled ? "Disabled - configure backend .env and restart"
+                : telegram.data.running ? "Notification worker running" : "Worker stopped - check logs"}
+            </p>
+          </div>
+          <button className="btn-ghost whitespace-nowrap px-3 py-1.5 text-xs"
+            onClick={testTelegram} disabled={telegramBusy || !telegram.data?.running || !!telegram.error}>
+            {telegramBusy ? "Queuing..." : "Send test"}
+          </button>
+        </div>
+        {telegram.data && (
+          <div className="mt-2 text-xs text-slate-300">
+            Sent: {telegram.data.sent} | Queued: {telegram.data.queued} | Failed: {telegram.data.failed}
+            {" | "}Dropped: {telegram.data.dropped} | Grouped: {telegram.data.suppressed}
+            <p className="mt-1 text-slate-400">
+              Last API-confirmed delivery: {telegram.data.lastSentAt
+                ? new Date(telegram.data.lastSentAt * 1000).toLocaleString() : "None"}
+            </p>
+          </div>
+        )}
+        {(telegram.error || telegram.data?.lastError) && (
+          <p className="mt-2 text-xs text-red-300">{telegram.error || telegram.data?.lastError}</p>
+        )}
+        <p className="mt-2 text-xs text-slate-500">
+          Safe event labels only: algo, order activity, safety changes, warnings and heartbeat.
+          Raw logs, tokens, order IDs, quantities and P&amp;L stay off Telegram.
+          Heartbeat is not proof of broker readiness. No trading commands.
+        </p>
+      </div>
 
       {/* IP registration — fix for 'Invalid IP' on live orders */}
       <div

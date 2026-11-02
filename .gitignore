@@ -35,3 +35,6 @@ backend/orb_report.txt
 
 # Algo runtime data (state, journal, study cache)
 backend/data/
+
+# Local AWS deployment handoff (account-specific operational details)
+deployment/aws/STATUS.local.txt

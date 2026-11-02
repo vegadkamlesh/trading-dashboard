@@ -9,8 +9,11 @@ intentional: a restart always returns to the safe configured state.
 """
 from __future__ import annotations
 
+import logging
+
 from .config import get_settings
 
+logger = logging.getLogger("dhan.runtime")
 _dry_run: bool | None = None
 _fast_orders: bool | None = None
 
@@ -39,6 +42,9 @@ def set_dry_run(value: bool) -> bool:
     global _dry_run
     _ensure_init()
     _dry_run = bool(value)
+    logger.info("Trading dry-run setting changed", extra={
+        "telegram_event": "mode_changed", "telegram_mode": "DRY-RUN" if _dry_run else "LIVE",
+    })
     return _dry_run
 
 
@@ -46,6 +52,9 @@ def set_fast_orders(value: bool) -> bool:
     global _fast_orders
     _ensure_init()
     _fast_orders = bool(value)
+    logger.info("Order PIN setting changed", extra={
+        "telegram_event": "fast_changed", "telegram_mode": "PIN SKIPPED" if _fast_orders else "PIN REQUIRED",
+    })
     return _fast_orders
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import struct
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -30,6 +31,50 @@ from .config import get_settings
 from .dhan_client import DhanAPIError, get_dhan_client
 
 logger = logging.getLogger("dhan.feed")
+
+
+async def attach_ltp(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Quote prices separately from broker holdings/order-state authority."""
+    instruments: Dict[str, List[int]] = {}
+    for row in rows:
+        segment = str(row.get("exchangeSegment") or "")
+        sid = str(row.get("securityId") or "")
+        if segment in SEGMENT_NAME_BY_ID.values() and sid.isdigit() and int(sid) > 0:
+            ids = instruments.setdefault(segment, [])
+            if int(sid) not in ids:
+                ids.append(int(sid))
+    if not instruments:
+        return rows
+    try:
+        pairs = [(segment, sid) for segment, ids in instruments.items() for sid in ids]
+        data: Dict[str, Any] = {}
+        for offset in range(0, len(pairs), 1000):
+            batch: Dict[str, List[int]] = {}
+            for segment, sid in pairs[offset:offset + 1000]:
+                batch.setdefault(segment, []).append(sid)
+            response = await get_dhan_client().get_ltp(batch)
+            if not isinstance(response, dict) or not isinstance(response.get("data"), dict):
+                raise DhanAPIError(0, "BAD_QUOTES", "Broker returned invalid quote data")
+            for segment, nodes in response["data"].items():
+                if not isinstance(nodes, dict):
+                    raise DhanAPIError(0, "BAD_QUOTES", "Broker returned invalid segment quotes")
+                data.setdefault(segment, {}).update(nodes)
+    except DhanAPIError as exc:
+        logger.warning("Portfolio quote sync failed: %s", exc)
+        for row in rows:
+            row["quoteError"] = exc.error_message
+            row["ltp"] = None
+        return rows
+    for row in rows:
+        node = (data.get(str(row.get("exchangeSegment"))) or {}).get(str(row.get("securityId"))) or {}
+        raw = node.get("last_price")
+        try:
+            price = float(raw) if raw is not None else 0
+        except (ValueError, TypeError):
+            price = 0
+        row["ltp"] = price if math.isfinite(price) and price > 0 else None
+        row["quoteError"] = None if row["ltp"] is not None else "Price unavailable"
+    return rows
 
 try:  # websockets >= 13 exposes the asyncio client here
     from websockets.asyncio.client import connect as ws_connect
@@ -69,13 +114,15 @@ def parse_packet(pkt: bytes) -> Optional[Tuple[str, int, float]]:
     code = pkt[0]
     if code not in (CODE_TICKER, CODE_QUOTE, CODE_FULL):
         return None
-    seg = SEGMENT_NAME_BY_ID.get(pkt[3], "IDX_I")
+    seg = SEGMENT_NAME_BY_ID.get(pkt[3])
+    if seg is None:
+        return None
     security_id = struct.unpack_from("<i", pkt, 4)[0]
     try:
         ltp = float(struct.unpack_from("<f", pkt, 8)[0])
     except struct.error:
         return None
-    if ltp <= 0:
+    if not math.isfinite(ltp) or ltp <= 0:
         return None
     return seg, int(security_id), ltp
 
@@ -84,9 +131,10 @@ class MarketFeed:
     """Shared live-price cache with an automatic WS -> REST fallback."""
 
     def __init__(self) -> None:
-        self._prices: Dict[int, float] = {}
-        self._segments: Dict[int, str] = {}       # security_id -> segment
-        self._on_tick: Optional[Callable[[int, float], None]] = None
+        self._prices: Dict[tuple[str, int], float] = {}
+        self._updated_at: Dict[tuple[str, int], float] = {}
+        self._segments: Set[tuple[str, int]] = set()
+        self._on_tick: Optional[Callable[[int, float, str], None]] = None
 
         self._ws_task: Optional[asyncio.Task] = None
         self._rest_task: Optional[asyncio.Task] = None
@@ -103,44 +151,60 @@ class MarketFeed:
         self._lock = asyncio.Lock()
 
     # ---------------- public API ----------------
-    def set_on_tick(self, cb: Optional[Callable[[int, float], None]]) -> None:
+    def set_on_tick(self, cb: Optional[Callable[[int, float, str], None]]) -> None:
         self._on_tick = cb
 
     def subscribe(self, security_id: int, segment: str) -> None:
         sid = int(security_id)
-        if self._segments.get(sid) == segment and sid in self._prices:
+        key = (segment, sid)
+        if key in self._segments:
             return
-        self._segments[sid] = segment
-        self._prices.setdefault(sid, 0.0)
+        self._segments.add(key)
+        self._prices.setdefault(key, 0.0)
         if self._ws is not None:
             asyncio.ensure_future(self._push_subscription())
 
-    def unsubscribe(self, security_id: int) -> None:
+    def unsubscribe(self, security_id: int, segment: Optional[str] = None) -> None:
         sid = int(security_id)
-        self._segments.pop(sid, None)
-        self._prices.pop(sid, None)
+        for key in list(self._segments):
+            if key[1] == sid and (segment is None or key[0] == segment):
+                self._segments.discard(key)
+                self._prices.pop(key, None)
+                self._updated_at.pop(key, None)
 
     def clear(self, keep: Set[int] | None = None) -> None:
         keep = keep or set()
-        for sid in list(self._segments):
+        for segment, sid in list(self._segments):
             if sid not in keep:
-                self.unsubscribe(sid)
+                self.unsubscribe(sid, segment)
 
-    def price(self, security_id: int) -> Optional[float]:
-        v = self._prices.get(int(security_id))
+    def _key(self, security_id: int, segment: Optional[str]) -> Optional[tuple[str, int]]:
+        if segment is not None:
+            return segment, int(security_id)
+        keys = [key for key in self._prices if key[1] == int(security_id)]
+        return keys[0] if len(keys) == 1 else None
+
+    def price(self, security_id: int, segment: Optional[str] = None) -> Optional[float]:
+        key = self._key(security_id, segment)
+        v = self._prices.get(key) if key is not None else None
         return v if v and v > 0 else None
+
+    def age(self, security_id: int, segment: Optional[str] = None) -> Optional[float]:
+        key = self._key(security_id, segment)
+        stamp = self._updated_at.get(key) if key is not None else None
+        return max(0.0, time.time() - stamp) if stamp is not None else None
 
     def subscribed(self) -> List[Dict[str, Any]]:
         return [
-            {"securityId": sid, "segment": seg, "ltp": self._prices.get(sid)}
-            for sid, seg in sorted(self._segments.items())
+            {"securityId": sid, "segment": seg, "ltp": self._prices.get((seg, sid))}
+            for seg, sid in sorted(self._segments)
         ]
 
     def status(self) -> Dict[str, Any]:
         return {
             "mode": self._mode,
-            "connected": self._connected,
-            "webSocket": self._connected,
+            "connected": self._ws_healthy(),
+            "webSocket": self._ws_healthy(),
             "ticks": self._tick_count,
             "reconnects": self._reconnects,
             "lastTickSecondsAgo": (
@@ -175,16 +239,17 @@ class MarketFeed:
         logger.info("Market feed stopped")
 
     # ---------------- internals ----------------
-    def _apply(self, security_id: int, ltp: float) -> None:
-        if ltp <= 0:
+    def _apply(self, security_id: int, ltp: float, segment: str = "IDX_I") -> None:
+        if not math.isfinite(ltp) or ltp <= 0:
             return
-        prev = self._prices.get(security_id)
-        self._prices[security_id] = ltp
+        key = (segment, security_id)
+        self._prices[key] = ltp
+        self._updated_at[key] = time.time()
         self._tick_count += 1
         self._last_tick_at = time.time()
-        if self._on_tick is not None and (prev is None or prev != ltp):
+        if self._on_tick is not None:
             try:
-                self._on_tick(security_id, ltp)
+                self._on_tick(security_id, ltp, segment)
             except Exception:  # noqa: BLE001 - never let a consumer break the feed
                 logger.exception("feed on_tick callback failed")
 
@@ -195,17 +260,22 @@ class MarketFeed:
             logger.warning("Feed sent disconnect/error packet (code=%s)", pkt[0])
             self._connected = False
             return
+        length = struct.unpack_from("<H", pkt, 1)[0] if len(pkt) >= 3 else 0
+        if 8 <= length < len(pkt):
+            self._handle_packet(pkt[:length])
+            self._handle_packet(pkt[length:])
+            return
         parsed = parse_packet(pkt)
         if parsed is None:
             return
-        _seg, sid, ltp = parsed
+        segment, sid, ltp = parsed
         self._last_ws_msg_at = time.time()
-        self._apply(sid, ltp)
+        self._apply(sid, ltp, segment)
 
-    def _grouped(self, ids: Optional[Set[int]] = None) -> Dict[str, List[int]]:
+    def _grouped(self, keys: Optional[Set[tuple[str, int]]] = None) -> Dict[str, List[int]]:
         out: Dict[str, List[int]] = {}
-        for sid, seg in self._segments.items():
-            if ids is not None and sid not in ids:
+        for seg, sid in sorted(self._segments):
+            if keys is not None and (seg, sid) not in keys:
                 continue
             out.setdefault(seg, []).append(sid)
         return out
@@ -254,14 +324,16 @@ class MarketFeed:
                     self._mode = "websocket"
                     self._error = None
                     self._last_ws_msg_at = time.time()
-                    delay = 1.0
-                    logger.info("Dhan market feed connected")
+                    logger.info("Dhan market feed connected", extra={"telegram_event": "feed_connected"})
                     await self._push_subscription()
                     async for message in ws:
                         if not self._running:
                             break
                         if isinstance(message, (bytes, bytearray)):
+                            initial_ticks = self._tick_count
                             self._handle_packet(bytes(message))
+                            if self._tick_count > initial_ticks:
+                                delay = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - network is best effort
@@ -285,17 +357,24 @@ class MarketFeed:
         client = get_dhan_client()
         while self._running:
             try:
-                if self._ws_healthy() or not self._segments:
+                if not self._segments:
+                    await asyncio.sleep(REST_POLL_SECONDS)
+                    continue
+                stale: Set[tuple[str, int]] = set()
+                for key in self._segments:
+                    age = self.age(key[1], key[0])
+                    if age is None or age > 5:
+                        stale.add(key)
+                if self._ws_healthy() and not stale:
                     await asyncio.sleep(REST_POLL_SECONDS)
                     continue
                 if self._mode != "websocket":
                     self._mode = "rest"
-                payload = self._grouped()
+                payload = self._grouped(stale if self._ws_healthy() else None)
                 if not payload:
                     await asyncio.sleep(REST_POLL_SECONDS)
                     continue
                 data = await client.get_ltp(payload)
-                now = time.time()
                 for seg, rows in (data.get("data") or {}).items():
                     if not isinstance(rows, dict):
                         continue
@@ -306,16 +385,18 @@ class MarketFeed:
                         except (TypeError, ValueError):
                             continue
                         if ltp > 0:
-                            self._last_ws_msg_at = now  # keep REST warm, not "silent"
-                            self._apply(sid, ltp)
+                            self._apply(sid, ltp, seg)
                 self._error = None
             except DhanAPIError as exc:
-                if exc.error_code != "DH-904":  # 904 = rate limit; just slow down
-                    self._error = exc.error_message
+                self._error = exc.error_message
+                logger.warning("Feed REST refresh failed: %s", exc)
+                if exc.status_code == 401:
+                    await asyncio.sleep(60)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._error = str(exc)
+                logger.exception("Market feed REST processing failed")
             await asyncio.sleep(REST_POLL_SECONDS)
 
 

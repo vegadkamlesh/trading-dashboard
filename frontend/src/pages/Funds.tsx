@@ -3,7 +3,7 @@ import { api } from "../api/client";
 import type { Funds as FundsType } from "../api/types";
 
 export function Funds() {
-  const { data, error } = usePolling<FundsType>(() => api.get("/api/account/funds"), 10000);
+  const { data, error } = usePolling<FundsType>(() => api.get("/api/account/funds"), 1000);
 
   if (error) return <Empty msg={`Error: ${error}`} />;
   if (!data) return <Empty msg="Loading funds…" />;

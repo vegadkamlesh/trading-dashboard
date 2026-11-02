@@ -40,7 +40,10 @@ async def select_expiry(
     expiry = body.get("expiry") or ""
     if key not in INDEX_REGISTRY or not expiry:
         raise HTTPException(status_code=400, detail="index and expiry required")
-    engine.set_expiry(key, expiry)
+    try:
+        engine.set_expiry(key, expiry)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return {"ok": True, "index": key, "expiry": expiry}
 
 

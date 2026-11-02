@@ -25,6 +25,15 @@ from .config import get_settings
 _initialised = False
 
 
+class AccountFilter(logging.Filter):
+    def __init__(self, account: str):
+        super().__init__()
+        self.account = account
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return f"account={self.account} " in record.getMessage()
+
+
 def _log_dir() -> Path:
     s = get_settings()
     p = Path(s.log_dir)
@@ -137,6 +146,11 @@ def setup_logging() -> Path:
     err_handler = DailyFileHandler(directory, "errors", logging.WARNING)
     err_handler.setFormatter(fmt)
     root.addHandler(err_handler)
+    for account in ("master", "child"):
+        handler = DailyFileHandler(directory, f"account-{account}", level)
+        handler.setFormatter(fmt)
+        handler.addFilter(AccountFilter(account))
+        root.addHandler(handler)
 
     # Dedicated order + access loggers (propagate=False so we control files).
     _attach_dedicated("dhan.orders", "orders", directory, fmt)

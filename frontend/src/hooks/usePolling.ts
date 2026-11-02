@@ -55,9 +55,18 @@ export function usePolling<T>(
     };
 
     tick();
+    const onVisible = () => {
+      if (document.hidden || inFlight) return;
+      if (timer) window.clearTimeout(timer);
+      void tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
     };
     // `identity` change (e.g. switching index) resets the data + refetches now.
   }, [enabled, intervalMs, identity, manualTick]);

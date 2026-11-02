@@ -7,14 +7,23 @@ Safety:
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
+import hashlib
+import json
+import math
+import sqlite3
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .. import audit, orders as order_logic, runtime
+from ..algo import algo
 from ..config import get_settings
-from ..dhan_client import DhanAPIError, get_dhan_client
+from ..dhan_client import DhanAPIError, get_trading_client as get_dhan_client
+from ..accounts import current_account, selected_accounts
+from ..optionchain import engine as chain_engine
+from ..feed import attach_ltp
 from ..security import require_csrf, require_session, verify_order_pin
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
@@ -40,28 +49,33 @@ class OrderPreviewBody(BaseModel):
 
 class OrderPlaceBody(OrderPreviewBody):
     pin: str
+    requestId: UUID = Field(default_factory=uuid4)
 
 
 async def _fund_check(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Compare the order's required cash against the available balance.
 
-    Returns a small dict the UI can render. Never raises: if the funds call
-    fails we simply report unknown so the trader isn't blocked spuriously.
+    Unknown balance is an explicit failure, never approval to place an order.
     """
     required = order_logic.required_cash(payload)
     available: float | None = None
     try:
         f = await get_dhan_client().get_fund_limit()
         if isinstance(f, dict):
-            # Dhan spells it "availabelBalance"; fall back to SOD if absent.
+            # Start-of-day funds are not the currently available balance.
             raw = f.get("availabelBalance")
-            if raw is None:
-                raw = f.get("sodLimit")
             if raw is not None:
                 available = float(raw)
-    except DhanAPIError:
-        available = None
-    sufficient = True if available is None else available >= required
+    except DhanAPIError as exc:
+        return {"requiredCash": required, "availableBalance": None, "sufficient": False,
+                "shortfall": 0.0, "error": exc.error_message}
+    except (ValueError, TypeError):
+        return {"requiredCash": required, "availableBalance": None, "sufficient": False,
+                "shortfall": 0.0, "error": "Broker returned an invalid available balance."}
+    if available is None or not math.isfinite(available) or available < 0:
+        return {"requiredCash": required, "availableBalance": None, "sufficient": False,
+                "shortfall": 0.0, "error": "Broker did not provide a valid available balance."}
+    sufficient = available >= required
     return {
         "requiredCash": required,
         "availableBalance": available,
@@ -71,7 +85,7 @@ async def _fund_check(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _to_order_request(body: OrderPreviewBody) -> order_logic.OrderRequest:
-    return order_logic.OrderRequest(
+    req = order_logic.OrderRequest(
         index_key=body.indexKey.upper(),
         security_id=str(body.securityId),
         option_type=body.optionType.upper(),
@@ -86,6 +100,18 @@ def _to_order_request(body: OrderPreviewBody) -> order_logic.OrderRequest:
         stop_loss_pct=body.stopLossPct,
         lots=body.lots,
     )
+    if req.order_type == "MARKET":
+        snap = chain_engine.snapshot(req.index_key)
+        if not snap or snap.get("stale") or snap.get("error") or snap.get("ageSeconds", 999) > 12:
+            raise HTTPException(409, "Fresh option quote unavailable. Wait for market sync before a MARKET order.")
+        node = next((row.get("ce" if req.option_type == "CE" else "pe") or {}
+                     for row in snap.get("rows", [])
+                     if str((row.get("ce" if req.option_type == "CE" else "pe") or {}).get("securityId")) == req.security_id), None)
+        premium = float(node.get("ltp") or 0) if node else 0
+        if not math.isfinite(premium) or premium <= 0:
+            raise HTTPException(409, "Fresh price for this exact option contract is unavailable.")
+        req.price = order_logic._round_tick(premium)
+    return req
 
 
 @router.post("/preview")
@@ -111,17 +137,45 @@ async def place(
     _session: str = Depends(require_session),
     _csrf: None = Depends(require_csrf),
 ):
+    if current_account() not in selected_accounts():
+        raise HTTPException(409, "This account is disabled for new entries")
+    async with algo._execution_lock:
+        return await _place_locked(body)
+
+
+async def _place_locked(body: OrderPlaceBody):
     verify_order_pin(body.pin)
+    request_id = str(body.requestId)
+    fingerprint = hashlib.sha256(json.dumps(
+        body.model_dump(exclude={"pin", "requestId"}), sort_keys=True,
+    ).encode()).hexdigest()
+    if not runtime.is_dry_run():
+        try:
+            exists, previous = audit.read_manual_request(request_id, fingerprint)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except sqlite3.Error as exc:
+            raise HTTPException(503, "Cannot recover order identity. Order not sent.") from exc
+        if exists:
+            if previous:
+                return previous
+            raise HTTPException(409, "Previous submission has an unknown/pending outcome. Check Super Orders at Dhan; do not repeat the BUY/SELL.")
     s = get_settings()
     req = _to_order_request(body)
     payload = order_logic.build_super_order(req)
-    payload["dhanClientId"] = s.dhan_client_id
+    payload["dhanClientId"] = get_dhan_client()._client_id
+    tracked = algo._position
+    if (tracked and str(tracked.security_id) == str(payload["securityId"])
+            and algo._segment_for(tracked.index_key) == payload["exchangeSegment"]):
+        raise HTTPException(409, "This contract is managed by the algo. Use its EXIT; do not mix manual entry quantity.")
 
     pv = order_logic.preview(req)
 
     # Balance check: block an order that costs more than the available balance
     # so the trader can reduce lots instead of getting a broker rejection.
     funds = await _fund_check(payload)
+    if funds.get("error"):
+        raise HTTPException(503, f"Cannot confirm funds: {funds['error']}. Order not sent.")
     if not funds["sufficient"]:
         msg = (
             f"Insufficient balance: order needs ₹{funds['requiredCash']:.2f} "
@@ -148,6 +202,17 @@ async def place(
         )
         return {"ok": True, "dryRun": True, "status": "DRY_RUN", "preview": pv, "payload": payload}
 
+    payload["correlationId"] = f"MAN-E-{body.requestId.hex[:24]}"
+    try:
+        claimed, previous = audit.claim_manual_request(request_id, fingerprint)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(503, "Cannot persist order identity. Order not sent.") from exc
+    if not claimed:
+        if previous:
+            return previous
+        raise HTTPException(409, "Previous submission has an unknown/pending outcome. Check Super Orders at Dhan; do not repeat the BUY/SELL.")
     try:
         result = await get_dhan_client().place_super_order(payload)
     except DhanAPIError as exc:
@@ -161,16 +226,27 @@ async def place(
         )
         raise HTTPException(status_code=502, detail=exc.to_dict())
 
+    status = str(result.get("orderStatus") or "").upper()
+    accepted = bool(result.get("orderId")) and status in {"TRANSIT", "PENDING", "PART_TRADED", "TRADED"}
+    error = None if accepted else (
+        result.get("omsErrorDescription") or result.get("errorMessage")
+        or f"Super Order status {status or 'unknown'}; verify this account at Dhan before retrying."
+    )
     audit.log_order(
-        action="place_super_order", success=True, dry_run=False,
+        action="place_super_order", success=accepted, dry_run=False,
         order_id=str(result.get("orderId")), status=str(result.get("orderStatus")),
-        message="Super order placed", payload=payload,
+        message="Super order submitted (fill not guaranteed)" if accepted else str(error), payload=payload,
         index_key=req.index_key, option_type=req.option_type,
         transaction_type=req.transaction_type, quantity=req.quantity,
         price=payload["price"], target_price=payload["targetPrice"],
         stop_loss_price=payload["stopLossPrice"],
     )
-    return {"ok": True, "dryRun": False, "result": result, "preview": pv}
+    response = {"ok": accepted, "dryRun": False, "result": result, "preview": pv, "error": error}
+    try:
+        audit.finish_manual_request(request_id, response)
+    except sqlite3.Error as exc:
+        raise HTTPException(503, "Order submitted but receipt could not be saved. Check Dhan; do not place it again.") from exc
+    return response
 
 
 @router.post("/cancel")
@@ -179,11 +255,18 @@ async def cancel(
     _session: str = Depends(require_session),
     _csrf: None = Depends(require_csrf),
 ):
+    async with algo._execution_lock:
+        return await _cancel_locked(body)
+
+
+async def _cancel_locked(body: Dict[str, str]):
     order_id = body.get("orderId")
     leg = body.get("leg") or "ENTRY_LEG"
     pin = body.get("pin")
     if not order_id:
         raise HTTPException(status_code=400, detail="orderId required")
+    if leg not in {"ENTRY_LEG", "TARGET_LEG", "STOP_LOSS_LEG"}:
+        raise HTTPException(400, "Invalid Super Order leg")
     verify_order_pin(pin)
     if runtime.is_dry_run():
         audit.log_order(action="cancel_super_order", success=True, dry_run=True,
@@ -197,14 +280,17 @@ async def cancel(
         raise HTTPException(status_code=502, detail=exc.to_dict())
     audit.log_order(action="cancel_super_order", success=True, dry_run=False,
                     order_id=order_id, status=str(result.get("orderStatus")),
-                    message=f"Cancelled {leg}")
+                    message=f"Cancellation requested for {leg}; confirmation pending")
     return {"ok": True, "dryRun": False, "result": result}
 
 
 @router.get("/super")
 async def super_orders(_session: str = Depends(require_session)):
     try:
-        return await get_dhan_client().get_super_orders()
+        rows = await get_dhan_client().get_super_orders()
+        if not isinstance(rows, list):
+            raise DhanAPIError(0, "BAD_ORDERS", "Invalid broker Super Order response")
+        return await attach_ltp(rows)
     except DhanAPIError as exc:
         raise HTTPException(status_code=502, detail=exc.to_dict())
 

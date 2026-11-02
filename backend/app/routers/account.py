@@ -2,17 +2,26 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import uuid
+import sqlite3
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .. import audit, marketdata, runtime
+from ..algo import algo, TERMINAL_ORDERS
 from ..config import get_settings
-from ..dhan_client import DhanAPIError, get_dhan_client
+from ..dhan_client import DhanAPIError, get_trading_client as get_dhan_client
+from ..accounts import current_account
+from ..feed import attach_ltp
 from ..runtime import is_dry_run, is_fast_orders
 from ..security import require_csrf, require_session, verify_order_pin
 
 router = APIRouter(prefix="/api/account", tags=["account"])
+_pending_exits: Dict[tuple[str, str, str], str] = {}
+_child_pending_exits: Dict[tuple[str, str, str], str] = {}
+logger = logging.getLogger("dhan.account")
 
 
 def _wrap(coro_factory):
@@ -32,12 +41,40 @@ async def funds(_session: str = Depends(require_session)):
         raise HTTPException(status_code=502, detail=exc.to_dict())
 
 
+@router.get("/sync")
+async def sync_status(_session: str = Depends(require_session)):
+    return get_dhan_client().sync_status()
+
+
 @router.get("/positions")
 async def positions(_session: str = Depends(require_session)):
+    pending = _pending_exits if current_account() == "master" else _child_pending_exits
     try:
-        return await get_dhan_client().get_positions()
+        rows = await get_dhan_client().get_positions()
+        if not isinstance(rows, list):
+            raise DhanAPIError(0, "BAD_POSITIONS", "Invalid broker positions response")
+        pending.update(audit.pending_manual_exits())
+        for key in list(pending):
+            sid, segment, product = key
+            held = sum(int(r.get("netQty") or 0) for r in rows
+                       if str(r.get("securityId")) == sid and r.get("exchangeSegment") == segment
+                       and r.get("productType") == product)
+            if held == 0:
+                try:
+                    order = await get_dhan_client().get_order_by_correlation(pending[key])
+                    if not isinstance(order, dict) or not order.get("orderStatus"):
+                        raise DhanAPIError(0, "UNKNOWN_EXIT", "Pending manual exit status unavailable.")
+                    if str(order.get("orderStatus") or "").upper() in TERMINAL_ORDERS:
+                        audit.save_manual_exit(key, None)
+                        pending.pop(key, None)
+                except DhanAPIError as exc:
+                    logger.warning("account=%s manual_exit_unverified code=%s reason=%s; broker holding flat, identity retained",
+                                   current_account(), exc.error_code, exc.error_message)
+        return await attach_ltp(rows)
     except DhanAPIError as exc:
         raise HTTPException(status_code=502, detail=exc.to_dict())
+    except sqlite3.Error as exc:
+        raise HTTPException(503, "Cannot recover manual exit state; check Dhan before another EXIT.") from exc
 
 
 @router.get("/holdings")
@@ -146,7 +183,7 @@ async def ip_diagnose(_session: str = Depends(require_session)):
     try:
         await client.place_order(
             {
-                "dhanClientId": get_settings().dhan_client_id,
+                "dhanClientId": client._client_id,
                 "transactionType": "BUY",
                 "exchangeSegment": "NSE_FNO",
                 "productType": "INTRADAY",
@@ -309,20 +346,35 @@ async def square_off(
     _session: str = Depends(require_session),
     _csrf: None = Depends(require_csrf),
 ):
+    async with algo._execution_lock:
+        return await _square_off_locked(body)
+
+
+async def _square_off_locked(body: SquareOffBody):
     """One-click EXIT — square off a position with a MARKET order.
 
     Uses the standard /orders endpoint (a plain market order), NOT a super
     order — an exit must fill immediately and carry no target/SL legs.
     """
+    pending = _pending_exits if current_account() == "master" else _child_pending_exits
     if body.quantity <= 0:
         raise HTTPException(status_code=400, detail="quantity must be > 0")
     txn = body.transactionType.upper()
     if txn not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="transactionType must be BUY or SELL")
 
+    tracked = algo._position
+    if (tracked and str(tracked.security_id) == body.securityId
+            and algo._segment_for(tracked.index_key) == body.exchangeSegment
+            and algo.cfg.product_type == body.productType):
+        await algo._exit_position_locked(tracked, "MANUAL")
+        if algo._position is not None and algo._position.execution_error:
+            raise HTTPException(409, algo._position.execution_error)
+        return {"ok": True, "dryRun": tracked.dry_run, "status": algo.status()}
+
     s = get_settings()
     payload: Dict[str, Any] = {
-        "dhanClientId": s.dhan_client_id,
+        "dhanClientId": get_dhan_client()._client_id,
         "transactionType": txn,
         "exchangeSegment": body.exchangeSegment,
         "productType": body.productType,
@@ -333,6 +385,7 @@ async def square_off(
         "price": 0,
         "triggerPrice": 0,
         "afterMarketOrder": False,
+        "correlationId": f"MAN-X-{uuid.uuid4().hex[:18]}",
     }
 
     if runtime.is_dry_run():
@@ -343,7 +396,70 @@ async def square_off(
         return {"ok": True, "dryRun": True, "status": "DRY_RUN"}
 
     try:
-        result = await get_dhan_client().place_order(payload)
+        client = get_dhan_client()
+        key = (body.securityId, body.exchangeSegment, body.productType)
+        pending.update(audit.pending_manual_exits())
+        if key in pending:
+            previous = await client.get_order_by_correlation(pending[key])
+            if not isinstance(previous, dict) or not previous.get("orderStatus"):
+                raise HTTPException(409, "Previous exit status is unknown. Check this account at Dhan; no repeat exit sent.")
+            previous_status = str(previous.get("orderStatus") or "").upper()
+            if previous_status not in {"CANCELLED", "REJECTED", "EXPIRED"}:
+                raise HTTPException(409, "Previous exit submitted; confirm it at Dhan before sending another.")
+            audit.save_manual_exit(key, None)
+            del pending[key]
+        def matches(row: Dict[str, Any]) -> bool:
+            return (str(row.get("securityId")) == body.securityId
+                    and row.get("exchangeSegment") == body.exchangeSegment
+                    and row.get("productType") == body.productType)
+        supers = await client.get_super_orders(fresh=True)
+        active = [o for o in supers if matches(o)
+                  and str(o.get("orderStatus") or "").upper() not in {"CLOSED", "CANCELLED", "REJECTED", "EXPIRED"}]
+        if any(str(o.get("orderStatus") or "").upper() in {"TRANSIT", "PENDING", "PART_TRADED"} for o in active):
+            raise HTTPException(409, "Cancel the unfilled Super Order entry before exiting this contract.")
+        for order in active:
+            for leg in order.get("legDetails") or []:
+                if (leg.get("legName") in {"TARGET_LEG", "STOP_LOSS_LEG"}
+                        and str(leg.get("orderStatus") or "").upper() not in TERMINAL_ORDERS):
+                    await client.cancel_super_order(str(order["orderId"]), leg["legName"])
+        if active:
+            refreshed = await client.get_super_orders(fresh=True)
+            active_ids = {str(o["orderId"]) for o in active}
+            if any(str(o.get("orderId")) in active_ids and any(
+                leg.get("legName") in {"TARGET_LEG", "STOP_LOSS_LEG"} and (
+                    str(leg.get("orderStatus") or "").upper() == "TRADED"
+                    or int(leg.get("filledQty") or 0) > 0)
+                for leg in o.get("legDetails") or []
+            ) for o in refreshed):
+                raise HTTPException(409, "Super Order exit filled during cancellation. Wait for holdings sync; no second exit sent.")
+            if any(matches(o) and any(
+                leg.get("legName") in {"TARGET_LEG", "STOP_LOSS_LEG"}
+                and str(leg.get("orderStatus") or "").upper() not in TERMINAL_ORDERS
+                for leg in o.get("legDetails") or []
+            ) for o in refreshed):
+                raise HTTPException(409, "Waiting for target/SL cancellation confirmation. No duplicate exit sent; retry after sync.")
+        book = await client.get_order_book(fresh=True)
+        if any(matches(o) and o.get("transactionType") == txn
+               and str(o.get("orderStatus") or "").upper() not in TERMINAL_ORDERS for o in book):
+            raise HTTPException(409, "An exit-side order is already pending at Dhan. Wait for broker sync.")
+        rows = await client.get_positions(fresh=True)
+        held = sum(int(r.get("netQty") or 0) for r in rows if matches(r))
+        if held == 0:
+            raise HTTPException(409, "Broker position is already closed. Refresh positions.")
+        expected_txn = "SELL" if held > 0 else "BUY"
+        if txn != expected_txn or body.quantity > abs(held):
+            raise HTTPException(409, "Requested exit no longer matches broker quantity/direction. Refresh positions.")
+        audit.save_manual_exit(key, payload["correlationId"])
+        pending[key] = payload["correlationId"]
+        try:
+            result = await client.place_order(payload)
+        except DhanAPIError as exc:
+            if 0 < exc.status_code < 500:
+                audit.save_manual_exit(key, None)
+                pending.pop(key, None)
+            raise
+    except sqlite3.Error as exc:
+        raise HTTPException(503, "Cannot persist/recover manual exit identity. Check Dhan before retrying.") from exc
     except DhanAPIError as exc:
         audit.log_order(
             action="squareoff", success=False, dry_run=False,

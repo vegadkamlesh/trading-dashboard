@@ -9,10 +9,12 @@ import json
 import logging
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 from .config import get_settings
+from .accounts import current_account
 
 logger = logging.getLogger("dhan.audit")
 order_logger = logging.getLogger("dhan.orders")
@@ -20,10 +22,16 @@ order_logger = logging.getLogger("dhan.orders")
 DB_PATH = Path(__file__).resolve().parent.parent / "audit.sqlite3"
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+@contextmanager
+def _connect() -> Generator[sqlite3.Connection, None, None]:
+    path = DB_PATH if current_account() == "master" else DB_PATH.with_name("audit-child.sqlite3")
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -50,7 +58,68 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS manual_requests (
+                request_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                response TEXT,
+                created_at REAL NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pending_manual_exits (
+                security_id TEXT NOT NULL, segment TEXT NOT NULL, product TEXT NOT NULL,
+                correlation_id TEXT NOT NULL,
+                PRIMARY KEY (security_id, segment, product)
+            )"""
+        )
         conn.commit()
+
+
+def claim_manual_request(request_id: str, fingerprint: str) -> tuple[bool, Optional[Dict[str, Any]]]:
+    """Persist intent before a write; unknown outcomes cannot be blindly replayed."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO manual_requests VALUES (?, ?, NULL, ?)",
+            (request_id, fingerprint, time.time()),
+        )
+        if cur.rowcount == 1:
+            return True, None
+    _, response = read_manual_request(request_id, fingerprint)
+    return False, response
+
+
+def finish_manual_request(request_id: str, response: Dict[str, Any]) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE manual_requests SET response = ? WHERE request_id = ?",
+                     (json.dumps(response), request_id))
+
+
+def read_manual_request(request_id: str, fingerprint: str) -> tuple[bool, Optional[Dict[str, Any]]]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT fingerprint, response FROM manual_requests WHERE request_id = ?", (request_id,),
+        ).fetchone()
+    if row is None:
+        return False, None
+    if row["fingerprint"] != fingerprint:
+        raise ValueError("This request was already submitted with different order inputs. Check Super Orders before a new order.")
+    return True, json.loads(row["response"]) if row["response"] else None
+
+
+def pending_manual_exits() -> Dict[tuple[str, str, str], str]:
+    with _connect() as conn:
+        return {(r["security_id"], r["segment"], r["product"]): r["correlation_id"]
+                for r in conn.execute("SELECT * FROM pending_manual_exits")}
+
+
+def save_manual_exit(key: tuple[str, str, str], correlation_id: Optional[str]) -> None:
+    with _connect() as conn:
+        if correlation_id is None:
+            conn.execute("DELETE FROM pending_manual_exits WHERE security_id=? AND segment=? AND product=?", key)
+        else:
+            conn.execute("INSERT OR REPLACE INTO pending_manual_exits VALUES (?, ?, ?, ?)",
+                         (*key, correlation_id))
 
 
 def log_order(
@@ -70,6 +139,9 @@ def log_order(
     target_price: Optional[float] = None,
     stop_loss_price: Optional[float] = None,
 ) -> None:
+    account = current_account()
+    correlation = (payload or {}).get("correlationId", "-")
+    message = f"account={account} correlation={correlation} {message or ''}"
     try:
         with _connect() as conn:
             conn.execute(
@@ -103,6 +175,11 @@ def log_order(
                 transaction_type or "-",
                 quantity, price, target_price, stop_loss_price,
                 dry_run, success, order_id or "-", status or "-", message or "-",
+                extra={
+                    "telegram_event": "order_success" if success else "order_failed",
+                    "telegram_account": account,
+                    "telegram_mode": "DRY-RUN" if dry_run else "LIVE",
+                },
             )
         except Exception:
             pass

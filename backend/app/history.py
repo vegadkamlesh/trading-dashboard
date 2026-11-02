@@ -217,6 +217,14 @@ class HistoryEngine:
                 except DhanAPIError as exc:
                     err = exc.error_message
                     logger.warning("rollingoption failed (code=%s): %s", expiry_code, exc)
+                    if exc.error_code in {"DH-905", "DH905", "DH-901", "DH901"} or exc.status_code in {400, 401, 403}:
+                        failed = self._empty(inst, option_type, strike_offset)
+                        failed.error = (
+                            f"Dhan {exc.error_code}: {exc.error_message} "
+                            f"(underlying={inst.sec_id}, expiry={expiry_flag}/{expiry_code}, interval=60, "
+                            f"dates={start}..{end}). Study unavailable; invalid/auth requests not repeated."
+                        )
+                        return failed
                     continue
 
                 data = (raw or {}).get("data") or {}
@@ -230,6 +238,10 @@ class HistoryEngine:
         # Win rate: fraction of sampled sessions where close-vs-open was positive.
         wins = sum(1 for x in all_close_vs_open if x > 0)
         total = len(all_close_vs_open)
+        if not total and not err:
+            err = "Dhan returned no historical option candles for this contract/date range; study unavailable."
+            logger.warning("rollingoption no candles index=%s option=%s dates=%s..%s", inst.key, option_type,
+                           chunks[0][0] if chunks else today, today)
 
         return ExpiryStudy(
             index_key=inst.key,

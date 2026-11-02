@@ -6,7 +6,46 @@ it on with real money — it is the single most important part of this document.
 
 ---
 
+## Current execution mode: target-only (18 Oct 2026)
+
+**The historical study and classic 0.20x stop formulas below are NOT the current
+default exit policy.** `target_only=true` disables software spot SL and
+break-even exits. Spot target stays 2x OR; manual EXIT and 15:12 forced exit stay.
+Broker protective SL = 10% of confirmed BUY premium (90% away), rounded to
+0.05 with minimum 0.05. Rs100 BUY -> Rs10 SL trigger.
+
+The far stop can still hit; nearly the entire premium can be lost. Target-only
+profitability has **not** been backtested here; do not reuse the classic study
+win-rate or expectancy as its expected performance. Sizing estimates 90% premium
+risk per lot (100% if protective SL is disabled); the minimum-lot floor can
+still exceed the risk percentage.
+
+Legacy saved settings migrate to target-only; old tracked broker stops must be
+cancel-confirmed and holdings rechecked before replacement. Until confirmed, an
+old stop remains executable. Existing pending exits are not reversed.
+Use `target_only=false` explicitly only if the classic software-stop strategy
+is intended. See [README](./README.md) for current execution details.
+
 ## 1. The strategy (one page)
+
+### Two-account execution
+
+Master Dhan owns the single shared data feed, opening range and signal.
+Master/Child trading checkboxes select recipients independently of the viewed
+account. The same signal resolves one contract/direction/spot-target anchor, then
+each armed recipient uses its own funds to size and manages its own orders and
+premium SL. Child-only trading does not place a Master trade.
+
+Shared settings are edited from Master view and copied on ARM. Per-account IP
+preflight failures are reported without blocking healthy recipients. Likewise, an
+entry failure does not roll back the other account's successful trade. The
+shared attempt day is persisted before sends; failures are not blindly replayed.
+There is no atomic two-account fill guarantee.
+
+State, journal, trades, manual audit, locks and trading API clients are isolated.
+Startup restores holding management but disarms new entries. Account-wise EXIT
+is separate from explicit EXIT BOTH. See [README](./README.md#master-dhan--child-dhan)
+for environment keys, controls, restart behavior, rate budgets and log locations.
 
 ```
 09:15 - 09:25   build the opening range (OR high / OR low) for both indices
@@ -339,22 +378,44 @@ python run_algo_account_sim.py --balance 30000 --premium 115 --mode fixed --lots
 
 ## 4. How the algo actually operates
 
+The current execution/synchronization contract is also documented in
+[README.md](./README.md#order-execution-and-stop-loss-rules-current-implementation).
+The performance figures above are the previous study, **not a rerun validating
+these execution changes**. Prices, fills, slippage and API outages can differ.
+The historical OR window is preserved: candle timestamps 09:15 through 09:25
+inclusive (11 one-minute timestamps), evaluated from 09:26 IST.
+
 ### Stop / target: software **and** broker-side
 
 The stop and target are **spot levels monitored in software**. On every tick
 (from the WebSocket, or the 1-second REST fallback) the engine compares the
 index spot against them and fires a **MARKET exit** the moment one is hit. This
-is precise, because the strategy is defined on spot — not on the option premium.
+uses the strategy's spot levels, not option premium. Execution is not guaranteed
+at those levels. Both entry prices must be no older than 5s; software stops/targets
+are evaluated only on fresh index samples.
 
 That has one weakness: it depends on this process staying alive. So immediately
 after the entry fill the engine also **parks a much wider real stop at Dhan**
 as a `STOP_LOSS_MARKET` order, at `protective_sl_mult` (default 2x) the software
-stop distance, converted to a premium price. If the server dies, you are not
-left naked — Dhan closes it.
+stop distance, converted using configured paper delta:
+`max(0.05, fill premium - initial spot stop distance x multiplier x delta)`,
+rounded to a 0.05 premium tick. This approximation can trigger before the spot
+stop. A fresh option quote is required; an already-crossed protective trigger
+requests an exit instead. An accepted SL request is not a confirmed live stop:
+check its broker status and any warnings. Broker execution can fail or slip.
 
-On a software exit the protective order is cancelled first, then the exit is
-sent. The protective stop is deliberately far away so it and the software exit
-cannot realistically race.
+On a software exit the protective order is verified/cancelled first, terminal
+cancellation/fill is confirmed, then holdings are freshly read. Only the
+remaining long quantity can be sold. Protective stops and software exits **can
+race**, so a pending cancel never permits a second SELL. A pending protective
+SELL displayed by Dhan is not itself an executed exit.
+
+Entry acknowledgement (`TRANSIT`/`PENDING`) is never assumed to be a fill.
+Pending identities are persisted before POST and resolved by broker
+order/correlation ID, including after timeout/restart. Partial entry remainders
+are cancelled before managing the confirmed fill. Pending exits stay tracked
+until broker-flat confirmation; rejected exits do not clear holdings. All
+algo/Positions/manual exit paths share one execution lock.
 
 *(Set `protective_sl: false` in Settings if you don't want an extra order at Dhan.)*
 
@@ -364,19 +425,24 @@ State is written to `backend/data/algo/state.json` after every meaningful change
 (arm, OR locked, entry, stop move, exit). On startup the engine:
 
 1. reloads the day, phase, OR levels, config and open position from disk
-2. **re-syncs with Dhan's real position book** (`POST /api/algo/reconcile`):
-   - position we track but Dhan no longer holds → marked closed
-   - quantity mismatch → adopts Dhan's quantity
+2. resubscribes index/option feeds and **re-syncs with Dhan's real position book**
+   automatically every ~1s while a position/order is tracked (including disarmed):
+   - position no longer held and no pending SELL → marked closed
+   - smaller quantity → verifies protective-stop cancellation and adopts remaining units
+   - unexpected short/larger quantity → attention warning, no blind reversal
    - position at Dhan we don't track → logs a loud error telling you to square it off
 3. resumes monitoring from wherever it left off
 
 OR levels are derived from the day's 1-minute data, so they are reproducible —
-a restart never loses the levels. A new calendar day resets everything
-automatically.
+a restart reloads saved levels. A new calendar day resets a flat session only;
+a surviving position is kept and an exit is requested, never silently forgotten.
+Paper positions are never compared against live holdings. A position keeps its
+original dry-run/live mode; mode and config changes are blocked while it exists.
 
-Caveat: entries are *events*, not state. If the server is down at the exact
-moment the range breaks, that entry is missed. The engine only trades while it
-is running.
+Caveat: entry is level-based, not a guaranteed crossing event. Starting late can
+enter a range that is already broken, before the configured cutoff; it cannot
+reproduce the price available while offline. Software SL/target require this
+process and fresh prices; broker protective orders are not guaranteed protection.
 
 ### Journal, EOD and retention
 
@@ -413,11 +479,13 @@ a glance during market hours:
 
 - **DRY-RUN is the default.** Nothing reaches Dhan while it is on; fills are
   simulated from live prices.
-- **EXIT NOW / panic button** squares off immediately.
+- **EXIT NOW / panic button** requests a checked market exit; wait for broker
+  confirmation. It does not promise an immediate fill.
 - Disarming does **not** abandon an open position — it keeps managing it, and
   says so in the log.
-- The page polls one cheap in-memory endpoint once a second. It never blocks on
-  Dhan, so it cannot hang.
+- The page polls one cheap in-memory endpoint once a second. Quote age, execution
+  state, broker-sync errors/time and failed UI refresh are shown separately.
+  A connected feed/armed algo does not mean an open position.
 
 ---
 
@@ -434,19 +502,21 @@ All settings also live in the **Settings** sub-tab and persist across restarts.
 | `ALGO_ENTRY_CUTOFF` | `15:00` | no fresh entries after this (IST) |
 | `ALGO_EXIT_TIME` | `15:12` | forced square-off |
 | `ALGO_STRIKE_OFFSET` | `0` | 0 = ATM, 1 = one strike OTM |
-| `ALGO_RISK_PCT` | `2.0` | % of balance risked per trade |
+| `ALGO_RISK_PCT` | `0.5` | risk estimate per trade, capped by streak budget in .env defaults |
 | `ALGO_MAX_CAPITAL_PCT` | `60.0` | max % of balance spent on premium |
-| `ALGO_MAX_LOTS` | `15` | hard cap |
+| `ALGO_MAX_LOTS` | `10` | hard cap |
+| `ALGO_MIN_LOTS` | `1` | minimum-lot floor can override percentage budgets, never actual affordability |
 | `ALGO_MIN_OR_PCT` / `ALGO_MAX_OR_PCT` | `0` | skip days whose OR is too small/large (0 = off) |
 | `ALGO_ORDER_TYPE` | `MARKET` | MARKET (fast) or LIMIT |
 | `ALGO_PRODUCT_TYPE` | `INTRADAY` | `INTRADAY` or `MARGIN` |
-| `ALGO_LOT_SIZES` | *(empty)* | override, e.g. `NIFTY=75,SENSEX=20` |
+| `ALGO_LOT_SIZES` | *(empty)* | override, e.g. `NIFTY=65,SENSEX=20`; verify current exchange contract sizes |
 
 **Position sizing** uses the live fund balance (or the paper balance in dry-run):
-`lots = min(risk_budget / (stop_points × delta × lot), capital_budget / (premium × lot), max_lots)`.
-At 2% risk and a 76-point OR, that is about **2% of balance per trade**. The
-study's per-trade drawdown (2,700 SENSEX points ≈ ₹27,000/lot, 758 NIFTY points
-≈ ₹28,000/lot) is the number to sanity-check your account size against.
+the risk/capital caps with the existing minimum-lot floor, bounded by actual
+available cash and max lots. **Minimum lots can exceed the configured risk
+percentage**, so 0.5% is not a guaranteed maximum loss. Insufficient cash skips
+the trade. Gap risk, delta changes and slippage can exceed any estimate.
+Saved per-session settings take precedence over .env defaults.
 
 > `ALGO_BREAKEVEN_AT` defaults to **off** on purpose: the 5-year numbers were
 > measured without it, so the live behaviour matches the validated backtest
@@ -472,10 +542,12 @@ study's per-trade drawdown (2,700 SENSEX points ≈ ₹27,000/lot, 758 NIFTY poi
 
 ## 8. Troubleshooting
 
-**"DH-904 / Too many requests"** — Dhan's data API is strict. The historical and
-intraday fetches share one global gate (1.1s apart) and back off on 429, so a
-few warnings during a long backfill are normal and retried. If it never
-recovers, wait a minute.
+**"DH-904 / Too many requests"** — all REST callers share category budgets,
+including bulk history with `throttle=False`. 429 applies a category cooldown;
+order writes are never automatically replayed. Charts normally retain the
+1.1s gap, while bulk calls still obey 5/s and 100,000/day. See the README limits
+table. Budgets are per process and reset on restart; other apps share your
+broker account quota, so run a single backend and monitor errors.
 
 **Feed says "offline"** — the WebSocket needs the Dhan access token to be valid
 and your IP to be whitelisted. The engine automatically falls back to the

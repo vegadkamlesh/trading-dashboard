@@ -70,6 +70,7 @@ export interface FundCheck {
   availableBalance: number | null;
   sufficient: boolean;
   shortfall: number;
+  error?: string;
 }
 
 export interface OrderPreviewResponse {
@@ -98,6 +99,7 @@ export interface Position {
   buyAvg?: number;
   sellAvg?: number;
   ltp?: number;
+  quoteError?: string | null;
   realizedProfit?: number;
   unrealizedProfit?: number;
   drvExpiryDate?: string;
@@ -117,6 +119,7 @@ export interface SuperOrderLeg {
 }
 
 export interface SuperOrder {
+  quoteError?: string | null;
   orderId: string;
   correlationId?: string;
   orderStatus: string;
@@ -392,6 +395,18 @@ export interface IpStatus {
   ordersAllowed?: boolean | null;
 }
 
+export interface TelegramStatus {
+  enabled: boolean;
+  running: boolean;
+  queued: number;
+  sent: number;
+  failed: number;
+  dropped: number;
+  suppressed: number;
+  lastSentAt: number | null;
+  lastError: string | null;
+}
+
 export interface AppSettings {
   ok: boolean;
   dryRun: boolean;
@@ -401,12 +416,14 @@ export interface AppSettings {
   logDir: string;
   logRetentionDays: number;
   logLevel: string;
+  telegram: TelegramStatus;
 }
 
 // --------------------------------------------------------------------- //
 //  Algo (ORB auto-trader)
 // --------------------------------------------------------------------- //
 export interface AlgoConfig {
+  target_only: boolean;
   indices: string[];
   sl_mult: number;
   target_mult: number;
@@ -446,6 +463,8 @@ export interface AlgoLeg {
 }
 
 export interface AlgoPosition {
+  softwareStopEnabled: boolean;
+  protectiveTrigger: number | null;
   index: string;
   optionType: "CALL" | "PUT";
   strike: number;
@@ -470,6 +489,10 @@ export interface AlgoPosition {
   dryRun: boolean;
   orderId: string | null;
   protectiveOrderId: string | null;
+  executionState: "entry_pending" | "open" | "exit_pending" | "attention";
+  executionError: string;
+  exitOrderId: string | null;
+  spotAgeSeconds: number | null;
 }
 
 export interface AlgoEvent {
@@ -520,6 +543,8 @@ export interface AlgoFeedStatus {
 
 export interface AlgoStatus {
   enabled: boolean;
+  sharedEnabled: boolean;
+  sharedEntryAccounts: Array<"master" | "child">;
   phase: string;
   phaseLabel: string;
   dryRun: boolean;
@@ -545,6 +570,10 @@ export interface AlgoStatus {
   feed: AlgoFeedStatus;
   recovered: string | null;
   lastError: string | null;
+  brokerSyncAt: string | null;
+  brokerSyncError: string | null;
+  brokerNetQty: number | null;
+  brokerPositionPnl: number | null;
   paperBalance: number | null;
   uptimeSeconds: number;
   events: AlgoEvent[];

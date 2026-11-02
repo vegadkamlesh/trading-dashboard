@@ -7,11 +7,13 @@ import { ConnectionBar } from "../components/ConnectionBar";
 import { OptionChainPage } from "./OptionChainPage";
 import { AlgoPage } from "./AlgoPage";
 import { Positions } from "./Positions";
-import { SuperOrders } from "./SuperOrders";
+import { Orders } from "./SuperOrders";
 import { Funds } from "./Funds";
 import { EodSummary } from "./EodSummary";
 import { SettingsPanel } from "../components/SettingsPanel";
 import { Readme } from "./Readme";
+import { TradingAccountsProvider, useTradingAccounts } from "../hooks/useTradingAccounts";
+import { TradingAccountBar } from "../components/TradingAccountBar";
 
 type Tab = "algo" | "chain" | "positions" | "orders" | "funds" | "eod" | "settings" | "readme";
 
@@ -19,7 +21,7 @@ const TABS: Array<[Tab, string]> = [
   ["algo", "🤖 Algo"],
   ["chain", "Option Chain"],
   ["positions", "Positions"],
-  ["orders", "Super Orders"],
+  ["orders", "Orders"],
   ["funds", "Funds"],
   ["eod", "EOD Summary"],
   ["settings", "Settings"],
@@ -27,9 +29,16 @@ const TABS: Array<[Tab, string]> = [
 ];
 
 export function Dashboard() {
+  return <TradingAccountsProvider><TradingDashboard /></TradingAccountsProvider>;
+}
+
+function TradingDashboard() {
+  const { view, data: accounts } = useTradingAccounts();
   const { logout } = useAuth();
   const [tab, setTab] = useState<Tab>("algo");
   const { data: indices } = usePolling<IndexInfo[]>(() => api.get("/api/market/indices"), 60000);
+  const mockAccounts = accounts?.accounts.filter((account) => account.configured && account.mock) ?? [];
+  const realAccounts = accounts?.accounts.some((account) => account.configured && !account.mock) ?? false;
 
   return (
     <div className="flex min-h-full flex-col">
@@ -48,14 +57,30 @@ export function Dashboard() {
             ))}
           </nav>
         </div>
-        <ConnectionBar onLogout={logout} />
+        <ConnectionBar key={view} onLogout={logout} />
       </header>
 
-      <main className="flex-1 p-4">
+      <TradingAccountBar />
+      <main key={view} className="flex-1 p-4">
+        {(accounts?.dataSourceMock || mockAccounts.length > 0) && (
+          <div role="alert" className="mb-3 rounded border border-amber-500 bg-amber-950/60 px-3 py-2 text-sm text-amber-100">
+            {accounts?.dataSourceMock && (
+              <p><strong>MOCK MARKET DATA:</strong> Prices and history are synthetic, not live Dhan quotes. Do not trade based on them.</p>
+            )}
+            {mockAccounts.length > 0 && (
+              <p><strong>MOCK BROKER:</strong> {mockAccounts.map((account) => account.name).join(", ")} uses simulated broker responses.</p>
+            )}
+            {realAccounts && (
+              <p>Accounts with real broker credentials can place real orders when LIVE mode is enabled.</p>
+            )}
+          </div>
+        )}
+        <p className="mb-3 text-xs text-sky-300">Viewing {view === "master" ? "Master Dhan" : "Child Dhan"} — account-specific holdings, orders, funds and EXIT</p>
+        <BrokerSyncBar />
         {tab === "algo" && <AlgoPage />}
         {tab === "chain" && <OptionChainPage indices={indices ?? []} />}
         {tab === "positions" && <Positions />}
-        {tab === "orders" && <SuperOrders />}
+        {tab === "orders" && <Orders />}
         {tab === "funds" && <Funds />}
         {tab === "eod" && <EodSummary />}
         {tab === "settings" && <SettingsPanel />}
@@ -65,4 +90,23 @@ export function Dashboard() {
   );
 }
 
-
+function BrokerSyncBar() {
+  const { data, error } = usePolling<{
+    observedAt: Record<string, number>; errors: Record<string, string>;
+    orderStreamConnected: boolean; orderStreamError: string | null;
+  }>(() => api.get("/api/account/sync"), 1000);
+  const observed = data?.observedAt["/positions"];
+  const age = observed ? Math.max(0, Date.now() / 1000 - observed) : null;
+  const stale = !!error || age === null || age > 3 || !!data?.errors["/positions"];
+  return <div role={stale ? "alert" : undefined}
+    className={`mb-3 rounded border px-3 py-2 text-xs ${stale
+      ? "border-amber-700 text-amber-200" : "border-slate-800 text-slate-400"}`}>
+    Broker holdings: {stale ? "UNVERIFIED / STALE" : "recent Dhan snapshot"}
+    {age !== null && ` · ${age.toFixed(1)}s since response`}
+    {" · "}Order notifications: {data?.orderStreamConnected ? "connected" : "REST fallback"}
+    {" · "}Both accounts refresh in backend, even when another view is selected.
+    {error && <p>{error}</p>}
+    {Object.entries(data?.errors || {}).map(([path, message]) => <p key={path}>{path}: {message}</p>)}
+    {data?.orderStreamError && <p>{data.orderStreamError}</p>}
+  </div>;
+}

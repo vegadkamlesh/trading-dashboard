@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +15,22 @@ class Settings(BaseSettings):
     # --- Dhan credentials ---
     dhan_client_id: str = ""
     dhan_access_token: str = ""
+    # Legacy DHAN_* remains the Master data/feed credentials.
+    dhan_master_trading_token: str = ""
+    dhan_child_client_id: str = ""
+    dhan_child_access_token: str = ""
+    # Optional local IPv4 each account binds to, so it egresses via its own
+    # whitelisted static IP (e.g. Master=primary NIC, Child=secondary NIC).
+    dhan_master_source_ip: str = ""
+    dhan_child_source_ip: str = ""
+
+    @model_validator(mode="after")
+    def validate_accounts(self):
+        if bool(self.dhan_child_client_id) != bool(self.dhan_child_access_token):
+            raise ValueError("Set both DHAN_CHILD_CLIENT_ID and DHAN_CHILD_ACCESS_TOKEN, or leave both empty")
+        if self.dhan_child_client_id and self.dhan_child_client_id == self.dhan_client_id:
+            raise ValueError("Master and Child must have different Dhan client IDs")
+        return self
 
     # --- Security ---
     app_session_secret: str = "insecure-dev-secret-change-me"
@@ -33,6 +49,23 @@ class Settings(BaseSettings):
     log_retention_days: int = 7
     # DEBUG / INFO / WARNING / ERROR
     log_level: str = "INFO"
+
+    # --- Optional, outbound-only operational notifications ---
+    telegram_enabled: bool = False
+    telegram_bot_token: str = Field("", repr=False)
+    telegram_chat_id: str = Field("", repr=False)
+    telegram_heartbeat_seconds: int = Field(900, ge=60)
+
+    @model_validator(mode="after")
+    def validate_telegram(self):
+        if self.telegram_enabled:
+            import re
+
+            if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", self.telegram_bot_token):
+                raise ValueError("TELEGRAM_ENABLED requires a valid TELEGRAM_BOT_TOKEN")
+            if not re.fullmatch(r"-?\d+|@[A-Za-z][A-Za-z0-9_]{4,}", self.telegram_chat_id):
+                raise ValueError("TELEGRAM_ENABLED requires a numeric chat ID or @channel username")
+        return self
 
     # --- Network ---
     app_host: str = "127.0.0.1"
@@ -54,10 +87,11 @@ class Settings(BaseSettings):
     intel_history_days: int = 90
 
     # --- ORB Algo (auto trading) -------------------------------------------
-    # All ratios come from the 5-year ORB study (see ALGO_STRATEGY.md).
-    # Stop / target are multiples of the day's 09:15-09:25 range (auto-adapts).
+    # Classic ratios come from the previous ORB study, not target-only validation.
+    # Target scales with the day's range; target-only disables software stops.
     # Which indices the auto-trader watches (first one to break takes the trade).
     algo_indices_raw: str = Field("NIFTY,SENSEX", validation_alias="ALGO_INDICES")
+    algo_target_only: bool = True
     algo_sl_mult: float = 0.2           # stop = 0.20 x opening range
     algo_target_mult: float = 2.0       # target = 2.0 x opening range
     algo_breakeven_at: float = 0.0      # move stop to entry after +N x OR (0 = off)
@@ -141,4 +175,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

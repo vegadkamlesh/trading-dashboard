@@ -16,21 +16,34 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import logging
+import json as json_codec
+import math
 import math
 import random
 import socket
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import httpx
+try:
+    from websockets.asyncio.client import connect as order_ws_connect
+except ImportError:
+    from websockets.client import connect as order_ws_connect
 
 from .config import get_settings
+from .rate_limit import DATA_GATE, chain_gate_for, gate_for
 
 logger = logging.getLogger("dhan.client")
 
 BASE_URL = "https://api.dhan.co/v2"
 
 MOCK_TOKEN_PREFIX = "mock"
+
+
+def is_mock_token(token: str) -> bool:
+    return token.lower().startswith(MOCK_TOKEN_PREFIX)
+
 
 # ---------------------------------------------------------------------------
 # Force IPv4 for ALL outbound calls.
@@ -46,6 +59,20 @@ _ORIG_GETADDRINFO = socket.getaddrinfo
 
 def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return _ORIG_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+
+
+def source_ip_for(account_id: str) -> str:
+    """Local IPv4 this account's Dhan traffic must leave from ("" = OS default)."""
+    s = get_settings()
+    if account_id == "child":
+        return s.dhan_child_source_ip.strip()
+    if account_id in ("master", "master-data"):
+        return s.dhan_master_source_ip.strip()
+    return ""
+
+
+def _transport(source_ip: str) -> Optional[httpx.AsyncHTTPTransport]:
+    return httpx.AsyncHTTPTransport(local_address=source_ip) if source_ip else None
 
 
 def enable_ipv4_only() -> None:
@@ -99,24 +126,137 @@ class DhanClient:
     _heavy_lock: Optional[asyncio.Lock] = None
     _last_heavy_at: float = 0.0
 
-    def __init__(self, timeout: float = 15.0) -> None:
+    def __init__(self, timeout: float = 15.0, *, client_id: Optional[str] = None,
+                 access_token: Optional[str] = None, account_id: str = "master-data") -> None:
         # Pin outbound traffic to IPv4 so Dhan always sees the whitelisted IP.
         enable_ipv4_only()
         s = get_settings()
-        self._client_id = s.dhan_client_id
+        self.account_id = account_id
+        self._client_id = s.dhan_client_id if client_id is None else client_id
+        token = s.dhan_access_token if access_token is None else access_token
         self._headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "access-token": s.dhan_access_token,
-            "client-id": s.dhan_client_id,
+            "access-token": token,
+            "client-id": self._client_id,
         }
-        self._client = httpx.AsyncClient(base_url=BASE_URL, timeout=timeout)
-        self._mock = s.dhan_access_token.lower().startswith(MOCK_TOKEN_PREFIX)
+        self.source_ip = source_ip_for(account_id)
+        self._client = httpx.AsyncClient(base_url=BASE_URL, timeout=timeout, transport=_transport(self.source_ip))
+        if self.source_ip:
+            logger.info("account=%s outbound Dhan traffic bound to %s", account_id, self.source_ip)
+        self._mock = is_mock_token(token)
+        self._read_cache: Dict[str, tuple[float, Any]] = {}
+        self._read_locks: Dict[str, asyncio.Lock] = {}
+        self._observed_at: Dict[str, float] = {}
+        self._read_errors: Dict[str, str] = {}
+        self._live_tasks: list[asyncio.Task] = []
+        self._refresh_event = asyncio.Event()
+        self._order_connected = False
+        self._order_error: Optional[str] = None
+        self._last_order_event: Optional[float] = None
+        self._auth_retry_at = 0.0
+        self._auth_error: Optional[DhanAPIError] = None
         if self._mock:
             logger.warning("DhanClient running in MOCK mode (synthetic data, no network)")
 
     async def aclose(self) -> None:
+        for task in self._live_tasks:
+            task.cancel()
+        if self._live_tasks:
+            await asyncio.gather(*self._live_tasks, return_exceptions=True)
+            self._live_tasks.clear()
         await self._client.aclose()
+
+    def start_live_sync(self) -> None:
+        if self._live_tasks or self._mock:
+            return
+        self._live_tasks = [
+            asyncio.create_task(self._account_poll_loop(), name=f"{self.account_id}-broker-poll"),
+            asyncio.create_task(self._order_update_loop(), name=f"{self.account_id}-order-stream"),
+        ]
+
+    def sync_status(self) -> Dict[str, Any]:
+        return {
+            "accountId": self.account_id, "source": "dhan",
+            "observedAt": dict(self._observed_at), "errors": dict(self._read_errors),
+            "orderStreamConnected": self._order_connected, "orderStreamError": self._order_error,
+            "lastOrderEventAt": self._last_order_event,
+        }
+
+    def _on_order_update(self, raw: Any) -> None:
+        if not isinstance(raw, dict) or raw.get("Type") != "order_alert":
+            return
+        data = raw.get("Data")
+        if not isinstance(data, dict) or str(data.get("ClientId")) != self._client_id:
+            raise DhanAPIError(0, "BAD_ORDER_EVENT", "Order stream identity missing/mismatched; event ignored.")
+        self._last_order_event = time.time()
+        self._read_cache.clear()
+        self._refresh_event.set()
+        logger.info("account=%s external_order_event status=%s; refreshing broker books",
+                    self.account_id, data.get("Status"), extra={
+                        "telegram_event": "broker_update", "telegram_account": self.account_id,
+                    })
+
+    async def _account_poll_once(self) -> None:
+        for path, call in (
+            ("/positions", lambda: self.get_positions(fresh=True)),
+            ("/orders", lambda: self.get_order_book(fresh=True)),
+            ("/super/orders", lambda: self.get_super_orders(fresh=True)),
+            ("/fundlimit", lambda: self.get_fund_limit(fresh=True)),
+        ):
+            previous_error = self._read_errors.get(path)
+            try:
+                await call()
+                if previous_error:
+                    logger.info("account=%s resource=%s live_account_sync recovered", self.account_id, path)
+            except DhanAPIError as exc:
+                if previous_error != exc.error_message:
+                    logger.warning("account=%s resource=%s live_account_sync code=%s reason=%s",
+                                   self.account_id, path, exc.error_code, exc.error_message)
+
+    async def _account_poll_loop(self) -> None:
+        while True:
+            self._refresh_event.clear()
+            next_poll = time.monotonic() + 1.0
+            await self._account_poll_once()
+            try:
+                await asyncio.wait_for(self._refresh_event.wait(), timeout=max(.1, next_poll - time.monotonic()))
+            except asyncio.TimeoutError:
+                pass
+
+    async def _order_update_loop(self) -> None:
+        delay = 1.0
+        while True:
+            try:
+                bind = {"local_addr": (self.source_ip, 0)} if self.source_ip else {}
+                async with order_ws_connect("wss://api-order-update.dhan.co",
+                                            ping_interval=20, ping_timeout=20, **bind) as ws:
+                    await ws.send(json_codec.dumps({
+                        "LoginReq": {"MsgCode": 42, "ClientId": self._client_id,
+                                     "Token": self._headers["access-token"]},
+                        "UserType": "SELF",
+                    }))
+                    self._order_connected = True
+                    self._order_error = None
+                    connected_at = time.monotonic()
+                    self._refresh_event.set()
+                    async for message in ws:
+                        self._on_order_update(json_codec.loads(message))
+                        if time.monotonic() - connected_at > 30:
+                            delay = 1.0
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ValueError, DhanAPIError, httpx.HTTPError) as exc:
+                self._order_error = f"{type(exc).__name__}: order stream unavailable; REST polling continues"
+                logger.warning("account=%s order_stream_unavailable type=%s retry_in=%s",
+                               self.account_id, type(exc).__name__, delay)
+            except Exception:
+                self._order_error = "Unexpected order-stream failure; REST polling continues"
+                logger.exception("account=%s order stream failed", self.account_id)
+            finally:
+                self._order_connected = False
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
 
     @classmethod
     async def _await_heavy_slot(cls) -> None:
@@ -145,6 +285,12 @@ class DhanClient:
     ) -> Any:
         if self._mock:
             return self._mock_response(method, path, json or {})
+        if self._auth_error and time.monotonic() < self._auth_retry_at:
+            raise DhanAPIError(self._auth_error.status_code, self._auth_error.error_code,
+                               self._auth_error.error_message + " Retry paused for 60s; refresh credentials.")
+        if self.account_id in {"master", "child"} and json is not None and (
+                path.startswith("/orders") or path.startswith("/super/orders")):
+            json = {**json, "dhanClientId": self._client_id}
 
         # Serialise heavy chart calls through one gate so parallel panels can't
         # burst the data API and trip Dhan's rate limit (DH-904 / 429).
@@ -153,39 +299,101 @@ class DhanClient:
         # bounded-concurrency + 429-retry management.
         if throttle and any(p in path for p in _HEAVY_PATHS):
             await self._await_heavy_slot()
+        gate = gate_for(method, path, self._client_id)
+        if path == "/optionchain" and json is not None:
+            gate = chain_gate_for(self._client_id, str(json.get("UnderlyingScrip")), str(json.get("Expiry")))
+            await DATA_GATE.acquire()
+        await gate.acquire()
 
         try:
             resp = await self._client.request(
                 method, path, headers=self._headers, json=json
             )
         except httpx.HTTPError as exc:  # network-level failure
-            logger.warning("Network error calling %s %s: %s", method, path, exc)
+            logger.warning("account=%s method=%s path=%s network_error=%s", self.account_id, method, path, exc)
             raise DhanAPIError(0, "DH-909", f"Network error: {exc}") from exc
 
         if resp.status_code >= 400:
             code, msg = self._extract_error(resp)
-            logger.warning("Dhan %s %s -> %s [%s] %s", method, path, resp.status_code, code, msg)
+            if resp.status_code == 401:
+                self._auth_error = DhanAPIError(resp.status_code, code, msg)
+                self._auth_retry_at = time.monotonic() + 60
+            if resp.status_code == 429 or code == "DH-904":
+                try:
+                    cooldown = max(3.0, float(resp.headers.get("Retry-After", "3")))
+                except ValueError:
+                    cooldown = 3.0
+                gate.defer(cooldown)
+            logger.warning("account=%s method=%s path=%s http=%s code=%s reason=%s",
+                           self.account_id, method, path, resp.status_code, code, msg)
             raise DhanAPIError(resp.status_code, code, msg)
 
         if resp.status_code == 202 or not resp.content:
             return {"status": "accepted"}
         try:
-            return resp.json()
-        except ValueError:
-            return {"raw": resp.text}
+            data = resp.json()
+        except ValueError as exc:
+            raise DhanAPIError(resp.status_code, "BAD_RESPONSE", "Broker returned non-JSON response; outcome unknown.") from exc
+        self._auth_error = None
+        return data
+
+    async def _cached_read(self, path: str, *, fresh: bool = False) -> Any:
+        async with self._read_locks.setdefault(path, asyncio.Lock()):
+            cached = self._read_cache.get(path)
+            if not fresh and cached and time.monotonic() - cached[0] < 1.0:
+                return deepcopy(cached[1])
+            try:
+                result = await self._request("GET", path)
+                if path in {"/positions", "/orders", "/super/orders"}:
+                    if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
+                        raise DhanAPIError(0, "BAD_BROKER_BOOK", f"Invalid {path} response; holdings/orders unknown.")
+                    required = "netQty" if path == "/positions" else "orderStatus"
+                    fields = (required, "securityId", "exchangeSegment", "productType")
+                    if any(any(field not in row or row[field] is None for field in fields) for row in result):
+                        raise DhanAPIError(0, "BAD_BROKER_BOOK", f"Missing identity/status/quantity in {path}; not a valid broker book.")
+                    if path == "/positions":
+                        try:
+                            for row in result:
+                                quantity = row["netQty"]
+                                if isinstance(quantity, bool) or int(quantity) != float(quantity):
+                                    raise ValueError("Non-integer net quantity")
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            raise DhanAPIError(0, "BAD_BROKER_BOOK", "Invalid broker netQty; holdings unknown.") from exc
+                elif path == "/fundlimit":
+                    try:
+                        if not isinstance(result, dict) or isinstance(result.get("availabelBalance"), bool):
+                            raise ValueError("Invalid balance type")
+                        if not math.isfinite(float(result["availabelBalance"])):
+                            raise ValueError("Balance is not finite")
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise DhanAPIError(0, "BAD_FUNDS", "Invalid/missing available funds; balance unknown.") from exc
+            except DhanAPIError as exc:
+                self._read_cache.pop(path, None)
+                self._read_errors[path] = exc.error_message
+                raise
+            self._read_cache[path] = (time.monotonic(), result)
+            self._observed_at[path] = time.time()
+            self._read_errors.pop(path, None)
+            return deepcopy(result)
 
     @staticmethod
     def _extract_error(resp: httpx.Response) -> tuple[str, str]:
         try:
             data = resp.json()
         except ValueError:
-            return "DH-910", resp.text[:300]
-        code = str(data.get("errorCode") or data.get("error_code") or "DH-910")
+            if resp.status_code == 401:
+                return "DH-901", "Authentication rejected: token/client ID invalid or expired."
+            return "DH-910", resp.text[:300] or f"Broker request failed (HTTP {resp.status_code})."
+        if not isinstance(data, dict):
+            data = next((r for r in data if isinstance(r, dict)), {}) if isinstance(data, list) else {}
+        code = str(data.get("errorCode") or data.get("error_code") or
+                   ("DH-901" if resp.status_code == 401 else "DH-910"))
         msg = str(
             data.get("errorMessage")
             or data.get("error_message")
             or data.get("message")
-            or "Unknown error"
+            or ("Authentication rejected: token/client ID invalid or expired." if resp.status_code == 401
+                else f"Broker request failed (HTTP {resp.status_code}); no detailed reason supplied.")
         )
         return code, msg
 
@@ -550,11 +758,11 @@ class DhanClient:
     async def get_profile(self) -> Dict[str, Any]:
         return await self._request("GET", "/profile")
 
-    async def get_fund_limit(self) -> Dict[str, Any]:
-        return await self._request("GET", "/fundlimit")
+    async def get_fund_limit(self, *, fresh: bool = False) -> Dict[str, Any]:
+        return await self._cached_read("/fundlimit", fresh=fresh)
 
-    async def get_positions(self) -> List[Dict[str, Any]]:
-        return await self._request("GET", "/positions")
+    async def get_positions(self, *, fresh: bool = False) -> List[Dict[str, Any]]:
+        return await self._cached_read("/positions", fresh=fresh)
 
     async def get_holdings(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/holdings")
@@ -562,43 +770,88 @@ class DhanClient:
     # ---------------- orders ----------------
     async def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Plain order (LIMIT/MARKET) — used for instant square-off/exit."""
+        self._read_cache.clear()
         return await self._request("POST", "/orders", json=payload)
 
     async def place_super_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._read_cache.clear()
         return await self._request("POST", "/super/orders", json=payload)
 
     async def cancel_super_order(self, order_id: str, leg: str) -> Dict[str, Any]:
+        self._read_cache.clear()
         return await self._request("DELETE", f"/super/orders/{order_id}/{leg}")
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel a regular (non-super) order by id."""
+        self._read_cache.clear()
         return await self._request("DELETE", f"/orders/{order_id}")
 
-    async def get_super_orders(self) -> List[Dict[str, Any]]:
-        return await self._request("GET", "/super/orders")
+    async def get_super_orders(self, *, fresh: bool = False) -> List[Dict[str, Any]]:
+        return await self._cached_read("/super/orders", fresh=fresh)
 
-    async def get_order_book(self) -> List[Dict[str, Any]]:
-        return await self._request("GET", "/orders")
+    async def get_order_book(self, *, fresh: bool = False) -> List[Dict[str, Any]]:
+        return await self._cached_read("/orders", fresh=fresh)
 
     async def get_order_by_id(self, order_id: str) -> Dict[str, Any]:
-        return await self._request("GET", f"/orders/{order_id}")
+        return await self._get_order_detail(f"/orders/{order_id}", order_id=order_id)
+
+    async def get_order_by_correlation(self, correlation_id: str) -> Dict[str, Any]:
+        return await self._get_order_detail(f"/orders/external/{correlation_id}", correlation=correlation_id)
+
+    async def _get_order_detail(self, path: str, *, order_id: str = "", correlation: str = "") -> Dict[str, Any]:
+        try:
+            raw = await self._request("GET", path)
+            return self._order_detail(raw, order_id=order_id, correlation=correlation)
+        except DhanAPIError as exc:
+            if exc.error_code != "UNKNOWN_ORDER" and exc.status_code != 404:
+                raise
+            logger.warning("account=%s detail unavailable; verifying exact identity against fresh current order book",
+                           self.account_id)
+            book = await self.get_order_book(fresh=True)
+            return self._order_detail(book, order_id=order_id, correlation=correlation)
+
+    @staticmethod
+    def _order_detail(raw: Any, *, order_id: str = "", correlation: str = "") -> Dict[str, Any]:
+        rows = raw if isinstance(raw, list) else [raw]
+        matches = [row for row in rows if isinstance(row, dict) and row.get("orderStatus")
+                   and ((order_id and str(row.get("orderId")) == order_id)
+                        or (correlation and row.get("correlationId") == correlation))]
+        if len(matches) != 1:
+            raise DhanAPIError(0, "UNKNOWN_ORDER", "Broker order missing/ambiguous; outcome unknown. No automatic replay.")
+        return matches[0]
 
     async def get_trades(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/trades")
 
     async def get_ip(self) -> Dict[str, Any]:
-        return await self._request("GET", "/ip/getIP")
+        result = await self._request("GET", "/ip/getIP")
+        if not isinstance(result, dict):
+            message = next((str(row["message"]) for row in result
+                            if isinstance(row, dict) and row.get("message")), None) \
+                if isinstance(result, list) else None
+            reason = message or "Dhan returned an invalid static-IP response; cannot verify order permission."
+            logger.warning("account=%s static_ip_unverified response_type=%s reason=%s",
+                           self.account_id, type(result).__name__, reason)
+            raise DhanAPIError(200, "IP_NOT_VERIFIED", reason)
+        allowed = result.get("ordersAllowed")
+        if (allowed is not None and not isinstance(allowed, bool)) or (
+            allowed is None and not result.get("ipMatchStatus")
+        ):
+            reason = str(result.get("message") or
+                         "Dhan returned no valid static-IP permission verdict; check IP registration for this account.")
+            logger.warning("account=%s static_ip_unverified reason=%s", self.account_id, reason)
+            raise DhanAPIError(200, "IP_NOT_VERIFIED", reason)
+        return result
 
     async def set_ip(self, ip: str, flag: str) -> Dict[str, Any]:
         """Register the outbound IP with Dhan (required before live orders).
 
         `flag` is 'PRIMARY' or 'SECONDARY'.
         """
-        s = get_settings()
         return await self._request(
             "POST",
             "/ip/setIP",
-            json={"dhanClientId": s.dhan_client_id, "ip": ip, "ipFlag": flag},
+            json={"dhanClientId": self._client_id, "ip": ip, "ipFlag": flag},
         )
 
     async def detect_public_ip(self) -> Optional[str]:
@@ -609,7 +862,7 @@ class DhanClient:
         """
         for url in ("https://api.ipify.org?format=json", "https://ifconfig.me/ip"):
             try:
-                async with httpx.AsyncClient(timeout=6.0) as c:
+                async with httpx.AsyncClient(timeout=6.0, transport=_transport(self.source_ip)) as c:
                     r = await c.get(url)
                     if r.status_code == 200:
                         text = r.text.strip()
@@ -622,6 +875,20 @@ class DhanClient:
 
 
 _client: Optional[DhanClient] = None
+_trading_clients: Dict[str, DhanClient] = {}
+
+
+def get_trading_client() -> DhanClient:
+    from .accounts import account_credentials, current_account
+    account = current_account()
+    if account not in _trading_clients:
+        client_id, token = account_credentials(account)
+        if not client_id or not token:
+            raise DhanAPIError(0, "NOT_CONFIGURED", f"{account} trading credentials missing")
+        _trading_clients[account] = DhanClient(
+            client_id=client_id, access_token=token, account_id=account,
+        )
+    return _trading_clients[account]
 
 
 def get_dhan_client() -> DhanClient:
@@ -636,3 +903,6 @@ async def close_dhan_client() -> None:
     if _client is not None:
         await _client.aclose()
         _client = None
+    for client in _trading_clients.values():
+        await client.aclose()
+    _trading_clients.clear()

@@ -11,18 +11,20 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from ..algo import algo
+from ..algo import algo, engines
 from ..algo_store import store
 from ..orb_study import study
 from ..security import require_csrf, require_session
+from ..accounts import current_account
 
 router = APIRouter(prefix="/api/algo", tags=["algo"])
 
 
 class ConfigPatch(BaseModel):
+    target_only: Optional[bool] = None
     sl_mult: Optional[float] = None
     target_mult: Optional[float] = None
     breakeven_at: Optional[float] = None
@@ -44,23 +46,33 @@ class ConfigPatch(BaseModel):
 
 @router.get("/status")
 async def status(_session: str = Depends(require_session)) -> Dict[str, Any]:
-    return algo.status()
+    return {
+        **algo.status(),
+        "sharedEnabled": any(engine.enabled for engine in engines.items.values()),
+        "sharedEntryAccounts": list(engines.entry_accounts),
+    }
 
 
 @router.post("/arm")
 async def arm(_session: str = Depends(require_session), _csrf: None = Depends(require_csrf)):
-    return await algo.arm()
+    from .trading_accounts import algo_action, AlgoAction
+    return await algo_action(AlgoAction(action="arm"))
 
 
 @router.post("/disarm")
 async def disarm(_session: str = Depends(require_session), _csrf: None = Depends(require_csrf)):
-    return algo.disarm("operator")
+    from .trading_accounts import algo_action, AlgoAction
+    return await algo_action(AlgoAction(action="disarm"))
 
 
 @router.post("/exit")
 async def exit_now(_session: str = Depends(require_session), _csrf: None = Depends(require_csrf)):
     """Panic square-off of the algo's open position."""
-    return await algo.panic_exit("PANIC button")
+    result = await algo.panic_exit("PANIC button")
+    position = result.get("position")
+    if position and position.get("executionError"):
+        raise HTTPException(409, position["executionError"])
+    return result
 
 
 @router.post("/reconcile")
@@ -75,7 +87,13 @@ async def config(
     _session: str = Depends(require_session),
     _csrf: None = Depends(require_csrf),
 ):
-    return algo.set_config(patch.model_dump(exclude_none=True))
+    if current_account() != "master":
+        raise HTTPException(409, "Shared algo configuration is edited from Master Dhan; both accounts use it on ARM.")
+    async with engines.selection_lock:
+        if any(engine.enabled or engine._position is not None or engine._execution_lock.locked()
+               for engine in engines.items.values()):
+            raise HTTPException(409, "Disarm both accounts and finish all tracked execution before changing shared configuration.")
+        return algo.set_config(patch.model_dump(exclude_none=True))
 
 
 @router.get("/journal")

@@ -27,6 +27,8 @@ async def login(response: Response):
     try:
         profile = await get_dhan_client().get_profile()
     except DhanAPIError as exc:
+        logger.warning("Dashboard broker-token validation failed",
+                       extra={"telegram_event": "login_failed"})
         return {
             "ok": False,
             "error": exc.to_dict(),

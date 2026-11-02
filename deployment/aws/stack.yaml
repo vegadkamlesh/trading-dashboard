@@ -1,0 +1,1106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Private single-instance trading dashboard, initially mock-only and unscheduled.
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+  AppArtifactKey:
+    Type: String
+  LambdaArtifactKey:
+    Type: String
+  BootstrapArtifactKey:
+    Type: String
+  TelegramParameter:
+    Type: String
+    AllowedPattern: "^/[A-Za-z0-9_./-]+$"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  InstanceType:
+    Type: String
+    AllowedValues: [t4g.micro, t3.micro]
+    Default: t4g.micro
+    Description: Select an image with the matching processor architecture.
+  AutomationEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Enable only after mock deployment, alert, backup and access verification.
+  CostReportsEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Enable after the daily cost report has been tested.
+  DataAttachmentEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Disable only while replacing a stopped, backed-up mock instance.
+  RecoveryStopAt:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^at\([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\)$'
+    Description: Optional one-time India-time safety stop for a mock recovery.
+  StaticIpEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Keep a billable Elastic IP for broker IP whitelisting; mock mode can disable it.
+  SecondaryStaticIpEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Add a second billable Elastic IP on a second network interface; requires StaticIpEnabled.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 20
+    MinValue: 1
+
+Conditions:
+  AutomationOn: !Equals [!Ref AutomationEnabled, "true"]
+  CostReportsOn: !Equals [!Ref CostReportsEnabled, "true"]
+  DataAttachmentOn: !Equals [!Ref DataAttachmentEnabled, "true"]
+  RecoverySafetyStopOn: !Not [!Equals [!Ref RecoveryStopAt, ""]]
+  StaticIpOn: !Equals [!Ref StaticIpEnabled, "true"]
+  # Multi-interface instances get no automatic public IP, so the second address needs the first.
+  SecondaryStaticIpOn: !And
+    - !Condition StaticIpOn
+    - !Equals [!Ref SecondaryStaticIpEnabled, "true"]
+
+Resources:
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/trading-dashboard/${AWS::StackName}/app"
+      RetentionInDays: 30
+
+  SystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/trading-dashboard/${AWS::StackName}/system"
+      RetentionInDays: 30
+
+  AlertLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-alerts"
+      RetentionInDays: 30
+
+  MonitorLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-monitor"
+      RetentionInDays: 30
+
+  CostReportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-cost-report"
+      RetentionInDays: 30
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Size: 4
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-data"
+        - Key: Application
+          Value: trading-dashboard
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound access; HTTPS and HTTP outbound for broker and updates.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: dashboard-bootstrap-and-telemetry
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/dhan"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/dhan"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${AppArtifactKey}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${BootstrapArtifactKey}"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt AppLogGroup.Arn
+                  - !GetAtt SystemLogGroup.Arn
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: TradingDashboard
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      InstanceInitiatedShutdownBehavior: stop
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref SecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 12
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-mock"
+        - Key: Application
+          Value: trading-dashboard
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+          export AWS_REGION='${AWS::Region}'
+          export ARTIFACT_BUCKET='${ArtifactBucket}'
+          export APP_ARTIFACT_KEY='${AppArtifactKey}'
+          export DATA_VOLUME_ID='${DataVolume}'
+          export TELEGRAM_PARAMETER='${TelegramParameter}'
+          export APP_LOG_GROUP='${AppLogGroup}'
+          export SYSTEM_LOG_GROUP='${SystemLogGroup}'
+          aws s3 cp 's3://${ArtifactBucket}/${BootstrapArtifactKey}' /var/tmp/trading-bootstrap.sh --region '${AWS::Region}' --only-show-errors
+          chmod 0700 /var/tmp/trading-bootstrap.sh
+          /var/tmp/trading-bootstrap.sh
+
+  DataAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Condition: DataAttachmentOn
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref DashboardInstance
+      VolumeId: !Ref DataVolume
+
+  StaticAddress:
+    Type: AWS::EC2::EIP
+    Condition: StaticIpOn
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-static-outbound"
+
+  StaticAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: StaticIpOn
+    Properties:
+      AllocationId: !GetAtt StaticAddress.AllocationId
+      InstanceId: !Ref DashboardInstance
+
+  SecondaryNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Condition: SecondaryStaticIpOn
+    Properties:
+      Description: Secondary broker-whitelisted outbound address
+      SubnetId: !Ref SubnetId
+      GroupSet: [!Ref SecurityGroup]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-secondary"
+
+  # An instance-ID association fails once two interfaces exist, so associate the primary first.
+  SecondaryNetworkInterfaceAttachment:
+    Type: AWS::EC2::NetworkInterfaceAttachment
+    Condition: SecondaryStaticIpOn
+    DependsOn: StaticAddressAssociation
+    Properties:
+      DeviceIndex: "1"
+      InstanceId: !Ref DashboardInstance
+      NetworkInterfaceId: !Ref SecondaryNetworkInterface
+      DeleteOnTermination: false
+
+  SecondaryStaticAddress:
+    Type: AWS::EC2::EIP
+    Condition: SecondaryStaticIpOn
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-secondary-outbound"
+
+  SecondaryStaticAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: SecondaryStaticIpOn
+    Properties:
+      AllocationId: !GetAtt SecondaryStaticAddress.AllocationId
+      NetworkInterfaceId: !Ref SecondaryNetworkInterface
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Trading dashboard operations
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:AddPermission
+              - sns:RemovePermission
+              - sns:DeleteTopic
+              - sns:Subscribe
+              - sns:ListSubscriptionsByTopic
+              - sns:Publish
+            Resource: !Ref AlertTopic
+          - Sid: BudgetNotifications
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:budgets::${AWS::AccountId}:*"
+          - Sid: CloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*"
+  AlertDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AlertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: telegram-alert-delivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AlertLambdaLogGroup.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt AlertDeadLetterQueue.Arn
+
+  AlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-alerts"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: alerts.handler
+      Role: !GetAtt AlertRole.Arn
+      Timeout: 20
+      MemorySize: 128
+      DeadLetterConfig:
+        TargetArn: !GetAtt AlertDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          TELEGRAM_PARAMETER: !Ref TelegramParameter
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt AlertFunction.Arn
+
+  AlertInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AlertFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  SchedulerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: operate-only-dashboard-instance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ec2:StartInstances, ec2:StopInstances]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DashboardInstance}"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  WeekdayStart:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-weekday-start"
+      Description: Request server start Monday to Friday at 09:00 India time.
+      State: !If [AutomationOn, ENABLED, DISABLED]
+      ScheduleExpression: "cron(0 9 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:${AWS::Partition}:scheduler:::aws-sdk:ec2:startInstances"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds":["${DashboardInstance}"]}'
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 900
+          MaximumRetryAttempts: 10
+
+  WeekdayStop:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-weekday-stop"
+      Description: Request hard server stop at 16:00 even when positions are unresolved.
+      State: !If [AutomationOn, ENABLED, DISABLED]
+      ScheduleExpression: "cron(0 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:${AWS::Partition}:scheduler:::aws-sdk:ec2:stopInstances"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds":["${DashboardInstance}"]}'
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 120
+          MaximumRetryAttempts: 2
+
+  RecoverySafetyStop:
+    Type: AWS::Scheduler::Schedule
+    Condition: RecoverySafetyStopOn
+    Properties:
+      Name: !Sub "${AWS::StackName}-recovery-safety-stop"
+      Description: One-time hard stop for the replacement mock instance.
+      State: ENABLED
+      ScheduleExpression: !Ref RecoveryStopAt
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:${AWS::Partition}:scheduler:::aws-sdk:ec2:stopInstances"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds":["${DashboardInstance}"]}'
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 120
+          MaximumRetryAttempts: 2
+
+  CostReportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: daily-cost-and-telegram
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ce:GetCostAndUsage
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:GetMetricStatistics
+                Resource: "*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt CostReportLogGroup.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  CostReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cost-report"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: cost_report.handler
+      Role: !GetAtt CostReportRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      DeadLetterConfig:
+        TargetArn: !GetAtt SchedulerDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref DashboardInstance
+          TELEGRAM_PARAMETER: !Ref TelegramParameter
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  CostReportAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref CostReportFunction
+      Qualifier: "$LATEST"
+      MaximumEventAgeInSeconds: 120
+      MaximumRetryAttempts: 0
+
+  CostReportSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-daily-cost-report
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CostReportFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  WeekdayCostReport:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-weekday-cost-report"
+      Description: Request an account cost and instance activity report before the 16:00 stop.
+      State: !If [CostReportsOn, ENABLED, DISABLED]
+      ScheduleExpression: "cron(55 15 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt CostReportFunction.Arn
+        RoleArn: !GetAtt CostReportSchedulerRole.Arn
+        Input: "{}"
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 120
+          MaximumRetryAttempts: 2
+
+  MonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: monitor-dashboard-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DashboardInstance}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+              - Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: TradingDashboard
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt MonitorLambdaLogGroup.Arn
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-monitor"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: monitor.handler
+      Role: !GetAtt MonitorRole.Arn
+      Timeout: 35
+      MemorySize: 128
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref DashboardInstance
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  MonitorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-monitor"
+      ScheduleExpression: "rate(5 minutes)"
+      State: !If [AutomationOn, ENABLED, DISABLED]
+      Targets:
+        - Id: monitor
+          Arn: !GetAtt MonitorFunction.Arn
+
+  MonitorInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MonitorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonitorSchedule.Arn
+
+  AvailabilityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-availability"
+      AlarmDescription: Expected scheduled server state and loopback dashboard health.
+      Namespace: TradingDashboard
+      MetricName: ScheduledAvailability
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DashboardInstance
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      ComparisonOperator: LessThanThreshold
+      Threshold: 0.5
+      TreatMissingData: breaching
+      ActionsEnabled: !If [AutomationOn, true, false]
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-memory"
+      Namespace: TradingDashboard
+      MetricName: mem_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DashboardInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 85
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-instance-status"
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DashboardInstance
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  DataDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-disk-data"
+      Namespace: TradingDashboard
+      MetricName: disk_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DashboardInstance
+        - Name: path
+          Value: /var/lib/trading
+        - Name: fstype
+          Value: xfs
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 85
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  RootDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-disk-root"
+      Namespace: TradingDashboard
+      MetricName: disk_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DashboardInstance
+        - Name: path
+          Value: /
+        - Name: fstype
+          Value: xfs
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 85
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  CpuCreditAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cpu-credit"
+      Namespace: AWS/EC2
+      MetricName: CPUCreditBalance
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DashboardInstance
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      ComparisonOperator: LessThanThreshold
+      Threshold: 5
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  SchedulerFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-scheduler"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SchedulerDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  AlertDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alert-delivery"
+      AlarmDescription: Telegram delivery failed; inspect the alert dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AlertDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  CostReportFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cost-report"
+      AlarmDescription: The daily AWS usage report invocation failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostReportFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: !Sub "${AWS::StackName}-vault"
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores"
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub "${AWS::StackName}-daily-data"
+        BackupPlanRule:
+          - RuleName: WeekdayAfterStop
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: "cron(20 16 ? * MON-FRI *)"
+            ScheduleExpressionTimezone: Asia/Kolkata
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 240
+            Lifecycle:
+              DeleteAfterDays: 14
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: DashboardDataVolume
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/${DataVolume}"
+
+  BackupEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publish-backup-alerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  BackupFailureEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-backup-failures"
+      EventPattern:
+        source: [aws.backup]
+        detail-type: ["Backup Job State Change"]
+        detail:
+          state: [FAILED, ABORTED, EXPIRED]
+          resourceArn:
+            - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/${DataVolume}"
+      Targets:
+        - Id: alert
+          Arn: !Ref AlertTopic
+          RoleArn: !GetAtt BackupEventRole.Arn
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: AlertTopicPolicy
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-account-cost"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+
+  OperatorUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-operator"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/SignInLocalDevelopmentAccess"
+
+  OperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt OperatorUser.Arn
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                aws:MultiFactorAuthPresent: "true"
+      Policies:
+        - PolicyName: private-access-and-monitoring
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeAddresses
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeSessions
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DescribeAlarmHistory
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - logs:DescribeLogGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: [ec2:StartInstances, ec2:StopInstances]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DashboardInstance}"
+              - Effect: Allow
+                Action: ssm:StartSession
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DashboardInstance}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession"
+              - Effect: Allow
+                Action: [ssmmessages:OpenDataChannel, ssm:TerminateSession, ssm:ResumeSession]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:session/*"
+              - Effect: Allow
+                Action: [logs:DescribeLogStreams, logs:GetLogEvents, logs:FilterLogEvents]
+                Resource:
+                  - !GetAtt AppLogGroup.Arn
+                  - !GetAtt SystemLogGroup.Arn
+                  - !GetAtt AlertLambdaLogGroup.Arn
+                  - !GetAtt MonitorLambdaLogGroup.Arn
+                  - !GetAtt CostReportLogGroup.Arn
+
+  OperatorUserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: operator-login-and-role
+      Users: [!Ref OperatorUser]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt OperatorRole.Arn
+          - Effect: Allow
+            Action: [iam:ChangePassword, iam:GetUser, iam:ListMFADevices]
+            Resource: !GetAtt OperatorUser.Arn
+          - Effect: Allow
+            Action: iam:GetAccountPasswordPolicy
+            Resource: "*"
+
+Outputs:
+  InstanceId:
+    Value: !Ref DashboardInstance
+  StaticOutboundIp:
+    Condition: StaticIpOn
+    Value: !Ref StaticAddress
+  SecondaryStaticOutboundIp:
+    Condition: SecondaryStaticIpOn
+    Value: !Ref SecondaryStaticAddress
+  DataVolumeId:
+    Value: !Ref DataVolume
+  BackupVaultName:
+    Value: !Ref BackupVault
+  BackupRoleArn:
+    Value: !GetAtt BackupRole.Arn
+  OperatorRoleArn:
+    Value: !GetAtt OperatorRole.Arn
+  OperatorUserName:
+    Value: !Ref OperatorUser
+  AppLogGroup:
+    Value: !Ref AppLogGroup
+  SystemLogGroup:
+    Value: !Ref SystemLogGroup
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  AlertDeadLetterQueueUrl:
+    Value: !Ref AlertDeadLetterQueue
+  SchedulerDeadLetterQueueUrl:
+    Value: !Ref SchedulerDeadLetterQueue

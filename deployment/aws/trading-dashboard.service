@@ -1,0 +1,30 @@
+[Unit]
+Description=Private trading dashboard backend
+Wants=network-online.target
+After=network-online.target amazon-cloudwatch-agent.service
+RequiresMountsFor=/var/lib/trading
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+WorkingDirectory=/opt/trading/backend
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/trading
+ExecStart=/opt/trading/venv/bin/python run.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trading
+
+[Install]
+WantedBy=multi-user.target

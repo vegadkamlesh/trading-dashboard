@@ -22,7 +22,8 @@ This app **places real orders with real money**. Treat it accordingly.
    to Dhan. Start here. Turn it off only when you intend to trade live.
 
 5. **Order confirm PIN.** Server-side gate on every order/super-order/cancel.
-   Stored hashed in `.env`. Required in the confirm popup.
+   Stored in plaintext in the protected backend `.env`; restrict file access
+   and never share it. Required in the confirm popup unless fast orders are on.
 
 6. **Session auth.** All state-changing API calls require a valid session cookie
    (`HttpOnly`, `SameSite=Strict`, `Secure` when served over HTTPS).
@@ -46,9 +47,31 @@ This app **places real orders with real money**. Treat it accordingly.
 - If you must expose it on LAN, enable the order PIN and set `APP_ALLOWED_ORIGINS`
   to an explicit origin (never `*`).
 - Serve over HTTPS if you ever expose it beyond localhost (cookie `Secure`).
+- The current login validates the backend's Dhan token, not the identity of a
+  website visitor. Do not expose it publicly without a separate identity gate.
+  For a single-user AWS installation, prefer private access (such as SSM port
+  forwarding) and no public inbound app ports.
+
+## Optional Telegram notifications
+
+- Keep `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the ignored backend `.env`
+  or an access-controlled cloud secret, never in frontend configuration or chat.
+- Use a private destination. Give a channel bot only the required posting rights.
+- Application alerts contain fixed operational labels, timestamps and safe
+  account/mode aliases; never raw logs, credentials, order payloads or trading
+  financial details. The optional AWS daily usage report intentionally sends
+  estimated account-wide AWS costs to the configured private Telegram channel.
+  Enable it only when that disclosure is intended.
+- Telegram delivery is best-effort and is not a durable trading audit or a risk
+  control. The backend must work independently of Telegram availability.
+- Monitor host/process failures externally: a stopped server cannot notify you.
+- No Telegram commands can place orders or enable LIVE/ARM.
 
 ## What this app deliberately does NOT do
 
 - It does not store your Dhan password or TOTP secret.
-- It does not auto-trade / no background order placement without your click.
-- It does not use WebSocket live feed (paid). Polling only, to stay free.
+- It does not enable new algo entries on startup. Explicit operator ARM is
+  required; an armed algo can place background orders, and restored positions
+  continue to be managed even while new entries are disarmed.
+- It does not support multiple active backend replicas. Account execution locks
+  and broker rate budgets are in-process; run one active trading backend.

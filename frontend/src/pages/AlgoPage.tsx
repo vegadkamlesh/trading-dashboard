@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { usePolling } from "../hooks/usePolling";
+import { accountResultText, useTradingAccounts } from "../hooks/useTradingAccounts";
 import type {
   AlgoConfig,
   AlgoEvent,
@@ -61,12 +62,13 @@ function Stat({ label, value, tone = "" }: { label: string; value: React.ReactNo
 type SubTab = "live" | "study" | "journal" | "eod" | "tuning";
 
 export function AlgoPage() {
+  const { data: accounts, error: accountsError, refresh: refreshAccounts } = useTradingAccounts();
   const [sub, setSub] = useState<SubTab>("live");
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
   // 1s status poll: the whole "live" screen is fed from this one cheap call.
-  const { data: st, refresh } = usePolling<AlgoStatus>(() => api.get("/api/algo/status"), 1000);
+  const { data: st, error: statusError, refresh } = usePolling<AlgoStatus>(() => api.get("/api/algo/status"), 1000);
   const { data: study, refresh: refreshStudy } = usePolling<AlgoStudy>(
     () => api.get("/api/algo/study"), sub === "study" ? 3000 : 30000
   );
@@ -80,8 +82,19 @@ export function AlgoPage() {
   const call = async (path: string, body?: unknown, label?: string) => {
     setBusy(true);
     try {
-      await api.post(path, body);
-      await refresh();
+      const result = await api.post<AlgoStatus & { ok?: boolean; results?: Array<{accountId: string; ok: boolean; error?: unknown}>; armed?: boolean; armError?: { reason?: string } }>(path, body);
+      refresh();
+      refreshAccounts();
+      if (result.ok === false) {
+        const errors = result.results?.filter(r => !r.ok)
+          .map(r => `${r.accountId}: ${accountResultText(r.error)}`).join("; ");
+        throw new Error((errors || "Action incomplete; check each account")
+          + (result.armed ? " — other ready recipients remain ARMED" : ""));
+      }
+      if (result.armed === false) throw new Error(result.armError?.reason || "Algo arm refused");
+      if (path === "/api/algo/exit" && result.position?.executionError) {
+        throw new Error(result.position.executionError);
+      }
       if (label) setToast({ kind: "ok", text: label });
     } catch (e) {
       setToast({ kind: "err", text: e instanceof Error ? e.message : "Failed" });
@@ -93,13 +106,29 @@ export function AlgoPage() {
   if (!st) {
     return (
       <div className="flex h-64 items-center justify-center text-slate-400">
-        Loading algo status…
+        {statusError ? `Status unavailable: ${statusError}` : "Loading algo status…"}
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-3">
+      {statusError && <div role="alert" className="rounded-lg border border-rose-700 bg-rose-950/50 p-3 text-sm text-rose-200">
+        Backend status refresh failed: {statusError}. Values below are the last received snapshot, not live.
+      </div>}
+      {st.brokerSyncError && <div role="alert" className="rounded-lg border border-amber-700 p-3 text-sm text-amber-200">
+        Broker sync failed: {st.brokerSyncError}. Check holdings and orders in Dhan.
+      </div>}
+      {st.position && !st.position.dryRun && st.brokerNetQty === 0 && <div role="alert"
+        className="rounded-lg border border-amber-700 p-3 text-sm text-amber-200">
+        Dhan holding is FLAT (0 units). Saved algo tracking below is awaiting order/protection verification,
+        not an open broker holding. No duplicate exit should be sent.
+      </div>}
+      <div className="text-xs text-slate-500">
+        {st.position ? "Tracked position: " + st.position.executionState : "No tracked algo position"}
+        {" · "}Feed connection is separate from an open trade.
+        {st.brokerSyncAt && ` · Last broker sync: ${new Date(st.brokerSyncAt).toLocaleTimeString("en-IN")}`}
+      </div>
       {toast && (
         <div className={`rounded-lg border px-3 py-2 text-sm ${toast.kind === "ok"
           ? "border-emerald-700 bg-emerald-950/50 text-emerald-200"
@@ -108,14 +137,29 @@ export function AlgoPage() {
         </div>
       )}
 
-      <ControlBar st={st} busy={busy} onCall={call} />
+      <ControlBar st={st} busy={busy} onCall={call}
+        armBlocked={!accounts || !!accountsError || accounts.selected.length === 0} />
+      <p className="text-xs text-sky-300">
+        Shared entry recipients: {accounts?.selected.join(", ") || "NONE"}.
+        {" "}Algo ready: {st.sharedEntryAccounts?.join(", ") || "NONE"}.
+        {" "}ON arms selected checkboxes from either view; OFF disarms all accounts.
+      </p>
+      <div className="flex items-center gap-3 text-xs text-slate-400">
+        Shared algo ARM uses selected trading recipients; configure it from Master Dhan.
+        Each account sizes from its own funds. Position EXIT below affects the viewed account only.
+        <button className="btn-sell" disabled={busy} onClick={() => {
+          if (confirm("Exit tracked ALGO positions in BOTH accounts (including disabled recipients)?"))
+            void call("/api/trading/algo", { action: "exit" }, "EXIT BOTH requested; verify each account");
+        }}>ALGO EXIT BOTH</button>
+      </div>
       <NowAndNext st={st} />
 
       <div className="grid gap-3 lg:grid-cols-2">
         {st.legs.map((leg) => <IndexCard key={leg.index} leg={leg} cfg={st.config} status={st} />)}
       </div>
 
-      {st.position && <PositionCard pos={st.position} cfg={st.config} busy={busy} onCall={call} />}
+      {st.position && <PositionCard pos={st.position} cfg={st.config} busy={busy} onCall={call}
+        brokerNetQty={st.brokerNetQty} brokerPnl={st.brokerPositionPnl} />}
 
       <div className="flex flex-wrap gap-1 border-b border-slate-800 pb-1">
         {([["live", "Live feed"], ["study", "5-year study"], ["journal", "Journal (7 din)"],
@@ -139,17 +183,17 @@ export function AlgoPage() {
 // --------------------------------------------------------------------------- //
 //  control bar
 // --------------------------------------------------------------------------- //
-function ControlBar({ st, busy, onCall }: { st: AlgoStatus; busy: boolean; onCall: (p: string, b?: unknown, l?: string) => void }) {
-  const on = st.enabled;
+function ControlBar({ st, busy, armBlocked, onCall }: { st: AlgoStatus; busy: boolean; armBlocked: boolean; onCall: (p: string, b?: unknown, l?: string) => void }) {
+  const on = st.sharedEnabled ?? st.enabled;
   return (
     <div className="card flex flex-wrap items-center gap-4">
       <button
         onClick={() => onCall(on ? "/api/algo/disarm" : "/api/algo/arm", {}, on ? "Algo DISARMED" : "Algo ARMED")}
-        disabled={busy}
+        disabled={busy || (!on && armBlocked)}
         className={`flex items-center gap-3 rounded-xl border px-4 py-2.5 transition-colors ${on
           ? "border-emerald-500 bg-emerald-600/20 hover:bg-emerald-600/30"
           : "border-slate-700 bg-slate-900 hover:bg-slate-800"}`}
-        title="Algo ON / OFF — the only thing you need to touch"
+        title="Shared algo: ON arms checked recipients, OFF disarms all; Viewing does not change recipients"
       >
         <span className={`relative h-6 w-11 rounded-full transition-colors ${on ? "bg-emerald-500" : "bg-slate-600"}`}>
           <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? "left-[22px]" : "left-0.5"}`} />
@@ -158,7 +202,7 @@ function ControlBar({ st, busy, onCall }: { st: AlgoStatus; busy: boolean; onCal
           <div className={`text-sm font-bold ${on ? "text-emerald-300" : "text-slate-300"}`}>
             {on ? "ALGO ON" : "ALGO OFF"}
           </div>
-          <div className="text-[11px] text-slate-500">{on ? "click to stop" : "click to start"}</div>
+          <div className="text-[11px] text-slate-500">{on ? "stop all accounts" : "start checked accounts"}</div>
         </span>
       </button>
 
@@ -305,9 +349,12 @@ function IndexCard({ leg, cfg, status }: { leg: AlgoLeg; cfg: AlgoConfig; status
           <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono">
             <span>↑ CALL target {n(target.up, 1)}</span>
             <span>↓ PUT target {n(target.down, 1)}</span>
-            <span className="text-rose-300">↑ CALL stop {n(leg.spot! - cfg.sl_mult * rng, 1)}</span>
-            <span className="text-rose-300">↓ PUT stop {n(leg.spot! + cfg.sl_mult * rng, 1)}</span>
+            {!cfg.target_only && <>
+              <span className="text-rose-300">↑ CALL stop {n(leg.spot! - cfg.sl_mult * rng, 1)}</span>
+              <span className="text-rose-300">↓ PUT stop {n(leg.spot! + cfg.sl_mult * rng, 1)}</span>
+            </>}
           </div>
+          {cfg.target_only && <p className="mt-1 text-amber-300">Target-only · spot SL OFF · broker premium SL 90% away</p>}
         </div>
       )}
 
@@ -320,8 +367,13 @@ function IndexCard({ leg, cfg, status }: { leg: AlgoLeg; cfg: AlgoConfig; status
 // --------------------------------------------------------------------------- //
 //  position
 // --------------------------------------------------------------------------- //
-function PositionCard({ pos, cfg, busy, onCall }: { pos: AlgoPosition; cfg: AlgoConfig; busy: boolean; onCall: (p: string, b?: unknown, l?: string) => void }) {
+function PositionCard({ pos, cfg, busy, onCall, brokerNetQty, brokerPnl }: {
+  pos: AlgoPosition; cfg: AlgoConfig; busy: boolean; brokerNetQty: number | null;
+  brokerPnl: number | null; onCall: (p: string, b?: unknown, l?: string) => void;
+}) {
   const win = pos.premiumPnl >= 0;
+  const pnl = !pos.dryRun && typeof brokerPnl === "number" ? brokerPnl
+    : !pos.dryRun && brokerNetQty === 0 ? null : pos.premiumPnl;
   return (
     <div className={`card border-2 ${win ? "border-emerald-700/50" : "border-rose-700/50"}`}>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -331,37 +383,47 @@ function PositionCard({ pos, cfg, busy, onCall }: { pos: AlgoPosition; cfg: Algo
           </span>
           <Chip tone={pos.optionType === "CALL" ? "green" : "red"}>{pos.optionType}</Chip>
           <Chip>{pos.lots} lot · {pos.quantity} qty</Chip>
+          <Chip tone={pos.executionState === "open" ? "green" : "amber"}>{pos.executionState.replace(/_/g, " ")}</Chip>
           {pos.dryRun && <Chip tone="amber">paper</Chip>}
-          {pos.breakevenDone && <Chip tone="sky">stop @ break-even</Chip>}
+          {pos.softwareStopEnabled && pos.breakevenDone && <Chip tone="sky">stop @ break-even</Chip>}
         </div>
         <div className="flex items-center gap-4">
           <div className="text-right">
-            <div className="text-[10px] uppercase tracking-wider text-slate-500">Premium P&L</div>
-            <div className={`font-mono text-2xl font-bold tabular-nums ${pnlTone(pos.premiumPnl)}`}>
-              {rs(pos.premiumPnl)}
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">
+              {!pos.dryRun && typeof brokerPnl === "number" ? "Broker contract P&L"
+                : !pos.dryRun && brokerNetQty === 0 ? "Broker holding FLAT" : "Quote-based P&L (estimate)"}
+            </div>
+            <div className={`font-mono text-2xl font-bold tabular-nums ${pnlTone(pnl ?? 0)}`}>
+              {pnl === null ? "—" : rs(pnl)}
             </div>
           </div>
-          <button className="btn-sell" disabled={busy} onClick={() => onCall("/api/algo/exit", {}, "Exit order bheja gaya")}>
+          <button className="btn-sell" disabled={busy || pos.executionState === "entry_pending" || pos.executionState === "exit_pending"} onClick={() => onCall("/api/algo/exit", {}, "Exit requested; broker confirmation pending")}>
             EXIT
           </button>
         </div>
+        {pos.executionError && <p role="alert" className="mb-3 text-xs text-amber-300">{pos.executionError}</p>}
+        {(pos.spotAgeSeconds === null || pos.spotAgeSeconds > 5) && <p role="alert" className="mb-3 text-xs text-rose-300">
+          Spot quote stale/unavailable. Software stop/target needs a fresh tick; check Dhan protective SL.
+        </p>}
       </div>
 
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
         <Stat label="Entry spot" value={n(pos.entrySpot, 1)} />
         <Stat label="Spot now" value={n(pos.spot, 1)} tone={pnlTone(pos.points)} />
         <Stat label="Target spot" value={n(pos.targetSpot, 1)} tone="text-emerald-300" />
-        <Stat label="Stop spot" value={n(pos.stopSpot, 1)} tone="text-rose-300" />
+        <Stat label="Spot SL" value={pos.softwareStopEnabled ? n(pos.stopSpot, 1) : "OFF · target-only"} tone="text-amber-300" />
         <Stat label="Premium" value={`₹${n(pos.entryPremium, 1)} → ₹${n(pos.premium, 1)}`} />
-        <Stat label="R multiple" value={`${pos.rMultiple >= 0 ? "+" : ""}${n(pos.rMultiple, 2)}R`} tone={pnlTone(pos.rMultiple)} />
+        {pos.softwareStopEnabled
+          ? <Stat label="R multiple" value={`${pos.rMultiple >= 0 ? "+" : ""}${n(pos.rMultiple, 2)}R`} tone={pnlTone(pos.rMultiple)} />
+          : <Stat label="Far broker SL premium" value={pos.protectiveTrigger === null ? "OFF" : `₹${n(pos.protectiveTrigger)}`} tone="text-amber-300" />}
       </div>
 
       <div className="mt-2 flex flex-wrap gap-4 text-[11px] text-slate-500">
         <span>entry {pos.entryTime}</span>
         <span>MFE {n(pos.mfe, 1)} pts</span>
         <span>MAE {n(pos.mae, 1)} pts</span>
-        <span>target = {cfg.target_mult}× OR · stop = {cfg.sl_mult}× OR</span>
-        {pos.protectiveOrderId && <span className="text-emerald-500">disaster stop parked at Dhan ✓</span>}
+        <span>target = {cfg.target_mult}× OR · {cfg.target_only ? "spot/break-even SL OFF; premium SL 90% away" : `stop = ${cfg.sl_mult}× OR`}</span>
+        {pos.protectiveOrderId && <span>protective SL order: {pos.protectiveOrderId} (pending SELL is not a filled exit)</span>}
       </div>
     </div>
   );
@@ -783,9 +845,9 @@ function EodPanel() {
 //  tuning
 // --------------------------------------------------------------------------- //
 const NUM_FIELDS: Array<[keyof AlgoConfig, string, string]> = [
-  ["sl_mult", "Stop (× OR range)", "0.2 = opening range ka 20% (5-saal study ka best, executable)"],
+  ["sl_mult", "Classic-mode stop / study (× OR)", "Ignored for live exits in target-only mode"],
   ["target_mult", "Target (× OR range)", "2.0 = range ka 2 guna (har stop level pe sabse achha nikla)"],
-  ["breakeven_at", "Break-even trigger (× OR, 0=off)", "0 = off. On karne se distribution badal jaata hai (untested)"],
+  ["breakeven_at", "Classic-mode break-even (× OR)", "Ignored in target-only mode"],
   ["risk_pct", "Risk % of balance / trade", "Lot size isi se decide hota hai (compounding)"],
   ["max_capital_pct", "Max % balance as premium", "Ek trade me kitna paisa lagega uski limit"],
   ["max_lots", "Max lots", "Hard cap"],
@@ -793,7 +855,7 @@ const NUM_FIELDS: Array<[keyof AlgoConfig, string, string]> = [
   ["strike_offset", "Strike offset (0=ATM)", "0 = ATM, 1 = ek strike OTM"],
   ["min_or_pct", "Min OR % of price (0=off)", "Chhoti range wale din skip"],
   ["max_or_pct", "Max OR % of price (0=off)", "Bahut bade gap wale din skip"],
-  ["protective_sl_mult", "Disaster stop (× normal stop)", "Dhan pe park kiya jaane wala wide SL"],
+  ["protective_sl_mult", "Classic-mode protective multiplier", "Ignored in target-only mode; premium SL fixed 90% away"],
 ];
 
 type Draft = Record<string, string | number | boolean | string[]>;
@@ -829,6 +891,11 @@ function TuningPanel({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; on
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={Boolean(draft.target_only)}
+            onChange={(e) => setDraft({ ...draft, target_only: e.target.checked })} />
+          <span className="text-xs text-amber-300">Target-only (default): spot/break-even SL OFF, far broker SL 90% away. Large loss possible.</span>
+        </label>
         {NUM_FIELDS.map(([key, label, hint]) => (
           <label key={String(key)} className="flex flex-col gap-1">
             <span className="text-[11px] font-semibold text-slate-300">{label}</span>

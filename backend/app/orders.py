@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from .instruments import get_index
+from .instruments import get_index, lot_size_for
 
 # Conservative bounds. Tighten as you like.
 MIN_TARGET_PCT = 0.1
@@ -48,8 +48,7 @@ class OrderRequest:
     order_type: str = "LIMIT"
     correlation_id: Optional[str] = None
     # When True, the mandatory Super-Order SL leg is pushed WAY out (near-zero)
-    # so it acts as a "no stop loss" for practical purposes. Default True so
-    # scalpers aren't stopped out prematurely.
+    # Default True means a far stop, not guaranteed protection or no stop.
     no_stop_loss: bool = True
     # Optional user-specified stop distance (%). Ignored when no_stop_loss=True.
     stop_loss_pct: Optional[float] = None
@@ -63,8 +62,7 @@ def units_for(req: OrderRequest) -> int:
     """Exchange units = lots × lot size (or the raw quantity if lots=False)."""
     if not req.lots:
         return int(req.quantity)
-    inst = get_index(req.index_key)
-    lot_size = inst.lot_size if inst else 1
+    lot_size = lot_size_for(req.index_key)
     return int(req.quantity) * int(lot_size)
 
 
@@ -102,7 +100,7 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="transaction_type must be BUY or SELL")
     if req.quantity <= 0:
         raise HTTPException(status_code=400, detail="quantity must be > 0")
-    if req.price <= 0:
+    if not math.isfinite(req.price) or req.price <= 0:
         raise HTTPException(status_code=400, detail="price must be > 0")
     if not (MIN_TARGET_PCT <= req.target_pct <= MAX_TARGET_PCT):
         raise HTTPException(
@@ -113,13 +111,23 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="invalid product_type")
     if req.order_type not in ("LIMIT", "MARKET"):
         raise HTTPException(status_code=400, detail="invalid order_type")
+    if not str(req.security_id).isdigit() or int(req.security_id) <= 0:
+        raise HTTPException(status_code=400, detail="A valid option security ID is required")
+    units = units_for(req)
+    if units <= 0 or units % lot_size_for(req.index_key):
+        raise HTTPException(status_code=400, detail="Quantity must be a whole exchange lot")
+    entry = _round_tick(req.price)
+    if entry <= 0 or abs(entry - req.price) > .000001:
+        raise HTTPException(status_code=400, detail="Reference/limit price must be on a 0.05 tick")
+    if req.stop_loss_pct is not None and not math.isfinite(req.stop_loss_pct):
+        raise HTTPException(status_code=400, detail="Stop loss percentage must be finite")
 
     # Decide the stop distance:
     #  * no_stop_loss=True  -> push SL far out (effectively "no SL")
     #  * stop_loss_pct set  -> user's chosen distance (bounded)
     #  * otherwise          -> the exchange-minimum safety distance
     if req.no_stop_loss:
-        sl_pct = 90.0  # 90% away — practically never triggers, satisfies exchange
+        sl_pct = MAX_SAFETY_SL_PCT
     elif req.stop_loss_pct is not None:
         sl_pct = max(1.0, min(float(req.stop_loss_pct), 95.0))
     else:
@@ -136,6 +144,9 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
     # The exchange requires a positive SL price; clamp to the smallest tick.
     if stop_loss_price <= 0:
         stop_loss_price = 0.05
+    if not (0 < stop_loss_price < entry < target_price if req.transaction_type == "BUY"
+            else 0 < target_price < entry < stop_loss_price):
+        raise HTTPException(400, "Rounded target and SL must be positive and on opposite sides of entry; increase the target/distance.")
 
     return {
         "transactionType": req.transaction_type,
@@ -143,8 +154,8 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
         "productType": req.product_type,
         "orderType": req.order_type,
         "securityId": str(req.security_id),
-        "quantity": units_for(req),
-        "price": float(req.price),
+        "quantity": units,
+        "price": entry,
         "targetPrice": float(target_price),
         "stopLossPrice": float(stop_loss_price),
         "trailingJump": 0,
@@ -154,8 +165,7 @@ def build_super_order(req: OrderRequest) -> Dict[str, Any]:
 def preview(req: OrderRequest) -> Dict[str, Any]:
     """What the confirm popup should display. No network call."""
     payload = build_super_order(req)
-    inst = get_index(req.index_key)
-    lot_size = inst.lot_size if inst else 1
+    lot_size = lot_size_for(req.index_key)
     return {
         "index": req.index_key,
         "optionType": req.option_type,
@@ -164,15 +174,15 @@ def preview(req: OrderRequest) -> Dict[str, Any]:
         "lots": req.quantity,
         "lotSize": lot_size,
         "units": payload["quantity"],
-        "entryPrice": payload["price"],
+        "entryPrice": _round_tick(req.price),
         "targetPrice": payload["targetPrice"],
-        "expectedProfitPerUnit": round(payload["targetPrice"] - payload["price"], 2)
+        "expectedProfitPerUnit": round(payload["targetPrice"] - req.price, 2)
         if req.transaction_type == "BUY"
-        else round(payload["price"] - payload["targetPrice"], 2),
+        else round(req.price - payload["targetPrice"], 2),
         "safetyStopPrice": payload["stopLossPrice"],
         "safetyStopNote": (
-            "No stop loss set — this far-away leg exists only because the exchange "
-            "requires it. You control the exit from Open Positions (one-click EXIT)."
+            "Far stop: 90% from the entry reference premium. It CAN trigger and "
+            "losses can be large. Target or manual EXIT normally closes earlier."
             if req.no_stop_loss
             else "Stop-loss leg at your chosen distance."
         ),

@@ -1,101 +1,98 @@
-# =====================================================================
-#  Dhan Options Dashboard - STOP EVERYTHING
-#  Kills the backend + frontend and frees their ports, even if the
-#  original windows were closed and processes were left behind (orphans).
-#  Just double-click "Stop Dashboard.bat" (or run this file).
-# =====================================================================
-$ErrorActionPreference = "Continue"
+param([switch]$NoPause)
+
+$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
+$ports = @(8000, 5173, 5174)
+$failed = $false
+$stopped = @{}
 
-Write-Host ""
-Write-Host "  ============================================" -ForegroundColor Cyan
-Write-Host "     DHAN OPTIONS DASHBOARD - SHUTTING DOWN" -ForegroundColor Cyan
-Write-Host "  ============================================" -ForegroundColor Cyan
-Write-Host ""
+function Get-DashboardProcesses {
+    param($Processes)
+    $Processes | Where-Object {
+        $command = [string]$_.CommandLine
+        $executable = [string]$_.ExecutablePath
+        $runtime = $_.Name -in @("python.exe", "pythonw.exe", "node.exe", "cmd.exe", "powershell.exe")
+        $inProject = $command.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        $backendPython = $executable.StartsWith(
+            (Join-Path $root "backend\.venv") + "\", [StringComparison]::OrdinalIgnoreCase)
+        $dashboardCommand = $command -match 'uvicorn|vite|npm(?:\.cmd)?\s+run\s+dev|Run Backend\.bat|Run Frontend\.bat|Start-All\.ps1|Dhan Dashboard\.bat'
+        $runtime -and $dashboardCommand -and ($inProject -or $backendPython)
+    }
+}
 
-$PORTS = @(8000, 5173, 5174)   # backend, vite, vite-fallback
-$killed = @()
-
-# ---------------------------------------------------------------------
-# 1. Kill whatever is LISTENING on our ports (by PID), plus the whole
-#    process tree, so orphaned children go too.
-# ---------------------------------------------------------------------
-Write-Host "[1/3] Killing processes on ports $($PORTS -join ', ')..." -ForegroundColor Yellow
-foreach ($port in $PORTS) {
-    $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-    foreach ($conn in $conns) {
-        $procId = $conn.OwningProcess
-        if ($procId -and $procId -ne 0 -and $procId -ne 4) {
-            # Kill the whole tree (parent + children) with taskkill /T /F
-            $out = taskkill /PID $procId /T /F 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "      killed PID $procId on port $port" -ForegroundColor Green
-                $killed += $procId
-            } else {
-                Write-Host "      (PID $procId on port $port already gone)" -ForegroundColor Gray
-            }
+function Stop-DashboardTree {
+    param([int]$ProcessId, $Processes, $Protected)
+    if ($Protected.ContainsKey($ProcessId) -or $stopped.ContainsKey($ProcessId) -or $ProcessId -le 4) { return }
+    foreach ($child in @($Processes | Where-Object { $_.ParentProcessId -eq $ProcessId })) {
+        Stop-DashboardTree -ProcessId $child.ProcessId -Processes $Processes -Protected $Protected
+    }
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        $stopped[$ProcessId] = $true
+        Write-Host "  Force-stopped PID $ProcessId" -ForegroundColor Green
+    } catch {
+        if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+            Write-Warning "Cannot stop PID ${ProcessId}: $($_.Exception.Message)"
         }
     }
 }
 
-# ---------------------------------------------------------------------
-# 2. Sweep for stray processes launched by our launcher:
-#    uvicorn (python), vite / npm run dev (node), and the console windows.
-# ---------------------------------------------------------------------
-Write-Host "[2/3] Sweeping for leftover backend / frontend processes..." -ForegroundColor Yellow
+Write-Host "`nDHAN DASHBOARD - FORCE STOP" -ForegroundColor Cyan
+Write-Host "Stops this project's backend/frontend trees only; other apps are preserved."
+Write-Warning "Force stop does not square off broker positions or cancel broker orders. Software algo management will stop."
 
-$targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $cl = $_.CommandLine
-    if (-not $cl) { return $false }
-    ($cl -like "*uvicorn*app.main:app*") -or
-    ($cl -like "*vite*") -or
-    ($cl -like "*npm run dev*") -or
-    ($cl -like "*Dhan Dashboard*")
-}
-
-foreach ($t in $targets) {
-    if ($killed -contains $t.ProcessId) { continue }
-    $out = taskkill /PID $t.ProcessId /T /F 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "      killed PID $($t.ProcessId) ($($t.Name))" -ForegroundColor Green
-        $killed += $t.ProcessId
+try {
+    # Protect this stop shell and its parents (including the invoking terminal).
+    $snapshot = @(Get-CimInstance Win32_Process)
+    $protected = @{}
+    $ancestor = $PID
+    while ($ancestor -gt 0 -and -not $protected.ContainsKey($ancestor)) {
+        $protected[$ancestor] = $true
+        $parent = $snapshot | Where-Object { $_.ProcessId -eq $ancestor } | Select-Object -First 1
+        if (-not $parent) { break }
+        $ancestor = [int]$parent.ParentProcessId
     }
-}
 
-if ($killed.Count -eq 0) {
-    Write-Host "      nothing running - already clean." -ForegroundColor Gray
-}
-
-# ---------------------------------------------------------------------
-# 3. Verify the ports are actually free now.
-# ---------------------------------------------------------------------
-Write-Host "[3/3] Verifying ports are free..." -ForegroundColor Yellow
-Start-Sleep -Seconds 2
-
-$stillUsed = @()
-foreach ($port in $PORTS) {
-    $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-    if ($conn) {
-        $stillUsed += $port
-        Write-Host "      port $port : STILL IN USE (PID $($conn.OwningProcess))" -ForegroundColor Red
-    } else {
-        Write-Host "      port $port : free" -ForegroundColor Green
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $snapshot = @(Get-CimInstance Win32_Process)
+        $targets = @(Get-DashboardProcesses -Processes $snapshot |
+            Where-Object { -not $protected.ContainsKey([int]$_.ProcessId) })
+        if ($targets.Count -eq 0) { break }
+        foreach ($target in $targets) {
+            Stop-DashboardTree -ProcessId $target.ProcessId -Processes $snapshot -Protected $protected
+        }
+        Start-Sleep -Milliseconds 500
     }
+
+    $remaining = @(Get-DashboardProcesses -Processes @(Get-CimInstance Win32_Process) |
+        Where-Object { -not $protected.ContainsKey([int]$_.ProcessId) })
+    if ($remaining.Count) {
+        $failed = $true
+        Write-Warning "Dashboard processes still running: $($remaining.ProcessId -join ', '). Try Run as administrator if access was denied."
+    }
+
+    # Enumerate listeners once; TIME_WAIT connections are not running servers.
+    $listeners = @(Get-NetTCPConnection -State Listen)
+    foreach ($port in $ports) {
+        $owners = @($listeners | Where-Object { $_.LocalPort -eq $port } |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+        if ($owners.Count) {
+            $failed = $true
+            Write-Warning "Port $port still occupied by PID(s) $($owners -join ', '). Unidentified/unrelated listeners are NOT killed."
+        } else {
+            Write-Host "  Port ${port}: free" -ForegroundColor Green
+        }
+    }
+    if (-not $failed) {
+        Write-Host "Dashboard stopped. Verified ports free. PIDs stopped: $($stopped.Count)." -ForegroundColor Green
+    }
+} catch {
+    $failed = $true
+    Write-Error "Shutdown/verification failed: $($_.Exception.Message)" -ErrorAction Continue
 }
 
-Write-Host ""
-if ($stillUsed.Count -eq 0) {
-    Write-Host "  ============================================" -ForegroundColor Green
-    Write-Host "     ALL STOPPED - PORTS FREE" -ForegroundColor Green
-    Write-Host "  ============================================" -ForegroundColor Green
-} else {
-    Write-Host "  ============================================" -ForegroundColor Red
-    Write-Host "     SOME PORTS STILL BUSY: $($stillUsed -join ', ')" -ForegroundColor Red
-    Write-Host "  ============================================" -ForegroundColor Red
-    Write-Host "  Try running this again, or close any open" -ForegroundColor Yellow
-    Write-Host "  PowerShell windows and re-run." -ForegroundColor Yellow
+if (-not $NoPause) {
+    Read-Host "Press Enter to close"
 }
-Write-Host ""
-Write-Host "  Press any key to close this window..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if ($failed) { exit 1 }
+exit 0

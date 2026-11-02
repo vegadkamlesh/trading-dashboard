@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../api/client";
-import type { OrderPreviewResponse, OptionRow } from "../api/types";
+import type { ChainSnapshot, OrderPreviewResponse, OptionRow } from "../api/types";
+import { usePolling } from "../hooks/usePolling";
+import { useTradingAccounts, accountResultText, type AccountId } from "../hooks/useTradingAccounts";
 import { useAuth } from "../hooks/useAuth";
 import { useToast } from "../hooks/useToasts";
 
@@ -24,7 +26,21 @@ export function OrderTicket({
 }) {
   const { push } = useToast();
   const { fastOrders } = useAuth();
-  const leg = seed.optionType === "CE" ? seed.row.ce : seed.row.pe;
+  const { data: accounts, error: accountsError } = useTradingAccounts();
+  const recipientsKey = accounts?.selected.join(",") ?? "";
+  const [accountChecks, setAccountChecks] = useState<Array<{
+    accountId: AccountId; ok: boolean; result?: OrderPreviewResponse; error?: unknown;
+  }>>([]);
+  const initialLeg = seed.optionType === "CE" ? seed.row.ce : seed.row.pe;
+  const { data: quote, error: quoteError } = usePolling<ChainSnapshot>(
+    () => api.get(`/api/market/optionchain?index=${seed.indexKey}`), 3000, true, seed.indexKey
+  );
+  const liveLeg = quote?.rows
+    .map((row) => seed.optionType === "CE" ? row.ce : row.pe)
+    .find((node) => String(node.securityId) === String(initialLeg.securityId));
+  const leg = liveLeg ?? initialLeg;
+  const quoteStale = !quote || !!quoteError || !!quote.error || quote.stale || !liveLeg
+    || Date.now() / 1000 - quote.fetchedAt > 12;
   // Default the "ref" price to LTP (fallback ask/bid). This is just the
   // starting value — the trader edits the LIMIT price to whatever they want.
   const refPrice = leg.ltp ?? leg.ask ?? leg.bid ?? 0;
@@ -37,11 +53,14 @@ export function OrderTicket({
   const [noStopLoss, setNoStopLoss] = useState(true);
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
-  const [preview, setPreview] = useState<OrderPreviewResponse | null>(null);
+  const placing = useRef(false);
+  const requestId = useRef(crypto.randomUUID());
+  const [previewState, setPreviewState] = useState<{ key: string; value: OrderPreviewResponse } | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   // Lot size for this index (from the server preview). Each index differs
   // (NIFTY 65, SENSEX 20, BANKNIFTY 30, ...), so units = lots × lotSize.
-  const lotSize = preview?.preview.lotSize ?? 1;
+  const lotSize = previewState?.value.preview.lotSize ?? 1;
   const units = quantity * lotSize;
 
   const body = useMemo(
@@ -59,44 +78,62 @@ export function OrderTicket({
       productType,
       orderType,
       noStopLoss,
+      accountIds: recipientsKey ? recipientsKey.split(",") : [],
     }),
-    [seed, leg, quantity, price, targetPct, productType, orderType, noStopLoss, refPrice]
+    [seed.indexKey, seed.indexName, seed.row.strike, seed.optionType, seed.transactionType,
+      leg.securityId, quantity, price, targetPct, productType, orderType, noStopLoss, refPrice, recipientsKey]
   );
+  const bodyKey = JSON.stringify(body);
+  const preview = previewState?.key === bodyKey ? previewState.value : null;
 
   // Fetch a live preview whenever inputs change (simple debounce).
   useEffect(() => {
     let cancelled = false;
+    setPreviewError(null);
     const t = window.setTimeout(async () => {
       try {
-        const p = await api.post<OrderPreviewResponse>("/api/orders/preview", body);
-        if (!cancelled) setPreview(p);
-      } catch {
-        if (!cancelled) setPreview(null);
+        const batch = await api.post<{results: typeof accountChecks}>("/api/trading/preview", body);
+        const p = batch.results.find(r => r.ok && r.result)?.result;
+        if (!cancelled) {
+          setAccountChecks(batch.results);
+          setPreviewState(p ? { key: bodyKey, value: p } : null);
+          if (!p) setPreviewError(batch.results.map(r => `${r.accountId}: ${accountResultText(r.error)}`).join("; "));
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setPreviewState(null);
+          setPreviewError(e instanceof Error ? e.message : "Order preview failed");
+        }
       }
     }, 250);
     return () => {
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [body]);
+  }, [body, bodyKey]);
 
   const place = async () => {
+    if (placing.current || !preview || quoteStale || accountsError || !recipientsKey) return;
     // FAST ORDERS ON → PIN is skipped (backend also skips it); 1 click places.
     if (!fastOrders && !pin) {
       push("error", "Enter your order confirm PIN");
       return;
     }
+    placing.current = true;
     setBusy(true);
     try {
       const res = await api.post<{
         ok: boolean;
         dryRun: boolean;
-        result?: { orderId?: string; orderStatus?: string };
-      }>("/api/orders/place", { ...body, pin });
-      if (res.dryRun) {
-        push("info", "DRY-RUN: order validated & logged (not sent to Dhan)");
-      } else {
-        push("success", `Order placed: ${res.result?.orderId} (${res.result?.orderStatus})`);
+        results: Array<{accountId: string; ok: boolean; error?: unknown;
+          result?: {dryRun?: boolean; result?: {orderId?: string; orderStatus?: string}}}>;
+      }>("/api/trading/place", { ...body, pin, requestId: requestId.current });
+      for (const item of res.results) {
+        const order = item.result?.result;
+        push(item.ok && order?.orderStatus !== "REJECTED" ? "info" : "error",
+          `${item.accountId}: ${item.ok
+            ? (item.result?.dryRun ? "DRY-RUN (not sent)" : `${order?.orderId ?? "submitted"} ${order?.orderStatus ?? "awaiting confirmation"}`)
+            : accountResultText(item.error)}`);
       }
       onClose();
     } catch (e) {
@@ -120,13 +157,14 @@ export function OrderTicket({
         push("error", "Order failed");
       }
     } finally {
+      placing.current = false;
       setBusy(false);
     }
   };
 
   const isBuy = seed.transactionType === "BUY";
   const funds = preview?.funds;
-  const insufficient = funds ? !funds.sufficient : false;
+  const insufficient = !accountChecks.some(check => check.ok && check.result?.funds?.sufficient);
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4">
@@ -145,6 +183,17 @@ export function OrderTicket({
           </span>
         </div>
 
+        <p className="mb-2 text-xs text-sky-300">Entry recipients: {recipientsKey || "NONE"} (same manual lots per account)</p>
+        {accountChecks.map(check => <p key={check.accountId} className={check.ok && check.result?.funds?.sufficient ? "text-xs text-green-300" : "text-xs text-amber-300"}>
+          {check.accountId}: {check.ok
+            ? `available ${check.result?.funds?.availableBalance ?? "unknown"} / needs ${check.result?.funds?.requiredCash ?? "-"}${check.result?.funds?.error ? " — " + check.result.funds.error : ""}`
+            : accountResultText(check.error)}
+        </p>)}
+        {(quoteStale || previewError || accountsError) && (
+          <p role="alert" className="mb-3 rounded border border-amber-500/40 p-2 text-xs text-amber-300">
+            {accountsError || previewError || quoteError || quote?.error || "Waiting for a fresh quote for this exact contract. Confirmation disabled."}
+          </p>
+        )}
         <div className="grid grid-cols-2 gap-3 text-sm">
           <Field label="Ref LTP">
             <span className="font-mono">{fmt(refPrice)}</span>
@@ -252,7 +301,7 @@ export function OrderTicket({
             <div className="text-xs font-semibold text-slate-300">Stop Loss</div>
             <div className="text-[11px] text-slate-500">
               {noStopLoss
-                ? "OFF — manage your exit manually from Open Positions."
+                ? "Target-first — broker SL 90% away. Large loss possible; SL can still hit."
                 : "ON — a safety stop is attached."}
             </div>
           </div>
@@ -262,7 +311,7 @@ export function OrderTicket({
               checked={!noStopLoss}
               onChange={(e) => setNoStopLoss(!e.target.checked)}
             />
-            Add stop loss
+            Use closer stop loss
           </label>
         </div>
 
@@ -279,12 +328,8 @@ export function OrderTicket({
               accent="green"
             />
             <Row
-              label={preview.preview.noStopLoss ? "Stop (off)" : "Stop loss"}
-              value={
-                preview.preview.noStopLoss
-                  ? "— none (manual exit)"
-                  : fmt(preview.preview.safetyStopPrice)
-              }
+              label={preview.preview.noStopLoss ? "Far SL (90% away)" : "Stop loss"}
+              value={fmt(preview.preview.safetyStopPrice)}
             />
             <Row
               label="Est. total profit"
@@ -314,12 +359,14 @@ export function OrderTicket({
 
         {insufficient && funds && (
           <div className="mt-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-            <div className="font-bold">⚠️ Insufficient balance</div>
+            <div className="font-bold">{funds.error ? "Balance check unavailable" : "⚠️ Insufficient balance"}</div>
+            {funds.error ? <div>{funds.error}</div> : (
             <div className="mt-0.5">
               This order needs <span className="font-mono">₹{funds.requiredCash.toFixed(2)}</span>{" "}
               but you only have <span className="font-mono">₹{(funds.availableBalance ?? 0).toFixed(2)}</span>{" "}
               (short by <span className="font-mono">₹{funds.shortfall.toFixed(2)}</span>). Reduce the lots.
             </div>
+            )}
           </div>
         )}
 
@@ -351,7 +398,7 @@ export function OrderTicket({
           <button
             className={isBuy ? "btn-buy" : "btn-sell"}
             onClick={place}
-            disabled={busy || !preview || insufficient}
+            disabled={busy || !preview || insufficient || quoteStale || !!accountsError || !recipientsKey}
             title={insufficient ? "Insufficient balance — reduce lots" : undefined}
           >
             {busy ? "Placing…" : `Confirm ${seed.transactionType}`}
