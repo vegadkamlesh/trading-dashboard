@@ -1971,6 +1971,19 @@ class AccountEngines:
             await master._prepare_contract(source, direction)
         if source.prepared_side != direction or not source.security_id:
             return
+        # The contract is often subscribed at the breakout tick itself, so its first
+        # premium tick may not have arrived yet. Do not consume the day's single
+        # signal on a stale premium; the next tick retries while the leg is watching.
+        segment = master._segment_for(source.index_key)
+        premium_age = feed.age(source.security_id, segment)
+        if (feed.price(source.security_id, segment) is None
+                or premium_age is None or premium_age > MAX_PRICE_AGE):
+            note = "Waiting for fresh option premium before entry (maximum age 5s)"
+            if source.note != note:
+                master._log(f"{source.index_key} {direction} breakout: {note}; will retry on next tick",
+                            level="warn", index=source.index_key)
+            source.note = note
+            return
         signal = asdict(source)
         master._signal_day = now_ist().date().isoformat()
         with account_scope("master"):

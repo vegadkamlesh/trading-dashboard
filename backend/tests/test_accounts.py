@@ -422,7 +422,9 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                    security_id=47154, prepared_side="PUT")
         for engine in self.manager.items.values():
             engine._enter = AsyncMock()
-        await self.manager.enter_signal(source, "PUT")
+        with patch.object(algo_module.feed, "price", return_value=100), \
+                patch.object(algo_module.feed, "age", return_value=0):
+            await self.manager.enter_signal(source, "PUT")
         self.manager.items["master"]._enter.assert_not_awaited()
         self.manager.items["child"]._enter.assert_awaited_once()
         await self.http.post("/api/algo/disarm")
@@ -435,12 +437,46 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.manager.items["child"]._enter = AsyncMock(side_effect=fail)
         source = algo_module.DayLeg("NIFTY", or_high=23000, or_low=22900, spot=23001,
                                    security_id=47153, prepared_side="CALL")
-        await self.manager.enter_signal(source, "CALL")
+        with patch.object(algo_module.feed, "price", return_value=100), \
+                patch.object(algo_module.feed, "age", return_value=0):
+            await self.manager.enter_signal(source, "CALL")
         self.manager.items["master"]._enter.assert_awaited_once()
         self.assertIn("persistence unavailable", self.manager.items["child"]._last_error)
         with account_scope("master"):
             saved = algo_store.store.load_state()
             self.assertEqual(saved["signalDay"], algo_module.now_ist().date().isoformat())
+
+    async def test_stale_premium_at_breakout_retries_instead_of_consuming_the_day(self):
+        # 2026-11-03: the contract was subscribed on the breakout tick, its premium was
+        # not fresh yet, and the shared signal locked the day without any order.
+        source = algo_module.DayLeg("NIFTY", status="watching",
+            or_high=23000, or_low=22900, spot=23001)
+        for e in self.manager.items.values():
+            e.cfg.risk_pct = 10
+            e.cfg.max_capital_pct = 60
+            e.cfg.protective_sl = True
+            e.cfg.indices = ["NIFTY"]
+        snap = {"expiry": "2026-10-29", "underlyingLtp": 23001, "rows": [{
+            "strike": 23050, "ce": {"securityId": 47153, "ltp": 100},
+            "pe": {"securityId": 47154, "ltp": 100},
+        }]}
+        with patch.object(algo_module.chain_engine, "snapshot", return_value=snap), \
+                patch.object(algo_module.feed, "subscribe"), \
+                patch.object(algo_module.feed, "price", return_value=None), \
+                patch.object(algo_module.feed, "age", return_value=None):
+            await self.manager.enter_signal(source, "CALL")
+        master = self.manager.items["master"]
+        self.assertIsNone(master._signal_day)
+        self.assertEqual(source.status, "watching")
+        self.assertIn("fresh option premium", source.note)
+        self.assertTrue(all(not b.orders and not b.supers for b in self.brokers.values()))
+        with patch.object(algo_module.chain_engine, "snapshot", return_value=snap), \
+                patch.object(algo_module.feed, "subscribe"), \
+                patch.object(algo_module.feed, "price", return_value=100), \
+                patch.object(algo_module.feed, "age", return_value=0):
+            await self.manager.enter_signal(source, "CALL")
+        self.assertTrue(all(e._position is not None for e in self.manager.items.values()))
+        self.assertEqual(master._signal_day, algo_module.now_ist().date().isoformat())
 
     async def test_batch_retry_after_restart_uses_persisted_receipt(self):
         first = (await self.http.post("/api/trading/place", json=self.body)).json()
