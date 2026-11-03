@@ -570,8 +570,20 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((sizing["lots"], sizing["quantity"]), (2, 130))
             leg.option_ltp = 230  # 14950/lot > 98% of 15000 -> cannot afford one lot
             self.assertEqual((await engine._size_position(leg))["lots"], 0)
-            leg.option_ltp = 1
-            self.assertEqual((await engine._size_position(leg))["lots"], 10)  # max_lots cap
+            leg.option_ltp = 1  # 14700 usable / 65 -> 226 lots: max_lots=10 must NOT cap it
+            sizing = await engine._size_position(leg)
+            # Only the exchange freeze bounds a single order: NIFTY 1800 -> 27 whole lots.
+            self.assertEqual((sizing["lots"], sizing["quantity"]), (27, 1755))
+            self.assertIn("freeze", sizing["reason"])
+        for key, lot, premium, balance, expected in (
+                ("BANKNIFTY", 30, 100, 50000, 16),   # 49000 / 3000 -> 16, under freeze 900 (30 lots)
+                ("SENSEX", 20, 100, 50000, 24),      # 49000 / 2000 -> 24, under freeze 1000 (50 lots)
+                ("BANKNIFTY", 30, 10, 500000, 30)):  # 163 affordable, freeze 900 -> 30 lots
+            leg = algo_module.DayLeg(key, status="watching", or_high=1, or_low=0)
+            leg.option_ltp = premium
+            with patch.object(algo_module, "lot_size_for", return_value=lot), \
+                    patch.object(engine, "_balance", AsyncMock(return_value=balance)):
+                self.assertEqual((await engine._size_position(leg))["lots"], expected, key)
 
     async def _rupee_exit(self, premium, profit, loss):
         await self.dispatch_shared_signal()

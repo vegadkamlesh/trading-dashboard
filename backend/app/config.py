@@ -136,6 +136,12 @@ class Settings(BaseSettings):
     algo_stop_loss_rs: float = 0.0
     # Optional lot-size override, e.g. "NIFTY=75,SENSEX=20". Empty = registry.
     algo_lot_sizes: str = Field("", validation_alias="ALGO_LOT_SIZES")
+    # Exchange quantity-freeze per single order (units). An order above this is
+    # rejected by the exchange, so max-affordable sizing stops at the largest
+    # whole-lot quantity within it. Exchanges revise these often; update here.
+    # NSE values w.e.f. 2026-11-02; SENSEX is the long-standing BSE value.
+    algo_freeze_qty: str = Field("NIFTY=1800,BANKNIFTY=900,FINNIFTY=1800,MIDCPNIFTY=2800,SENSEX=1000",
+                                 validation_alias="ALGO_FREEZE_QTY")
     # Paper-trade P&L for dry-run fills uses this assumed option delta.
     algo_paper_delta: float = 0.5
 
@@ -151,6 +157,19 @@ class Settings(BaseSettings):
                 k, v = part.split("=", 1)
                 try:
                     out[k.strip().upper()] = int(v)
+                except ValueError:
+                    continue
+        return out
+
+    @property
+    def algo_freeze_limits(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for part in self.algo_freeze_qty.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                try:
+                    if int(v) > 0:
+                        out[k.strip().upper()] = int(v)
                 except ValueError:
                     continue
         return out

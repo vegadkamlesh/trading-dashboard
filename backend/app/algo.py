@@ -1440,9 +1440,13 @@ class AlgoEngine:
         premium_per_lot = max(premium * lot, 1e-6)
 
         if self.cfg.max_affordable:
+            # Deliberately ignores max_lots: buy every lot the balance affords. The only
+            # bound is the exchange freeze, above which the whole order would be rejected.
             usable = balance * AFFORDABLE_BALANCE_PCT / 100.0
             affordable = int(usable // premium_per_lot) if premium > 0 else 0
-            lots = max(0, min(affordable, self.cfg.max_lots))
+            freeze = get_settings().algo_freeze_limits.get(leg.index_key.upper())
+            freeze_lots = freeze // lot if freeze and lot > 0 else None
+            lots = max(0, affordable if freeze_lots is None else min(affordable, freeze_lots))
             if lots < max(1, self.cfg.min_lots):
                 lots = 0
             return {
@@ -1452,7 +1456,8 @@ class AlgoEngine:
                 "reason": (
                     f"max-affordable: balance Rs{balance:,.0f} ({AFFORDABLE_BALANCE_PCT:g}% usable), "
                     f"premium/lot Rs{premium_per_lot:,.0f} -> {lots} lot(s)"
-                    + (f" (capped at max {self.cfg.max_lots})" if affordable > self.cfg.max_lots else "")
+                    + (f" (exchange freeze {freeze} qty per order)"
+                       if freeze_lots is not None and affordable > freeze_lots else "")
                 ) if lots else (
                     f"insufficient balance: Rs{balance:,.0f} available "
                     f"({AFFORDABLE_BALANCE_PCT:g}% usable), one lot of premium costs Rs{premium_per_lot:,.0f}"

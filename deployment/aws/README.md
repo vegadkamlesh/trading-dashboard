@@ -175,8 +175,10 @@ Dhan token, so tokens must be refreshed before each trading day. Set
 ### Position sizing and rupee exits
 
 `ALGO_MAX_AFFORDABLE=true` (or the Settings tab "Max lots" checkbox) sizes each
-account at `floor(balance x 98% / (premium x lot size))` lots, capped by
-`Max lots`; `risk_pct` and `max_capital_pct` are ignored. Example: balance
+account at `floor(balance x 98% / (premium x lot size))` lots. `Max lots`,
+`risk_pct` and `max_capital_pct` are ignored; the only bound is the exchange
+per-order freeze quantity (`ALGO_FREEZE_QTY`, default NIFTY 1800, BANKNIFTY 900,
+SENSEX 1000), because a larger single order is rejected outright. Example: balance
 15000, lot 65, premium 100 -> 2 lots (130 qty). The Algo tab "Exit conditions"
 box sets a profit and a stop-loss in rupees (0 = off) for both accounts via
 `POST /api/algo/exit-rules`; it can be changed while armed or holding. Each

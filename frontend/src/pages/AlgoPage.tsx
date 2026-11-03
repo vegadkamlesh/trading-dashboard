@@ -969,7 +969,7 @@ function TuningPanel({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; on
           <input type="checkbox" checked={Boolean(draft.max_affordable)}
             onChange={(e) => setDraft({ ...draft, max_affordable: e.target.checked })} />
           <span className="text-[11px] font-semibold text-amber-300">
-            Max lots: balance me jitne lot aaye utne lo (98% balance, Max lots cap). Risk % ignore.
+            Max lots: balance me jitne lot aaye utne lo (98% balance, koi lot cap nahi; sirf exchange freeze qty). Risk % ignore.
           </span>
         </label>
         <label className="flex items-center gap-2 pt-4">
