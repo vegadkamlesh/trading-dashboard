@@ -153,6 +153,7 @@ export function AlgoPage() {
         }}>ALGO EXIT BOTH</button>
       </div>
       <NowAndNext st={st} />
+      <ExitRulesBox cfg={st.config} busy={busy} onCall={call} />
 
       <div className="grid gap-3 lg:grid-cols-2">
         {st.legs.map((leg) => <IndexCard key={leg.index} leg={leg} cfg={st.config} status={st} />)}
@@ -842,6 +843,40 @@ function EodPanel() {
 }
 
 // --------------------------------------------------------------------------- //
+//  rupee exit conditions (editable any time, applies to both accounts)
+// --------------------------------------------------------------------------- //
+function ExitRulesBox({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; onCall: (p: string, b?: unknown, l?: string) => void }) {
+  const [profit, setProfit] = useState(String(cfg.profit_target_rs ?? 0));
+  const [loss, setLoss] = useState(String(cfg.stop_loss_rs ?? 0));
+  useEffect(() => { setProfit(String(cfg.profit_target_rs ?? 0)); }, [cfg.profit_target_rs]);
+  useEffect(() => { setLoss(String(cfg.stop_loss_rs ?? 0)); }, [cfg.stop_loss_rs]);
+  const p = Number(profit), l = Number(loss);
+  const valid = Number.isFinite(p) && p >= 0 && Number.isFinite(l) && l >= 0;
+  return (
+    <div className="card flex flex-wrap items-end gap-3">
+      <div className="text-sm font-semibold">Exit conditions (har account ka apna P&amp;L)</div>
+      <label className="flex flex-col gap-1">
+        <span className="text-[11px] font-semibold text-emerald-300">Profit ₹ (0 = off)</span>
+        <input className="input w-32 font-mono" type="number" min="0" step="100" value={profit}
+          onChange={(e) => setProfit(e.target.value)} />
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-[11px] font-semibold text-rose-300">Stop loss ₹ (0 = off)</span>
+        <input className="input w-32 font-mono" type="number" min="0" step="100" value={loss}
+          onChange={(e) => setLoss(e.target.value)} />
+      </label>
+      <button className="btn" style={{ background: "#0284c7" }} disabled={busy || !valid}
+        onClick={() => onCall("/api/algo/exit-rules", { profit_target_rs: p, stop_loss_rs: l },
+          "Exit conditions save ho gaye (dono accounts)")}>Save</button>
+      <span className="text-[10px] text-slate-400">
+        Active: profit ≥ ₹{cfg.profit_target_rs || "off"} · loss ≤ −₹{cfg.stop_loss_rs || "off"}.
+        Live option premium P&amp;L (charges ke bina) par MARKET exit; armed/position ke dauran bhi badal sakte ho.
+      </span>
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------------- //
 //  tuning
 // --------------------------------------------------------------------------- //
 const NUM_FIELDS: Array<[keyof AlgoConfig, string, string]> = [
@@ -929,6 +964,13 @@ function TuningPanel({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; on
             <option value="MARKET">MARKET (fast, slippage)</option>
             <option value="LIMIT">LIMIT (no slippage, may miss)</option>
           </select>
+        </label>
+        <label className="flex items-center gap-2 pt-4">
+          <input type="checkbox" checked={Boolean(draft.max_affordable)}
+            onChange={(e) => setDraft({ ...draft, max_affordable: e.target.checked })} />
+          <span className="text-[11px] font-semibold text-amber-300">
+            Max lots: balance me jitne lot aaye utne lo (98% balance, Max lots cap). Risk % ignore.
+          </span>
         </label>
         <label className="flex items-center gap-2 pt-4">
           <input type="checkbox" checked={Boolean(draft.protective_sl)}

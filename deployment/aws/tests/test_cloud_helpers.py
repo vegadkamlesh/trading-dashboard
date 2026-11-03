@@ -199,6 +199,27 @@ class CloudHelpersTest(unittest.TestCase):
                 deploy.prepare_mock_release("test", "trading-dashboard", "recovery", False)
         session.assert_not_called()
 
+    def test_publish_app_artifact_requires_approval_and_a_stopped_instance(self):
+        with patch.object(deploy.boto3, "Session") as session:
+            with self.assertRaises(ValueError):
+                deploy.publish_app_artifact("test", "trading-dashboard", False)
+        session.assert_not_called()
+        session = Mock()
+        session.client.return_value.describe_stacks.return_value = {"Stacks": [{
+            "StackStatus": "UPDATE_COMPLETE",
+            "Parameters": [{"ParameterKey": "AppArtifactKey", "ParameterValue": "old"}],
+            "Outputs": [{"OutputKey": "InstanceId", "OutputValue": "i-123"}],
+        }]}
+        session.client.return_value.describe_instances.return_value = {
+            "Reservations": [{"Instances": [{"State": {"Name": "running"}}]}]}
+        with patch.object(deploy.boto3, "Session", return_value=session), \
+                patch.object(deploy, "upload_artifact") as upload, \
+                patch.object(deploy, "execute_reviewed_update") as update:
+            with self.assertRaisesRegex(RuntimeError, "stop it"):
+                deploy.publish_app_artifact("test", "trading-dashboard", True)
+        upload.assert_not_called()
+        update.assert_not_called()
+
     def test_app_pointer_review_rejects_unrelated_or_unexpected_changes(self):
         instance = {"ResourceChange": {
             "LogicalResourceId": "DashboardInstance", "Action": "Modify", "Replacement": "Conditional",

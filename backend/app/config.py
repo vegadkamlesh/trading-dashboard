@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     algo_max_or_pct: float = 0.0        # skip if OR range > this % of price (0=off)
     algo_order_type: str = "MARKET"     # MARKET (fast) | LIMIT (no slippage)
     algo_product_type: str = "INTRADAY"
+    # Buy every lot the balance affords (minus a small charges/slippage buffer).
+    algo_max_affordable: bool = False
+    # Rupee exits on each account's live premium P&L; 0 = off.
+    algo_profit_target_rs: float = 0.0
+    algo_stop_loss_rs: float = 0.0
     # Optional lot-size override, e.g. "NIFTY=75,SENSEX=20". Empty = registry.
     algo_lot_sizes: str = Field("", validation_alias="ALGO_LOT_SIZES")
     # Paper-trade P&L for dry-run fills uses this assumed option delta.

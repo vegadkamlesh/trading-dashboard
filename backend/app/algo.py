@@ -59,6 +59,8 @@ OR_READY_MIN = 9 * 60 + 26          # start computing the OR at/after this minut
 TICKER = 15
 RECONCILE_SECONDS = 1.0
 MAX_PRICE_AGE = 5.0
+# Max-affordable sizing keeps this share of balance usable; the rest covers charges and MARKET slippage.
+AFFORDABLE_BALANCE_PCT = 98.0
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 
 # Order-placement retry policy. `_evaluate` runs on EVERY feed tick, so without a
@@ -115,6 +117,11 @@ class AlgoConfig:
     product_type: str = "INTRADAY"
     protective_sl: bool = True      # park a wide real SL at Dhan as a disaster stop
     protective_sl_mult: float = 2.0 # ... at this many x the software stop distance
+    # Size with every lot the balance can buy (capped by max_lots), ignoring risk_pct/max_capital_pct.
+    max_affordable: bool = False
+    # Per-account rupee exits on live premium P&L (0 = off). Editable while armed/in a position.
+    profit_target_rs: float = 0.0
+    stop_loss_rs: float = 0.0
 
     @classmethod
     def from_settings(cls) -> "AlgoConfig":
@@ -136,6 +143,9 @@ class AlgoConfig:
             max_or_pct=s.algo_max_or_pct,
             order_type=s.algo_order_type,
             product_type=s.algo_product_type,
+            max_affordable=s.algo_max_affordable,
+            profit_target_rs=s.algo_profit_target_rs,
+            stop_loss_rs=s.algo_stop_loss_rs,
         )
 
 
@@ -731,6 +741,18 @@ class AlgoEngine:
         await self._exit_position(self._position, "PANIC")
         return self.status()
 
+    def set_exit_rules(self, profit_target_rs: float, stop_loss_rs: float) -> None:
+        """Rupee exits only tighten/loosen exits, so they may change while armed or in a position."""
+        for value in (profit_target_rs, stop_loss_rs):
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise HTTPException(400, "Profit/loss conditions must be finite and >= 0 (0 = off)")
+        self.cfg.profit_target_rs = float(profit_target_rs)
+        self.cfg.stop_loss_rs = float(stop_loss_rs)
+        self._log(f"Exit conditions saved: profit >= Rs{profit_target_rs:,.0f}"
+                  f"{'' if profit_target_rs else ' (off)'}, loss <= -Rs{stop_loss_rs:,.0f}"
+                  f"{'' if stop_loss_rs else ' (off)'}")
+        self._persist()
+
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         if self._position is not None or self._execution_lock.locked():
             raise HTTPException(409, "Cannot change algo configuration while execution/position is active.")
@@ -745,7 +767,7 @@ class AlgoEngine:
         if (cfg.risk_pct > 100 or cfg.max_capital_pct > 100 or cfg.protective_sl_mult < 1
                 or cfg.min_lots < 1 or cfg.max_lots < cfg.min_lots):
             raise HTTPException(400, "Invalid risk/capital percentage, lot bounds or protective multiplier")
-        for key in ("breakeven_at", "min_or_pct", "max_or_pct"):
+        for key in ("breakeven_at", "min_or_pct", "max_or_pct", "profit_target_rs", "stop_loss_rs"):
             value = getattr(cfg, key)
             if not math.isfinite(value) or value < 0:
                 raise HTTPException(400, f"{key} must be finite and nonnegative")
@@ -1056,8 +1078,41 @@ class AlgoEngine:
         finally:
             self._busy = False
 
+    def _rupee_pnl(self, pos: Position) -> Optional[float]:
+        """Live premium P&L of the held quantity, or None when the premium is not fresh."""
+        if pos.premium is None or not pos.entry_premium or pos.quantity <= 0:
+            return None
+        age = feed.age(pos.security_id, self._segment_for(pos.index_key))
+        if age is None or age > MAX_PRICE_AGE:
+            return None
+        return (pos.premium - pos.entry_premium) * pos.quantity
+
+    def _rupee_exit_reason(self, pos: Position) -> Optional[str]:
+        target, stop = self.cfg.profit_target_rs, self.cfg.stop_loss_rs
+        if not target and not stop:
+            return None
+        pnl = self._rupee_pnl(pos)
+        if pnl is None:
+            return None
+        if target and pnl >= target:
+            return "PROFIT_RS"
+        if stop and pnl <= -stop:
+            return "LOSS_RS"
+        return None
+
     async def _manage_position(self) -> None:
         pos = self._position
+        if (pos is not None and pos.execution_state in {"open", "attention"}
+                and not pos.exit_order_id and not pos.exit_correlation_id
+                and time.time() >= pos.next_exit_try_at):
+            reason = self._rupee_exit_reason(pos)
+            if reason:
+                pnl = self._rupee_pnl(pos) or 0.0
+                self._log(f"{pos.index_key}: premium P&L Rs{pnl:,.0f} hit "
+                          f"{'profit' if reason == 'PROFIT_RS' else 'loss'} condition -> exit",
+                          level="warn", index=pos.index_key)
+                await self._exit_position_locked(pos, reason)
+                return
         if pos is None or pos.spot is None or pos.execution_state not in {"open", "attention"}:
             return
         if self.cfg.target_only and pos.dry_run and self.cfg.protective_sl:
@@ -1383,6 +1438,26 @@ class AlgoEngine:
             if self.cfg.target_only else sl_points * delta * lot, 1e-6,
         )
         premium_per_lot = max(premium * lot, 1e-6)
+
+        if self.cfg.max_affordable:
+            usable = balance * AFFORDABLE_BALANCE_PCT / 100.0
+            affordable = int(usable // premium_per_lot) if premium > 0 else 0
+            lots = max(0, min(affordable, self.cfg.max_lots))
+            if lots < max(1, self.cfg.min_lots):
+                lots = 0
+            return {
+                "lots": lots, "quantity": lots * lot, "lotSize": lot,
+                "premiumPerLot": round(premium_per_lot, 2), "riskPerLot": round(premium_per_lot, 2),
+                "balance": round(balance, 2), "riskLots": affordable, "cashLots": affordable,
+                "reason": (
+                    f"max-affordable: balance Rs{balance:,.0f} ({AFFORDABLE_BALANCE_PCT:g}% usable), "
+                    f"premium/lot Rs{premium_per_lot:,.0f} -> {lots} lot(s)"
+                    + (f" (capped at max {self.cfg.max_lots})" if affordable > self.cfg.max_lots else "")
+                ) if lots else (
+                    f"insufficient balance: Rs{balance:,.0f} available "
+                    f"({AFFORDABLE_BALANCE_PCT:g}% usable), one lot of premium costs Rs{premium_per_lot:,.0f}"
+                ),
+            }
 
         risk_lots = int((balance * self.cfg.risk_pct / 100.0) // risk_per_lot)
         cash_lots = int((balance * self.cfg.max_capital_pct / 100.0) // premium_per_lot)

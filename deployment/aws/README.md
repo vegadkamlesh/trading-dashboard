@@ -172,6 +172,30 @@ Current owner-approved live setting: `APP_DRY_RUN=false`, `APP_FAST_ORDERS=true`
 Dhan token, so tokens must be refreshed before each trading day. Set
 `ALGO_AUTO_ARM=false` to return to manual ARM.
 
+### Position sizing and rupee exits
+
+`ALGO_MAX_AFFORDABLE=true` (or the Settings tab "Max lots" checkbox) sizes each
+account at `floor(balance x 98% / (premium x lot size))` lots, capped by
+`Max lots`; `risk_pct` and `max_capital_pct` are ignored. Example: balance
+15000, lot 65, premium 100 -> 2 lots (130 qty). The Algo tab "Exit conditions"
+box sets a profit and a stop-loss in rupees (0 = off) for both accounts via
+`POST /api/algo/exit-rules`; it can be changed while armed or holding. Each
+account exits with a MARKET SELL when its own gross premium P&L reaches
+`+profit` (`PROFIT_RS`) or `-loss` (`LOSS_RS`), checked only on a fresh (<5 s)
+option price. The spot target and the 15:12 time exit still apply.
+
+### Bootstrap application package
+
+```powershell
+python .\deployment\aws\deploy.py publish-app-artifact --approved-app-publish
+```
+
+Builds the frontend, uploads the current code to S3 and updates only
+`AppArtifactKey` through a reviewed change set. It refuses unless the instance
+is stopped (the pointer rewrites user data). The package is used only when an
+instance is rebuilt; the running server is updated separately, and a rebuilt
+instance still needs `push-live-credentials`.
+
 Merely setting dry-run does not make an imported live state harmless. Never copy or
 restore old trading state blindly, and never run local and cloud engines against
 the same account simultaneously. Real Dhan credentials, static-IP registration,

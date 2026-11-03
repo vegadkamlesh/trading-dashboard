@@ -41,7 +41,15 @@ class ConfigPatch(BaseModel):
     product_type: Optional[str] = None
     protective_sl: Optional[bool] = None
     protective_sl_mult: Optional[float] = None
+    max_affordable: Optional[bool] = None
+    profit_target_rs: Optional[float] = None
+    stop_loss_rs: Optional[float] = None
     indices: Optional[List[str]] = None
+
+
+class ExitRules(BaseModel):
+    profit_target_rs: float
+    stop_loss_rs: float
 
 
 @router.get("/status")
@@ -94,6 +102,23 @@ async def config(
                for engine in engines.items.values()):
             raise HTTPException(409, "Disarm both accounts and finish all tracked execution before changing shared configuration.")
         return algo.set_config(patch.model_dump(exclude_none=True))
+
+
+@router.post("/exit-rules")
+async def exit_rules(
+    rules: ExitRules,
+    _session: str = Depends(require_session),
+    _csrf: None = Depends(require_csrf),
+):
+    """Rupee profit/loss exits for BOTH accounts; allowed while armed or holding a position."""
+    if current_account() != "master":
+        raise HTTPException(409, "Shared algo configuration is edited from Master Dhan.")
+    from ..accounts import account_scope
+    async with engines.selection_lock:
+        for account, engine in engines.items.items():
+            with account_scope(account):
+                engine.set_exit_rules(rules.profit_target_rs, rules.stop_loss_rs)
+    return algo.status()
 
 
 @router.get("/journal")

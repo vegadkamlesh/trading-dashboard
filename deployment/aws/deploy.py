@@ -1422,6 +1422,45 @@ def push_live_credentials(profile: str, stack: str, approved: bool, dry_run: boo
           "fast-order/auto-arm defaults in the instance .env were preserved")
 
 
+def publish_app_artifact(profile: str, stack: str, approved: bool) -> None:
+    """Upload the current code as the bootstrap package for a rebuilt instance (live-safe).
+
+    Only AppArtifactKey changes. The running app, its .env and live credentials are untouched;
+    the instance must be stopped because the pointer change rewrites its user data.
+    """
+    if not approved:
+        raise ValueError("Confirm that publishing the application package was approved")
+    if not STACK_NAME.fullmatch(stack):
+        raise ValueError("Invalid stack name")
+    session = boto3.Session(profile_name=profile, region_name=REGION)
+    current = session.client("cloudformation").describe_stacks(StackName=stack)["Stacks"][0]
+    if current["StackStatus"] not in UPDATABLE_STACK_STATES:
+        raise RuntimeError("Stack is not in an updateable state")
+    values = {item["ParameterKey"]: item["ParameterValue"] for item in current["Parameters"]}
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in current["Outputs"]}
+    instance = session.client("ec2").describe_instances(InstanceIds=[outputs["InstanceId"]])
+    state = instance["Reservations"][0]["Instances"][0]["State"]["Name"]
+    if state != "stopped":
+        raise RuntimeError(f"Instance is {state}; stop it before changing the bootstrap package")
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    s3 = session.client("s3")
+    create_or_verify_bucket(s3, values["ArtifactBucket"], account_id, REGION)
+    build_frontend()
+    key = upload_artifact(s3, values["ArtifactBucket"], stack, "app", application_archive())
+    if key == values["AppArtifactKey"]:
+        print("The stack already points to this application package")
+        return
+    parameters = [
+        {"ParameterKey": name, "ParameterValue": key}
+        if name == "AppArtifactKey" else {"ParameterKey": name, "UsePreviousValue": True}
+        for name in values
+    ]
+    execute_reviewed_update(
+        session.client("cloudformation"), stack, parameters, review=assert_safe_mock_app_pointer_update
+    )
+    print(f"Application package published: {key}")
+
+
 def prepare_mock_release(profile: str, stack: str, data_recovery: str, confirmed: bool) -> None:
     if not confirmed:
         raise ValueError("Confirm that the isolated mock release was approved")
@@ -1619,6 +1658,8 @@ def main() -> None:
     live = subparsers.add_parser("push-live-credentials")
     live.add_argument("--approved-live-trading", action="store_true")
     live.add_argument("--keep-dry-run", action="store_true", help="Use real data but simulate orders")
+    publish = subparsers.add_parser("publish-app-artifact")
+    publish.add_argument("--approved-app-publish", action="store_true")
     detach = subparsers.add_parser("detach-mock-data")
     detach.add_argument("--data-recovery-point", required=True)
     detach.add_argument("--root-recovery-point", required=True)
@@ -1656,6 +1697,8 @@ def main() -> None:
         set_static_ips(args.profile, args.stack, args.count, args.approved_static_ip_change, args.preview)
     elif args.command == "push-live-credentials":
         push_live_credentials(args.profile, args.stack, args.approved_live_trading, args.keep_dry_run)
+    elif args.command == "publish-app-artifact":
+        publish_app_artifact(args.profile, args.stack, args.approved_app_publish)
     elif args.command == "detach-mock-data":
         detach_mock_data(
             args.profile, args.stack, args.data_recovery_point, args.root_recovery_point,

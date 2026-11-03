@@ -557,6 +557,68 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len([o for o in self.brokers[account].orders
                                   if o["transactionType"] == "SELL"]), 1)
 
+    async def test_max_affordable_sizing_buys_every_lot_the_balance_allows(self):
+        """User example: balance 15000, lot 65, premium 100 -> 6500/lot -> 2 lots = 130 qty."""
+        engine = self.manager.items["master"]
+        engine.cfg.max_affordable = True
+        engine.cfg.max_lots = 10
+        leg = algo_module.DayLeg("NIFTY", status="watching", or_high=23000, or_low=22900)
+        leg.option_ltp = 100
+        with patch.object(algo_module, "lot_size_for", return_value=65), \
+                patch.object(engine, "_balance", AsyncMock(return_value=15000)):
+            sizing = await engine._size_position(leg)
+            self.assertEqual((sizing["lots"], sizing["quantity"]), (2, 130))
+            leg.option_ltp = 230  # 14950/lot > 98% of 15000 -> cannot afford one lot
+            self.assertEqual((await engine._size_position(leg))["lots"], 0)
+            leg.option_ltp = 1
+            self.assertEqual((await engine._size_position(leg))["lots"], 10)  # max_lots cap
+
+    async def _rupee_exit(self, premium, profit, loss):
+        await self.dispatch_shared_signal()
+        for engine in self.manager.items.values():
+            engine.enabled = True  # rules must be editable while armed and holding
+        r = await self.http.post("/api/algo/exit-rules",
+                                 json={"profit_target_rs": profit, "stop_loss_rs": loss})
+        self.assertEqual(r.status_code, 200, r.text)
+        positions = {}
+        for account, engine in self.manager.items.items():
+            self.assertEqual((engine.cfg.profit_target_rs, engine.cfg.stop_loss_rs), (profit, loss))
+            pos = positions[account] = engine._position
+            pos.spot = None  # rupee exits must not depend on the index tick
+            pos.premium = premium
+            with account_scope(account), patch.object(algo_module.feed, "age", return_value=0):
+                await engine._manage_position()
+        return positions
+
+    async def test_profit_rupee_condition_exits_both_accounts(self):
+        positions = await self._rupee_exit(premium=200, profit=1000, loss=0)
+        for account, pos in positions.items():
+            self.assertGreaterEqual((200 - pos.entry_premium) * pos.quantity, 1000)
+            self.assertEqual(pos.exit_reason, "PROFIT_RS")
+            self.assertTrue(any(o["transactionType"] == "SELL" for o in self.brokers[account].orders))
+        self.assertEqual([b.net for b in self.brokers.values()], [0, 0])
+
+    async def test_loss_rupee_condition_exits_and_zero_means_off(self):
+        positions = await self._rupee_exit(premium=1, profit=0, loss=500)
+        for pos in positions.values():
+            self.assertEqual(pos.exit_reason, "LOSS_RS")
+        self.assertEqual([b.net for b in self.brokers.values()], [0, 0])
+
+    async def test_rupee_conditions_off_or_stale_premium_never_exit(self):
+        positions = await self._rupee_exit(premium=1, profit=0, loss=0)
+        self.assertTrue(all(not p.exit_reason for p in positions.values()))
+        engine = self.manager.items["master"]
+        engine.cfg.stop_loss_rs = 500
+        with account_scope("master"), patch.object(algo_module.feed, "age", return_value=None):
+            await engine._manage_position()
+        self.assertFalse(positions["master"].exit_reason)
+        self.assertTrue(all(b.net > 0 for b in self.brokers.values()))
+        r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": -1, "stop_loss_rs": 0})
+        self.assertEqual(r.status_code, 400)
+        r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": 1, "stop_loss_rs": 1},
+                                 headers={"X-Trading-Account": "child"})
+        self.assertEqual(r.status_code, 409)
+
     async def test_batch_retry_after_restart_uses_persisted_receipt(self):
         first = (await self.http.post("/api/trading/place", json=self.body)).json()
         for c in client_module._trading_clients.values():

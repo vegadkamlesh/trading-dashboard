@@ -441,6 +441,9 @@ export interface AlgoConfig {
   product_type: string;
   protective_sl: boolean;
   protective_sl_mult: number;
+  max_affordable: boolean;
+  profit_target_rs: number;
+  stop_loss_rs: number;
 }
 
 export interface AlgoLeg {
