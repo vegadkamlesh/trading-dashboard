@@ -683,6 +683,44 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pos.exit_reason, "LOSS_RS")
         self.assertEqual([b.net for b in self.brokers.values()], [0, 0])
 
+    async def _open_then_save(self, pnl_steps, profit, loss):
+        """Hold a live position, move its P&L, save rules mid-trade, and report exits per step."""
+        await self.dispatch_shared_signal()
+        engine = self.manager.items["master"]
+        engine.enabled = True
+        pos = engine._position
+        self.assertEqual(pos.execution_state, "open")
+
+        async def tick(pnl):
+            pos.spot = None
+            pos.premium = pos.entry_premium + pnl / pos.quantity
+            self.assertGreater(pos.premium, 0)
+            with account_scope("master"), patch.object(algo_module.feed, "age", return_value=0):
+                await engine._manage_position()
+            return pos.exit_reason
+
+        self.assertFalse(await tick(pnl_steps[0]), "no rule saved yet -> must hold")
+        r = await self.http.post("/api/algo/exit-rules", json={
+            "profit_target_rs": profit, "stop_loss_rs": loss, "accounts": ["master"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        return pos, [await tick(p) for p in pnl_steps]
+
+    async def test_scenario_profit_3000_then_save_1000_exits_immediately(self):
+        pos, reasons = await self._open_then_save([3000], profit=1000, loss=0)
+        self.assertEqual(reasons, ["PROFIT_RS"])
+        self.assertEqual(self.brokers["master"].net, 0)
+
+    async def test_scenario_loss_3000_then_save_1000_exits_immediately(self):
+        pos, reasons = await self._open_then_save([-3000], profit=0, loss=1000)
+        self.assertEqual(reasons, ["LOSS_RS"])
+        self.assertEqual(self.brokers["master"].net, 0)
+
+    async def test_scenario_profit_800_with_1000_rule_exits_when_it_reaches_1000(self):
+        pos, reasons = await self._open_then_save([800, 999, 1000], profit=1000, loss=0)
+        self.assertEqual(reasons[:2], ["", ""])  # 800 and 999 hold
+        self.assertEqual(reasons[2], "PROFIT_RS")
+        self.assertEqual(self.brokers["master"].net, 0)
+
     async def test_rupee_conditions_off_or_stale_premium_never_exit(self):
         positions = await self._rupee_exit(premium=1, profit=0, loss=0)
         self.assertTrue(all(not p.exit_reason for p in positions.values()))
