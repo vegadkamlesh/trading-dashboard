@@ -1100,19 +1100,32 @@ class AlgoEngine:
             return "LOSS_RS"
         return None
 
+    async def _maybe_rupee_exit_locked(self) -> Optional[str]:
+        """Exit now if the held position's fresh premium P&L meets a rupee rule. Caller holds the lock."""
+        pos = self._position
+        if (pos is None or pos.execution_state not in {"open", "attention"}
+                or pos.exit_order_id or pos.exit_correlation_id or time.time() < pos.next_exit_try_at):
+            return None
+        reason = self._rupee_exit_reason(pos)
+        if reason:
+            pnl = self._rupee_pnl(pos) or 0.0
+            self._log(f"{pos.index_key}: premium P&L Rs{pnl:,.0f} hit "
+                      f"{'profit' if reason == 'PROFIT_RS' else 'loss'} condition -> exit",
+                      level="warn", index=pos.index_key)
+            await self._exit_position_locked(pos, reason)
+        return reason
+
+    async def check_rupee_exit_now(self) -> Optional[str]:
+        """Apply freshly saved rupee rules at once instead of waiting for the next tick."""
+        if self._position is None:
+            return None
+        async with self._execution_lock:
+            return await self._maybe_rupee_exit_locked()
+
     async def _manage_position(self) -> None:
         pos = self._position
-        if (pos is not None and pos.execution_state in {"open", "attention"}
-                and not pos.exit_order_id and not pos.exit_correlation_id
-                and time.time() >= pos.next_exit_try_at):
-            reason = self._rupee_exit_reason(pos)
-            if reason:
-                pnl = self._rupee_pnl(pos) or 0.0
-                self._log(f"{pos.index_key}: premium P&L Rs{pnl:,.0f} hit "
-                          f"{'profit' if reason == 'PROFIT_RS' else 'loss'} condition -> exit",
-                          level="warn", index=pos.index_key)
-                await self._exit_position_locked(pos, reason)
-                return
+        if await self._maybe_rupee_exit_locked():
+            return
         if pos is None or pos.spot is None or pos.execution_state not in {"open", "attention"}:
             return
         if self.cfg.target_only and pos.dry_run and self.cfg.protective_sl:

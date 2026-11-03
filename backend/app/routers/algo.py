@@ -128,7 +128,15 @@ async def exit_rules(
         for account in targets:
             with account_scope(account):
                 engines.items[account].set_exit_rules(rules.profit_target_rs, rules.stop_loss_rs)
-    return {**algo.status(), "exitRules": exit_rules_by_account(), "savedFor": targets}
+    # A held position already past the new limit exits in this same request.
+    exited: Dict[str, str] = {}
+    for account in targets:
+        with account_scope(account):
+            reason = await engines.items[account].check_rupee_exit_now()
+        if reason:
+            exited[account] = reason
+    return {**algo.status(), "exitRules": exit_rules_by_account(), "savedFor": targets,
+            "exitTriggered": exited}
 
 
 @router.get("/journal")
