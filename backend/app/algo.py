@@ -1094,9 +1094,10 @@ class AlgoEngine:
         pnl = self._rupee_pnl(pos)
         if pnl is None:
             return None
-        if target and pnl >= target:
+        # Half-paisa tolerance so float noise (e.g. 1199.9999999) never skips an exact hit.
+        if target and pnl >= target - 0.005:
             return "PROFIT_RS"
-        if stop and pnl <= -stop:
+        if stop and pnl <= -stop + 0.005:
             return "LOSS_RS"
         return None
 

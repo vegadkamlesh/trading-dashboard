@@ -729,6 +729,35 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await tick(1000), "PROFIT_RS")
         self.assertEqual(self.brokers["master"].net, 0)
 
+    async def test_profit_1200_loss_0_never_exits_on_any_loss(self):
+        pos, body, sells, tick = await self._open_then_save(0, profit=1200, loss=0)
+        worst = -(pos.entry_premium - 0.05) * pos.quantity  # premium almost zero
+        for pnl in (-1200, -5000, worst):
+            self.assertEqual(await tick(pnl), "", pnl)
+        self.assertGreater(self.brokers["master"].net, 0)
+        self.assertEqual(await tick(1199), "")
+        self.assertEqual(await tick(1200), "PROFIT_RS")
+
+    async def test_profit_0_loss_1200_never_exits_on_any_profit(self):
+        pos, body, sells, tick = await self._open_then_save(0, profit=0, loss=1200)
+        for pnl in (1200, 50000, 500000):
+            self.assertEqual(await tick(pnl), "", pnl)
+        self.assertGreater(self.brokers["master"].net, 0)
+        self.assertEqual(await tick(-1199), "")
+        self.assertEqual(await tick(-1200), "LOSS_RS")
+        self.assertEqual(self.brokers["master"].net, 0)
+
+    async def test_both_zero_uses_old_logic_only(self):
+        pos, body, sells, tick = await self._open_then_save(0, profit=0, loss=0)
+        for pnl in (500000, -(pos.entry_premium - 0.05) * pos.quantity):
+            self.assertEqual(await tick(pnl), "", pnl)  # no rupee exit either way
+        self.assertGreater(self.brokers["master"].net, 0)
+        engine = self.manager.items["master"]
+        pos.spot = pos.target_spot  # old spot-target rule still fires
+        with account_scope("master"), patch.object(algo_module.feed, "age", return_value=0):
+            await engine._manage_position()
+        self.assertEqual((pos.exit_reason, self.brokers["master"].net), ("TARGET", 0))
+
     async def test_save_with_stale_premium_waits_for_fresh_tick(self):
         await self.dispatch_shared_signal()
         engine = self.manager.items["master"]
