@@ -478,6 +478,85 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(e._position is not None for e in self.manager.items.values()))
         self.assertEqual(master._signal_day, algo_module.now_ist().date().isoformat())
 
+    async def test_end_to_end_auto_arm_entry_target_exit_flat_on_both_accounts(self):
+        """Startup auto-arm -> stale-premium retry -> both entries -> target -> SELL -> broker flat."""
+        from app.routers import trading_accounts
+
+        auto = Settings(_env_file=None, dhan_client_id="master-id", dhan_access_token="data-token",
+                        dhan_master_trading_token="token-master-id",
+                        dhan_child_client_id="child-id", dhan_child_access_token="token-child-id",
+                        TRADING_DEFAULT_ACCOUNTS="master,child", algo_auto_arm=True)
+        self.patch.object(trading_accounts, "get_settings", return_value=auto)
+        self.patch.object(accounts, "_selected", ("master",))
+        algo_module.engines.entry_accounts = ()
+        for e in self.manager.items.values():
+            e.enabled = False
+            e.cfg.risk_pct = 10
+            e.cfg.max_capital_pct = 60
+            e.cfg.protective_sl = False
+            e.cfg.target_only = True
+            e.cfg.indices = ["NIFTY"]
+        # 1. Startup defaults arm both accounts through the broker IP preflight.
+        armed = await trading_accounts.apply_startup_defaults()
+        self.assertTrue(armed["ok"], armed)
+        self.assertEqual(algo_module.engines.entry_accounts, ("master", "child"))
+        self.assertTrue(any(path == "/ip/getIP" for b in self.brokers.values() for _, path, _ in b.calls))
+        # 2. Breakout before the option premium is fresh: no order, day not consumed.
+        #    Driven through the real entry gate, exactly as at 09:26 on 2026-11-03.
+        source = algo_module.DayLeg("NIFTY", status="watching", or_high=23000, or_low=22900, spot=23001)
+        master = self.manager.items["master"]
+        master._legs["NIFTY"] = source
+        snap = {"expiry": "2026-10-29", "underlyingLtp": 23001, "rows": [{
+            "strike": 23050, "ce": {"securityId": 47153, "ltp": 100},
+            "pe": {"securityId": 47154, "ltp": 100},
+        }]}
+        nifty = algo_module.get_index("NIFTY").sec_id
+        at_0926 = algo_module.datetime(2026, 11, 3, 9, 26, tzinfo=algo_module.IST)
+        with patch.object(algo_module, "now_ist", return_value=at_0926), \
+                patch.object(algo_module.chain_engine, "snapshot", return_value=snap), \
+                patch.object(algo_module.feed, "subscribe"), \
+                patch.object(algo_module.feed, "price", return_value=None), \
+                patch.object(algo_module.feed, "age",
+                             side_effect=lambda sid, seg=None: 0 if sid == nifty else None), \
+                account_scope("master"):
+            await master._look_for_entry()
+        self.assertTrue(all(not b.orders and not b.supers for b in self.brokers.values()))
+        # 3. Next fresh tick: real BUY orders reach both brokers.
+        with patch.object(algo_module, "now_ist", return_value=at_0926), \
+                patch.object(algo_module.chain_engine, "snapshot", return_value=snap), \
+                patch.object(algo_module.feed, "subscribe"), \
+                patch.object(algo_module.feed, "price", return_value=100), \
+                patch.object(algo_module.feed, "age", return_value=0), \
+                account_scope("master"):
+            await master._look_for_entry()
+        positions = {a: e._position for a, e in self.manager.items.items()}
+        self.assertTrue(all(p is not None and not p.dry_run for p in positions.values()), positions)
+        self.assertTrue(all(b.net > 0 for b in self.brokers.values()))
+        self.assertTrue(all(any(o["transactionType"] == "BUY" for o in b.orders + b.supers)
+                            for b in self.brokers.values()))
+        # 4. Target reached: each account sends a SELL for exactly its broker holding.
+        for account, engine in self.manager.items.items():
+            pos = positions[account]
+            self.assertEqual(pos.execution_state, "open")
+            pos.spot = pos.target_spot + 1
+            with account_scope(account), patch.object(algo_module.feed, "age", return_value=0):
+                await engine._manage_position()
+            self.assertEqual(pos.exit_reason, "TARGET")
+            sells = [o for o in self.brokers[account].orders if o["transactionType"] == "SELL"]
+            self.assertEqual([o["quantity"] for o in sells], [pos.quantity])
+        self.assertEqual([b.net for b in self.brokers.values()], [0, 0])
+        # 5. Broker flat -> position closed and journalled; no repeat SELL.
+        for account, engine in self.manager.items.items():
+            positions[account].entry_confirmed_ts = 0
+            with account_scope(account):
+                await engine.reconcile()
+                await engine.reconcile()
+            self.assertIsNone(engine._position)
+            self.assertEqual(engine._today_trades[-1]["exitReason"], "TARGET")
+            self.assertFalse(engine._today_trades[-1]["dryRun"])
+            self.assertEqual(len([o for o in self.brokers[account].orders
+                                  if o["transactionType"] == "SELL"]), 1)
+
     async def test_batch_retry_after_restart_uses_persisted_receipt(self):
         first = (await self.http.post("/api/trading/place", json=self.body)).json()
         for c in client_module._trading_clients.values():
