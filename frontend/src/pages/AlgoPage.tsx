@@ -153,7 +153,7 @@ export function AlgoPage() {
         }}>ALGO EXIT BOTH</button>
       </div>
       <NowAndNext st={st} />
-      <ExitRulesBox cfg={st.config} busy={busy} onCall={call} />
+      <ExitRulesBox st={st} selected={accounts?.selected ?? []} busy={busy} onCall={call} />
 
       <div className="grid gap-3 lg:grid-cols-2">
         {st.legs.map((leg) => <IndexCard key={leg.index} leg={leg} cfg={st.config} status={st} />)}
@@ -843,15 +843,24 @@ function EodPanel() {
 }
 
 // --------------------------------------------------------------------------- //
-//  rupee exit conditions (editable any time, applies to both accounts)
+//  rupee exit conditions (editable any time, saved to the ticked accounts)
 // --------------------------------------------------------------------------- //
-function ExitRulesBox({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; onCall: (p: string, b?: unknown, l?: string) => void }) {
-  const [profit, setProfit] = useState(String(cfg.profit_target_rs ?? 0));
-  const [loss, setLoss] = useState(String(cfg.stop_loss_rs ?? 0));
-  useEffect(() => { setProfit(String(cfg.profit_target_rs ?? 0)); }, [cfg.profit_target_rs]);
-  useEffect(() => { setLoss(String(cfg.stop_loss_rs ?? 0)); }, [cfg.stop_loss_rs]);
+const ACCOUNT_LABEL: Record<"master" | "child", string> = { master: "Master", child: "Child" };
+
+function ExitRulesBox({ st, selected, busy, onCall }: {
+  st: AlgoStatus; selected: Array<"master" | "child">; busy: boolean;
+  onCall: (p: string, b?: unknown, l?: string) => void;
+}) {
+  const rules = st.exitRules;
+  const first = selected[0] ?? "master";
+  const seed = rules?.[first] ?? { profit_target_rs: st.config.profit_target_rs ?? 0, stop_loss_rs: st.config.stop_loss_rs ?? 0 };
+  const [profit, setProfit] = useState(String(seed.profit_target_rs ?? 0));
+  const [loss, setLoss] = useState(String(seed.stop_loss_rs ?? 0));
+  useEffect(() => { setProfit(String(seed.profit_target_rs ?? 0)); }, [first, seed.profit_target_rs]);
+  useEffect(() => { setLoss(String(seed.stop_loss_rs ?? 0)); }, [first, seed.stop_loss_rs]);
   const p = Number(profit), l = Number(loss);
-  const valid = Number.isFinite(p) && p >= 0 && Number.isFinite(l) && l >= 0;
+  const valid = Number.isFinite(p) && p >= 0 && Number.isFinite(l) && l >= 0 && selected.length > 0;
+  const names = selected.map(a => ACCOUNT_LABEL[a]).join(" + ");
   return (
     <div className="card flex flex-wrap items-end gap-3">
       <div className="text-sm font-semibold">Exit conditions (har account ka apna P&amp;L)</div>
@@ -866,11 +875,21 @@ function ExitRulesBox({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; o
           onChange={(e) => setLoss(e.target.value)} />
       </label>
       <button className="btn" style={{ background: "#0284c7" }} disabled={busy || !valid}
-        onClick={() => onCall("/api/algo/exit-rules", { profit_target_rs: p, stop_loss_rs: l },
-          "Exit conditions save ho gaye (dono accounts)")}>Save</button>
-      <span className="text-[10px] text-slate-400">
-        Active: profit ≥ ₹{cfg.profit_target_rs || "off"} · loss ≤ −₹{cfg.stop_loss_rs || "off"}.
-        Live option premium P&amp;L (charges ke bina) par MARKET exit; armed/position ke dauran bhi badal sakte ho.
+        onClick={() => onCall("/api/algo/exit-rules", { profit_target_rs: p, stop_loss_rs: l, accounts: selected },
+          `Exit conditions save ho gaye: ${names}`)}>
+        {selected.length ? `Save → ${names}` : "Upar account tick karo"}
+      </button>
+      <div className="flex flex-col text-[11px] text-slate-300">
+        {(["master", "child"] as const).map(a => {
+          const r = rules?.[a];
+          return <span key={a}>
+            <b>{ACCOUNT_LABEL[a]}:</b> profit ≥ ₹{r?.profit_target_rs || "off"} · loss ≤ −₹{r?.stop_loss_rs || "off"}
+          </span>;
+        })}
+      </div>
+      <span className="w-full text-[10px] text-slate-400">
+        Save sirf upar tick kiye accounts par lagta hai. Live option premium P&amp;L (charges ke bina) par MARKET exit;
+        armed/position ke dauran bhi badal sakte ho.
       </span>
     </div>
   );

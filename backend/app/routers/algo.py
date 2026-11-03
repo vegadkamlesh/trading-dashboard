@@ -50,6 +50,14 @@ class ConfigPatch(BaseModel):
 class ExitRules(BaseModel):
     profit_target_rs: float
     stop_loss_rs: float
+    # Accounts to apply to; default = currently ticked trading accounts.
+    accounts: Optional[List[str]] = None
+
+
+def exit_rules_by_account() -> Dict[str, Dict[str, float]]:
+    return {account: {"profit_target_rs": engine.cfg.profit_target_rs,
+                      "stop_loss_rs": engine.cfg.stop_loss_rs}
+            for account, engine in engines.items.items()}
 
 
 @router.get("/status")
@@ -58,6 +66,7 @@ async def status(_session: str = Depends(require_session)) -> Dict[str, Any]:
         **algo.status(),
         "sharedEnabled": any(engine.enabled for engine in engines.items.values()),
         "sharedEntryAccounts": list(engines.entry_accounts),
+        "exitRules": exit_rules_by_account(),
     }
 
 
@@ -110,15 +119,16 @@ async def exit_rules(
     _session: str = Depends(require_session),
     _csrf: None = Depends(require_csrf),
 ):
-    """Rupee profit/loss exits for BOTH accounts; allowed while armed or holding a position."""
-    if current_account() != "master":
-        raise HTTPException(409, "Shared algo configuration is edited from Master Dhan.")
-    from ..accounts import account_scope
+    """Rupee profit/loss exits for the chosen (default: ticked) accounts; allowed while armed or holding."""
+    from ..accounts import ACCOUNT_IDS, account_scope, selected_accounts
+    targets = rules.accounts if rules.accounts is not None else list(selected_accounts())
+    if not targets or len(set(targets)) != len(targets) or any(a not in ACCOUNT_IDS for a in targets):
+        raise HTTPException(400, "Tick at least one valid account (master/child) to save exit conditions.")
     async with engines.selection_lock:
-        for account, engine in engines.items.items():
+        for account in targets:
             with account_scope(account):
-                engine.set_exit_rules(rules.profit_target_rs, rules.stop_loss_rs)
-    return algo.status()
+                engines.items[account].set_exit_rules(rules.profit_target_rs, rules.stop_loss_rs)
+    return {**algo.status(), "exitRules": exit_rules_by_account(), "savedFor": targets}
 
 
 @router.get("/journal")

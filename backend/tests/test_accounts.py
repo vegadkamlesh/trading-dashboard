@@ -394,15 +394,82 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(child.entry_correlation_id)
         self.assertEqual(sum(method == "POST" for method, _, _ in self.brokers["child"].calls), 1)
 
-    async def test_selection_and_mode_changes_blocked_by_other_account_position(self):
+    async def test_selection_allowed_with_position_but_mode_change_blocked(self):
         from tests.test_trading import position
         self.manager.items["child"]._position = position()
         r = await self.http.post("/api/trading/selection", json={"accounts": ["master"]})
-        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNotNone(self.manager.items["child"]._position)  # exit management untouched
         runtime._dry_run = True
         r = await self.http.post("/api/settings/dry-run", json={"value": False})
         self.assertEqual(r.status_code, 409)
         self.assertTrue(runtime.is_dry_run())
+
+    def _fake_preflight(self, ip_ok):
+        for account, engine in self.manager.items.items():
+            async def preflight(account=account):
+                return {"ok": ip_ok[account], "reason": f"{account} ip not whitelisted"}
+            self.patch.object(engine, "_preflight_ip", new=preflight)
+
+    async def test_ticks_change_live_while_armed(self):
+        ip_ok = {"master": True, "child": True}
+        self._fake_preflight(ip_ok)
+        for engine in self.manager.items.values():
+            engine.enabled = True
+        master, child = self.manager.items["master"], self.manager.items["child"]
+        # Untick child: child stops new entries, master keeps running.
+        r = await self.http.post("/api/trading/selection", json={"accounts": ["master"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(algo_module.engines.entry_accounts, ("master",))
+        self.assertTrue(master.enabled)
+        self.assertFalse(child.enabled)
+        # Untick master, tick child: master still drives the signal but places no entry.
+        r = await self.http.post("/api/trading/selection", json={"accounts": ["child"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(algo_module.engines.entry_accounts, ("child",))
+        self.assertTrue(master.enabled and child.enabled)
+        # A failing IP check refuses the add and leaves everything as it was.
+        ip_ok["master"] = False
+        r = await self.http.post("/api/trading/selection", json={"accounts": ["master", "child"]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("not whitelisted", r.text)
+        self.assertEqual(accounts.selected_accounts(), ("child",))
+        self.assertEqual(algo_module.engines.entry_accounts, ("child",))
+        ip_ok["master"] = True
+        r = await self.http.post("/api/trading/selection", json={"accounts": ["master", "child"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(algo_module.engines.entry_accounts, ("master", "child"))
+        # Untick everything = algo off for new entries.
+        r = await self.http.post("/api/trading/selection", json={"accounts": []})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(any(e.enabled for e in self.manager.items.values()))
+
+    async def test_exit_rules_save_only_to_ticked_accounts_and_survive_arm(self):
+        self._fake_preflight({"master": True, "child": True})
+        master, child = self.manager.items["master"], self.manager.items["child"]
+        accounts.select_accounts(["master"])
+        r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": 1000, "stop_loss_rs": 500})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["savedFor"], ["master"])
+        self.assertEqual((master.cfg.profit_target_rs, master.cfg.stop_loss_rs), (1000, 500))
+        self.assertEqual((child.cfg.profit_target_rs, child.cfg.stop_loss_rs), (0, 0))
+        r = await self.http.post("/api/algo/exit-rules", headers={"X-Trading-Account": "child"},
+                                 json={"profit_target_rs": 700, "stop_loss_rs": 300, "accounts": ["child"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["exitRules"]["child"], {"profit_target_rs": 700, "stop_loss_rs": 300})
+        self.assertEqual(r.json()["exitRules"]["master"], {"profit_target_rs": 1000, "stop_loss_rs": 500})
+        # Shared ARM copies strategy config to child but keeps child's own rupee exits.
+        accounts.select_accounts(["master", "child"])
+        for engine in self.manager.items.values():
+            engine.enabled = False
+        r = await self.http.post("/api/algo/arm")
+        self.assertTrue(r.json()["ok"], r.text)
+        self.assertEqual((child.cfg.profit_target_rs, child.cfg.stop_loss_rs), (700, 300))
+        self.assertEqual((master.cfg.profit_target_rs, master.cfg.stop_loss_rs), (1000, 500))
+        status = (await self.http.get("/api/algo/status")).json()
+        self.assertEqual(status["exitRules"]["child"]["profit_target_rs"], 700)
+        r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": 1, "stop_loss_rs": 1, "accounts": []})
+        self.assertEqual(r.status_code, 400)
 
     async def test_data_quotes_do_not_touch_child_data_endpoints(self):
         await self.http.get("/api/account/positions", headers={"X-Trading-Account": "child"})
@@ -627,9 +694,9 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(b.net > 0 for b in self.brokers.values()))
         r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": -1, "stop_loss_rs": 0})
         self.assertEqual(r.status_code, 400)
-        r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": 1, "stop_loss_rs": 1},
-                                 headers={"X-Trading-Account": "child"})
-        self.assertEqual(r.status_code, 409)
+        r = await self.http.post("/api/algo/exit-rules", json={"profit_target_rs": 1, "stop_loss_rs": 1,
+                                                                "accounts": ["bogus"]})
+        self.assertEqual(r.status_code, 400)
 
     async def test_batch_retry_after_restart_uses_persisted_receipt(self):
         first = (await self.http.post("/api/trading/place", json=self.body)).json()

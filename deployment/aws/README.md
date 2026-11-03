@@ -180,8 +180,11 @@ account at `floor(balance x 98% / (premium x lot size))` lots. `Max lots`,
 per-order freeze quantity (`ALGO_FREEZE_QTY`, default NIFTY 1800, BANKNIFTY 900,
 SENSEX 1000), because a larger single order is rejected outright. Example: balance
 15000, lot 65, premium 100 -> 2 lots (130 qty). The Algo tab "Exit conditions"
-box sets a profit and a stop-loss in rupees (0 = off) for both accounts via
-`POST /api/algo/exit-rules`; it can be changed while armed or holding. Each
+box sets a profit and a stop-loss in rupees (0 = off) for the ticked accounts
+(`accounts` in `POST /api/algo/exit-rules`; each account keeps its own values,
+also across ARM); it can be changed while armed or holding. The Master/Child
+ticks can also change while armed: unticking stops new entries for that
+account (its open position is still managed), ticking joins after the IP check. Each
 account exits with a MARKET SELL when its own gross premium P&L reaches
 `+profit` (`PROFIT_RS`) or `-loss` (`LOSS_RS`), checked only on a fresh (<5 s)
 option price. The spot target and the 15:12 time exit still apply.

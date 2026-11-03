@@ -34,7 +34,8 @@ export function TradingAccountBar() {
     </div>
     <p className="mt-1 text-slate-400">
       Checkboxes select NEW entries, not the viewed account. Both ON sends one request per account.
-      Disarm and finish tracked positions before changing recipients. Existing exits remain active.
+      Works while armed: untick stops new entries for that account (open position exits continue);
+      tick joins the armed algo after its IP check. Algo exit conditions save to ticked accounts.
     </p>
     {error && <p role="alert" className="text-red-300">Account sync failed: {error}. Do not submit until refreshed.</p>}
     {data?.accounts.filter(a => a.error).map(a =>

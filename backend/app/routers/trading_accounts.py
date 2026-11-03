@@ -51,16 +51,58 @@ async def status():
     }
 
 
+def follow_master_config(account: AccountId) -> None:
+    """Copy the shared strategy config to a follower, keeping its own rupee exit rules."""
+    engine = engines.items[account]
+    if account == "master":
+        return
+    own = (engine.cfg.profit_target_rs, engine.cfg.stop_loss_rs)
+    engine.cfg = deepcopy(engines.items["master"].cfg)
+    engine.cfg.profit_target_rs, engine.cfg.stop_loss_rs = own
+
+
 @router.post("/selection", dependencies=[Depends(require_csrf)])
 async def selection(body: Selection):
+    """Change recipients; allowed while ARMED or holding.
+
+    Unticked accounts stop taking NEW entries at once (open-position management and
+    exits continue). Newly ticked accounts join the armed run only after their IP preflight.
+    """
     async with engines.selection_lock, AsyncExitStack() as stack:
         for engine in engines.items.values():
             await stack.enter_async_context(engine._execution_lock)
-        if any(engine._position is not None or engine.enabled for engine in engines.items.values()):
-            raise HTTPException(409, "Disarm the algo and finish tracked positions before changing recipients. Existing exits remain available.")
+        previous = list(selected_accounts())
         select_accounts(body.accounts)
-        engines.entry_accounts = ()
-        logger.info("selection_changed recipients=%s dry_run=%s", selected_accounts(), runtime.is_dry_run())
+        new = selected_accounts()
+        if not any(engine.enabled for engine in engines.items.values()):
+            engines.entry_accounts = ()
+            logger.info("selection_changed recipients=%s dry_run=%s", new, runtime.is_dry_run())
+            return await status()
+        added = [a for a in new if a not in engines.entry_accounts]
+        if not runtime.is_dry_run():
+            for account in added:
+                with account_scope(account):
+                    check = await engines.items[account]._preflight_ip()
+                if not check["ok"]:
+                    select_accounts(previous)
+                    engines.items[account]._last_error = check["reason"]
+                    raise HTTPException(409, f"{account_name(account)} not added (algo stays as before): {check['reason']}")
+        for account in ACCOUNT_IDS:
+            engine = engines.items[account]
+            with account_scope(account):
+                if account in added:
+                    follow_master_config(account)
+                    engine._last_error = None
+                enabled = account in new or (account == "master" and bool(new))
+                if enabled and not engine.enabled:
+                    engine.enabled = True
+                    engine._log("Algo recipient added while armed: new entries ON")
+                elif not enabled and engine.enabled:
+                    engine.disarm("recipient unticked - new entries stopped")
+                engine._persist()
+        engines.entry_accounts = new
+        logger.info("selection_changed_armed recipients=%s added=%s dry_run=%s",
+                    new, ",".join(added) or "none", runtime.is_dry_run())
     return await status()
 
 
@@ -202,8 +244,7 @@ async def algo_action(body: AlgoAction):
                     for account in ACCOUNT_IDS:
                         with account_scope(account):
                             engine = engines.items[account]
-                            if account != "master":
-                                engine.cfg = deepcopy(engines.items["master"].cfg)
+                            follow_master_config(account)
                             engine.enabled = account in ready or (account == "master" and bool(ready))
                             engine._log("Shared algo recipients ready=" + ",".join(ready))
                             engine._persist()

@@ -548,6 +548,7 @@ export interface AlgoStatus {
   enabled: boolean;
   sharedEnabled: boolean;
   sharedEntryAccounts: Array<"master" | "child">;
+  exitRules?: Record<"master" | "child", { profit_target_rs: number; stop_loss_rs: number }>;
   phase: string;
   phaseLabel: string;
   dryRun: boolean;
