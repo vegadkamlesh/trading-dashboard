@@ -341,6 +341,7 @@ def assert_safe_changes(
         "AlertSubscription": ("Endpoint", "AlertFunction.Arn", "AlertFunction"),
         "DataAttachment": ("InstanceId", "DashboardInstance", "DashboardInstance"),
         "StaticAddressAssociation": ("InstanceId", "DashboardInstance", "DashboardInstance"),
+        "SecondaryNetworkInterfaceAttachment": ("InstanceId", "DashboardInstance", "DashboardInstance"),
         "MonitorInvocationPermission": ("SourceArn", "MonitorSchedule.Arn", "MonitorSchedule"),
     }
     for name, resource in resources.items():
@@ -805,6 +806,7 @@ def assert_safe_mock_app_pointer_update(changes: list[dict]) -> None:
         "MonitorRole": {("Policies", "ResourceReference", "DashboardInstance")},
         "MonitorSchedule": {("Targets", "ResourceAttribute", "MonitorFunction.Arn")},
         "OperatorRole": {("Policies", "ResourceReference", "DashboardInstance")},
+        "OperatorUserPolicy": {("PolicyDocument", "ResourceAttribute", "OperatorRole.Arn")},
         "RecoverySafetyStop": {
             ("Target", "ResourceReference", "DashboardInstance"),
             ("Target", "ResourceAttribute", "SchedulerRole.Arn"),
@@ -812,6 +814,7 @@ def assert_safe_mock_app_pointer_update(changes: list[dict]) -> None:
         "RootDiskAlarm": {("Dimensions", "ResourceReference", "DashboardInstance")},
         "SchedulerRole": {("Policies", "ResourceReference", "DashboardInstance")},
         "StaticAddressAssociation": {("InstanceId", "ResourceReference", "DashboardInstance")},
+        "SecondaryNetworkInterfaceAttachment": {("InstanceId", "ResourceReference", "DashboardInstance")},
         "WeekdayCostReport": {
             ("Target", "ResourceAttribute", "CostReportFunction.Arn"),
             ("Target", "ResourceAttribute", "CostReportSchedulerRole.Arn"),

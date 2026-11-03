@@ -236,6 +236,18 @@ class CloudHelpersTest(unittest.TestCase):
             ],
         }}
         deploy.assert_safe_mock_app_pointer_update([instance, attachment])
+        secondary = {"ResourceChange": {
+            "LogicalResourceId": "SecondaryNetworkInterfaceAttachment", "Action": "Modify",
+            "Replacement": "Conditional", "Details": [
+                {"Target": {"Name": "InstanceId", "RequiresRecreation": "Always"},
+                 "ChangeSource": "ResourceReference", "CausingEntity": "DashboardInstance"},
+            ],
+        }}
+        deploy.assert_safe_mock_app_pointer_update([instance, attachment, secondary])
+        secondary_bad = json.loads(json.dumps(secondary))
+        secondary_bad["ResourceChange"]["Details"][0]["CausingEntity"] = "SecondaryNetworkInterface"
+        with self.assertRaises(RuntimeError):
+            deploy.assert_safe_mock_app_pointer_update([instance, secondary_bad])
         unrelated = {"ResourceChange": {
             "LogicalResourceId": "DataVolume", "Action": "Modify", "Replacement": "False",
             "Details": [{"Target": {"Name": "Size"}, "ChangeSource": "DirectModification"}],
