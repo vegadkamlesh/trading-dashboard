@@ -80,7 +80,7 @@ class AlgoStore:
     def append_event(self, event: Dict[str, Any], day: Optional[str] = None) -> None:
         day = day or date.today().isoformat()
         event = {**event, "ts": event.get("ts") or time.time(),
-                 "time": event.get("time") or datetime.now().strftime("%H:%M:%S")}
+                 "time": event.get("time") or datetime.now().strftime("%H:%M:%S.%f")[:-3]}
         try:
             with open(self._path(self._journal_name(day)), "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(event, default=str) + "\n")

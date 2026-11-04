@@ -50,6 +50,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.client.get_order_by_correlation = AsyncMock()
         self.client.get_order_book = AsyncMock(return_value=[])
         self.client.get_super_orders = AsyncMock(return_value=[])
+        self.client.get_fund_limit = AsyncMock(return_value={"availabelBalance": 100000})
         self.client.cancel_order = AsyncMock()
         self.client.place_order = AsyncMock(return_value={"orderId": "exit-1", "orderStatus": "TRANSIT"})
         self.client_patch = patch.object(algo_module, "get_dhan_client", return_value=self.client)

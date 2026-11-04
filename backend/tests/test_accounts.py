@@ -562,9 +562,9 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         }]}
         originals = {a: e._size_position for a, e in self.manager.items.items()}
         def reverting(account):
-            async def size(leg):
+            async def size(leg, **kwargs):
                 leg.spot = 22999.5
-                return await originals[account](leg)
+                return await originals[account](leg, **kwargs)
             return size
         for account, engine in self.manager.items.items():
             engine._size_position = reverting(account)
@@ -680,22 +680,51 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(engine, "_balance", AsyncMock(return_value=15000)):
             sizing = await engine._size_position(leg)
             self.assertEqual((sizing["lots"], sizing["quantity"]), (2, 130))
-            leg.option_ltp = 230  # 14950/lot > 98% of 15000 -> cannot afford one lot
+            # 2026-11-04 child reject: 10% buffer -> only 90% of balance is usable.
+            with patch.object(engine, "_balance", AsyncMock(return_value=14000)):
+                self.assertEqual((await engine._size_position(leg))["lots"], 1)  # 12600/6500
+            self.assertEqual((await engine._size_position(leg, balance=14500))["lots"], 2)
+            self.assertIn("90% usable", sizing["reason"])
+            leg.option_ltp = 210  # 13650/lot > 90% of 15000 -> cannot afford one lot
             self.assertEqual((await engine._size_position(leg))["lots"], 0)
-            leg.option_ltp = 1  # 14700 usable / 65 -> 226 lots: max_lots=10 must NOT cap it
+            leg.option_ltp = 1  # 13500 usable / 65 -> 207 lots: max_lots=10 must NOT cap it
             sizing = await engine._size_position(leg)
             # Only the exchange freeze bounds a single order: NIFTY 1800 -> 27 whole lots.
             self.assertEqual((sizing["lots"], sizing["quantity"]), (27, 1755))
             self.assertIn("freeze", sizing["reason"])
         for key, lot, premium, balance, expected in (
-                ("BANKNIFTY", 30, 100, 50000, 16),   # 49000 / 3000 -> 16, under freeze 900 (30 lots)
-                ("SENSEX", 20, 100, 50000, 24),      # 49000 / 2000 -> 24, under freeze 1000 (50 lots)
-                ("BANKNIFTY", 30, 10, 500000, 30)):  # 163 affordable, freeze 900 -> 30 lots
+                ("BANKNIFTY", 30, 100, 50000, 15),   # 45000 / 3000 -> 15, under freeze 900 (30 lots)
+                ("SENSEX", 20, 100, 50000, 22),      # 45000 / 2000 -> 22, under freeze 1000 (50 lots)
+                ("BANKNIFTY", 30, 10, 500000, 30)):  # 1500 affordable, freeze 900 -> 30 lots
             leg = algo_module.DayLeg(key, status="watching", or_high=1, or_low=0)
             leg.option_ltp = premium
             with patch.object(algo_module, "lot_size_for", return_value=lot), \
                     patch.object(engine, "_balance", AsyncMock(return_value=balance)):
                 self.assertEqual((await engine._size_position(leg))["lots"], expected, key)
+
+    async def test_strikes_are_decided_from_or_levels_so_warm_contract_is_traded(self):
+        # 2026-11-04: strike was re-picked from live spot at breakout, so a contract never
+        # warmed before had no fresh premium and entry waited a tick.
+        engine = self.manager.items["master"]
+        engine.cfg.strike_offset = 1
+        rows = [{"strike": k, "ce": {"securityId": 1000 + k // 50, "ltp": 100},
+                 "pe": {"securityId": 2000 + k // 50, "ltp": 100}} for k in range(22700, 23401, 50)]
+        snap = {"expiry": "2026-10-29", "underlyingLtp": 22950, "rows": rows}
+        leg = algo_module.DayLeg("NIFTY", status="watching", or_high=23000, or_low=22900, spot=22950)
+        with patch.object(algo_module.chain_engine, "snapshot", return_value=snap), \
+                patch.object(algo_module.feed, "subscribe") as sub:
+            await engine._prepare_contract(leg)
+            warmed = {c.args[0] for c in sub.call_args_list}
+            self.assertEqual(warmed, {1000 + 23050 // 50, 2000 + 22850 // 50})
+            leg.spot = 23001.5
+            await engine._prepare_contract(leg, "CALL")
+            self.assertEqual((leg.strike, leg.security_id), (23050, 1000 + 23050 // 50))
+            leg.spot = 22898
+            await engine._prepare_contract(leg, "PUT")
+            self.assertEqual((leg.strike, leg.security_id), (22850, 2000 + 22850 // 50))
+            leg.spot = 23200  # far past the level (late arm): fall back to live spot
+            await engine._prepare_contract(leg, "CALL")
+            self.assertEqual(leg.strike, 23250)
 
     async def _rupee_exit(self, premium, profit, loss):
         await self.dispatch_shared_signal()

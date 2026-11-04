@@ -121,6 +121,48 @@ class TelegramTests(unittest.TestCase):
         self.assertTrue(all(call.args[0] >= 3.1 for call in wait.call_args_list))
         self.assertNotIn("offline-test-token", "\n".join(logs.output))
 
+    def test_algo_lines_carry_short_detail_other_records_stay_metadata_only(self):
+        service = self.service()
+        service._thread = MagicMock()
+        service._thread.is_alive.return_value = True
+        handler = NotificationHandler(service)
+
+        def record(name, level, msg, **extra):
+            rec = logging.LogRecord(name, level, "", 0, msg, None, None)
+            for key, value in extra.items():
+                setattr(rec, key, value)
+            handler.emit(rec)
+            return service._queue.get_nowait()[1]
+
+        entry = record("dhan.algo", logging.INFO, "x", telegram_event="algo_entry",
+                       telegram_account="child", telegram_mode="LIVE", telegram_level="success",
+                       telegram_detail="Entry confirmed: SENSEX 76800 PE 100 units @ 363.55")
+        self.assertIn("✅", entry)
+        self.assertIn("child LIVE", entry)
+        self.assertIn("76800 PE 100 units @ 363.55", entry)
+        reject = record("dhan.algo", logging.ERROR, "x", telegram_event="algo_update",
+                        telegram_account="child", telegram_mode="LIVE", telegram_level="error",
+                        telegram_detail="Entry REJECTED: insufficient funds; ACTION: check Dhan")
+        self.assertIn("🚨", reject)
+        self.assertIn("insufficient funds", reject)
+        other = record("dhan.client", logging.WARNING, "private broker payload")
+        self.assertNotIn("private broker payload", other)
+        self.assertIn(EVENTS["warning"], other)
+
+    def test_burst_of_events_is_sent_as_one_message(self):
+        service = self.service()
+        for i in range(3):
+            service._queue.put_nowait((time.monotonic(), f"line-{i}"))
+        sent = []
+        with patch.object(service, "_send", side_effect=lambda text: sent.append(text) or True):
+            import threading
+            worker = threading.Thread(target=service._run)
+            worker.start()
+            service._queue.join()
+            service._stop.set()
+            worker.join(timeout=5)
+        self.assertEqual(sent, ["line-0\n\nline-1\n\nline-2"])
+
     def test_worker_is_nonblocking_idempotent_and_stops(self):
         service = TelegramNotifier()
         sent_at = []
@@ -138,9 +180,10 @@ class TelegramTests(unittest.TestCase):
         self.assertIs(service._thread, worker)
         self.assertTrue(service.publish("test"))
         service._queue.join()
-        self.assertEqual(service.status()["sent"], 2)
+        # startup + test were queued together, so they go out as one batched message.
+        self.assertEqual(service.status()["sent"], 1)
         service.stop()
-        self.assertEqual(len(sent_at), 3)
+        self.assertEqual(len(sent_at), 2)
         self.assertTrue(all(second - first >= 3.1 for first, second in zip(sent_at, sent_at[1:])))
         self.assertFalse(service.status()["running"])
         self.assertFalse(service.publish("test"))

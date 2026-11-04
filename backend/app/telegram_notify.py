@@ -6,13 +6,18 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import Settings, get_settings
 
 logger = logging.getLogger("dhan.telegram")
+
+IST = timezone(timedelta(hours=5, minutes=30))
+DETAIL_MAX = 400
+BATCH_MAX_CHARS = 3500   # Telegram hard limit is 4096
+LEVEL_ICONS = {"success": "✅", "info": "ℹ️", "warn": "⚠️", "warning": "⚠️", "error": "🚨"}
 
 EVENTS = {
     "startup": "Backend starting; verify readiness in dashboard",
@@ -54,10 +59,14 @@ class NotificationHandler(logging.Handler):
             event = "error" if record.levelno >= logging.ERROR else "warning"
         elif event == "algo_update" and record.levelno >= logging.WARNING:
             event = "error" if record.levelno >= logging.ERROR else "warning"
-        # Never export record messages, arguments, exception text, URLs or payloads.
+        # Only algo journal lines carry a detail: trading facts (index, strike, qty, price,
+        # P&L, broker reason). Other records stay metadata-only.
+        detail = getattr(record, "telegram_detail", "") if event.startswith("algo_") or \
+            getattr(record, "telegram_event", None) == "algo_update" else ""
+        level = getattr(record, "telegram_level", "")
         account = getattr(record, "telegram_account", "")
         mode = getattr(record, "telegram_mode", "")
-        self.service.publish(event, account=account, mode=mode)
+        self.service.publish(event, account=account, mode=mode, detail=detail, level=level)
 
 
 class TelegramNotifier:
@@ -105,7 +114,8 @@ class TelegramNotifier:
                 "lastError": self._last_error,
             }
 
-    def publish(self, event: str, *, account: str = "", mode: str = "") -> bool:
+    def publish(self, event: str, *, account: str = "", mode: str = "", detail: str = "",
+                level: str = "") -> bool:
         if event not in EVENTS:
             raise ValueError("Unknown Telegram notification event")
         if (not self._settings or not self._settings.telegram_enabled or self._stop.is_set()
@@ -114,25 +124,31 @@ class TelegramNotifier:
         now = time.monotonic()
         account = account if account in ("master", "child") else ""
         mode = mode if mode in ("DRY-RUN", "LIVE", "PIN REQUIRED", "PIN SKIPPED") else ""
+        detail = " ".join(str(detail or "").split())[:DETAIL_MAX]
         with self._lock:
             if event in ("warning", "error", "api_error", "login_failed"):
-                key = (event, account)
+                key = (event, account, detail[:80])
                 previous = self._recent.get(key)
                 if previous is not None and now - previous < 60:
                     self._suppressed += 1
                     return False
                 self._recent[key] = now
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        text = f"Trading dashboard | {timestamp}\n{EVENTS[event]}"
+        if detail:
+            icon = LEVEL_ICONS.get(level) or ("🚨" if event == "error" else "⚠️" if event == "warning" else "ℹ️")
+            stamp = datetime.now(IST).strftime("%H:%M:%S")
+            text = f"{icon} {stamp} {account or '-'} {mode}\n{detail}".strip()
+        else:
+            timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            text = f"Trading dashboard | {timestamp}\n{EVENTS[event]}"
         if event == "heartbeat":
             snapshot = self.status()
             text += (
                 f"\nSent={snapshot['sent']} failed={snapshot['failed']}"
                 f" dropped={snapshot['dropped']} grouped={snapshot['suppressed']}"
             )
-        if account:
+        if account and not detail:
             text += f"\nAccount: {account}"
-        if mode:
+        if mode and not detail:
             text += f"\nMode: {mode}"
         try:
             self._queue.put_nowait((now, text))
@@ -222,6 +238,7 @@ class TelegramNotifier:
             raise RuntimeError("Telegram worker started without settings")
         heartbeat_at = time.monotonic() + settings.telegram_heartbeat_seconds
         next_send_at = 0.0
+        carry: tuple[float, str] | None = None
         try:
             while True:
                 if not self._stop.is_set() and time.monotonic() >= heartbeat_at:
@@ -233,11 +250,26 @@ class TelegramNotifier:
                     )
                     heartbeat_at = time.monotonic() + settings.telegram_heartbeat_seconds
                 try:
-                    created_at, text = self._queue.get(timeout=0.2)
+                    created_at, text = carry if carry else self._queue.get(timeout=0.2)
+                    fresh_get = carry is None
+                    carry = None
                 except queue.Empty:
                     if self._stop.is_set():
                         break
                     continue
+                # Burst (e.g. breakout -> order -> fill): send pending lines as ONE message
+                # instead of one message per 3 s.
+                taken = 1 if fresh_get else 0
+                while not self._stop.is_set():
+                    try:
+                        more = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    taken += 1
+                    if len(text) + len(more[1]) + 2 > BATCH_MAX_CHARS:
+                        carry = more
+                        break
+                    text = f"{text}\n\n{more[1]}"
                 try:
                     delay = max(0.0, next_send_at - time.monotonic())
                     # Preserve pacing during graceful shutdown, too.
@@ -252,7 +284,8 @@ class TelegramNotifier:
                         self._send(text)
                     next_send_at = time.monotonic() + self.SEND_INTERVAL_SECONDS
                 finally:
-                    self._queue.task_done()
+                    for _ in range(taken):
+                        self._queue.task_done()
                 if self._stop.is_set():
                     # Flush at most the shutdown message, not minutes of stale backlog.
                     discarded = 0

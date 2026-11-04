@@ -62,7 +62,7 @@ MAX_PRICE_AGE = 5.0
 # Pause before re-checking a breakout whose entry aborted before any order was sent.
 SIGNAL_RETRY_COOLDOWN = 3.0
 # Max-affordable sizing keeps this share of balance usable; the rest covers charges and MARKET slippage.
-AFFORDABLE_BALANCE_PCT = 98.0
+AFFORDABLE_BALANCE_PCT = 90.0   # 10% buffer for premium move + Dhan market-order margin
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 
 # Order-placement retry policy. `_evaluate` runs on EVERY feed tick, so without a
@@ -285,6 +285,8 @@ class AlgoEngine:
             "telegram_event": notification,
             "telegram_account": self.account_id or current_account(),
             "telegram_mode": "DRY-RUN" if runtime.is_dry_run() else "LIVE",
+            "telegram_detail": msg.split(" ", 1)[-1],
+            "telegram_level": level,
         })
 
     # ------------------------------------------------------------- lifecycle
@@ -1006,7 +1008,12 @@ class AlgoEngine:
 
         sides = (direction,) if direction in ("CALL", "PUT") else ("CALL", "PUT")
         for side in sides:
-            strike = self._pick_strike(spot, step, side, self.cfg.strike_offset)
+            # Decide the strike from the breakout level itself, so the contract warmed at
+            # OR lock is exactly the one traded and its premium is already streaming.
+            # Fall back to live spot only if price is already far past the level.
+            level = leg.or_high if side == "CALL" else leg.or_low
+            ref = level if level and (direction is None or abs(spot - level) <= 2 * step) else spot
+            strike = self._pick_strike(ref, step, side, self.cfg.strike_offset)
             row = next((r for r in rows if abs(float(r["strike"]) - strike) < 1e-6), None)
             if row is None:
                 continue
@@ -1241,14 +1248,16 @@ class AlgoEngine:
             return
         leg.option_ltp = premium
 
+        balance: Optional[float] = None
         if not runtime.is_dry_run():
             try:
                 client = get_dhan_client()
-                held = await client.get_positions(fresh=True)
-                book = await client.get_order_book(fresh=True)
-                supers = await client.get_super_orders(fresh=True)
+                # One parallel round-trip instead of four sequential REST calls.
+                held, book, supers, balance = await asyncio.gather(
+                    client.get_positions(fresh=True), client.get_order_book(fresh=True),
+                    client.get_super_orders(fresh=True), self._balance())
             except DhanAPIError as exc:
-                leg.note = f"Entry blocked: cannot verify broker holdings: {exc.error_message}"
+                leg.note = f"Entry blocked: cannot verify broker holdings/balance: {exc.error_message}"
                 self._log(leg.note, level="error")
                 return
             def matches(row: Dict[str, Any]) -> bool:
@@ -1269,7 +1278,7 @@ class AlgoEngine:
 
         # Set the signal BEFORE sizing so _delta_for resolves the right leg.
         leg.signal = direction
-        sizing = await self._size_position(leg)
+        sizing = await self._size_position(leg, balance=balance)
         if sizing["lots"] < max(1, self.cfg.min_lots):
             leg.status = "skipped"
             leg.note = sizing["reason"]
@@ -1302,9 +1311,12 @@ class AlgoEngine:
             initial_stop_spot=round(stop, 2), dry_run=runtime.is_dry_run(),
             spot=spot, premium=leg.option_ltp,
         )
+        t0 = getattr(self, "_signal_t0", None)
         self._log(
             f"BREAKOUT {leg.index_key} {'UP' if direction == 'CALL' else 'DOWN'} @ {spot:,.1f} "
-            f"-> BUY {direction} {int(leg.strike)} x{pos.quantity} ({pos.lots} lot)"
+            f"-> BUY {direction} {int(leg.strike)} x{pos.quantity} ({pos.lots} lot) "
+            f"@~{leg.option_ltp} | {sizing.get('reason', '')}"
+            f"{f' (+{(time.perf_counter() - t0) * 1000:.0f}ms since signal)' if t0 else ''}"
             f"{' [DRY-RUN]' if pos.dry_run else ''}",
             level="success", index=leg.index_key, direction=direction,
             strike=pos.strike, lots=pos.lots, spot=spot, target=pos.target_spot, stop=pos.stop_spot,
@@ -1421,22 +1433,28 @@ class AlgoEngine:
                 pos.execution_state = "open"
                 pos.entry_confirmed_ts = time.time()
                 pos.execution_error = ""
-                self._log(f"Entry confirmed: {pos.index_key} {filled} units @ {average:.2f}", level="success",
-                          notification="algo_entry")
+                t0 = getattr(self, "_signal_t0", None)
+                self._log(f"Entry confirmed: {pos.index_key} {int(pos.strike)} "
+                          f"{'CE' if pos.option_type == 'CALL' else 'PE'} {filled} units @ {average:.2f}"
+                          f"{f' (+{(time.perf_counter() - t0) * 1000:.0f}ms since signal)' if t0 else ''}"
+                          f" | next: watching profit/loss rule + target, exit {self.cfg.exit_time}",
+                          level="success", notification="algo_entry")
                 if self.cfg.protective_sl:
                     await self._place_protective_sl(pos)
             elif status != "TRADED" and filled == 0:
                 leg = self._legs.get(pos.index_key)
+                reason = str(order.get('omsErrorDescription') or 'no fill')
                 if leg:
                     leg.status = "error"
-                    leg.note = f"Entry {status}: {order.get('omsErrorDescription') or 'no fill'}"
-                self._log(f"Entry {status}; no position opened.", level="error")
+                    leg.note = f"Entry {status}: {reason}"
+                self._log(f"Entry {status}: {reason[:200]}; no position opened. "
+                          f"ACTION: check Dhan, enter manually if needed.", level="error")
                 self._position = None
             else:
                 pos.execution_error = "Broker fill details incomplete; refusing to assume quantity or price."
         self._persist()
 
-    async def _size_position(self, leg: DayLeg) -> Dict[str, Any]:
+    async def _size_position(self, leg: DayLeg, balance: Optional[float] = None) -> Dict[str, Any]:
         """Size using policy-specific risk, available cash and the lot bounds.
 
         Target-only estimates 90% premium loss (100% without protection).
@@ -1448,7 +1466,7 @@ class AlgoEngine:
         rng = leg.or_range or 0.0
         sl_points = self.cfg.sl_mult * rng
         delta = self._delta_for(leg, leg.signal) or get_settings().algo_paper_delta
-        balance = await self._balance()
+        balance = await self._balance() if balance is None else balance
         risk_per_lot = max(
             premium * (MAX_SAFETY_SL_PCT / 100 if self.cfg.protective_sl else 1) * lot
             if self.cfg.target_only else sl_points * delta * lot, 1e-6,
@@ -1666,7 +1684,9 @@ class AlgoEngine:
                 order = await self._order_state(pos.protective_order_id, None)
                 status = str(order["orderStatus"]).upper()
                 if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
-                    pos.execution_error = f"Protective SL {status}; position needs manual attention."
+                    reason = str(order.get("omsErrorDescription") or order.get("omsErrorCode") or "no reason given")
+                    pos.execution_error = (f"Protective SL {status} ({reason[:160]}); "
+                                           f"broker SL NOT active - algo still watches exits.")
                     pos.execution_state = "attention"
                     self._log(pos.execution_error, level="error")
                 else:
@@ -2060,6 +2080,7 @@ class AccountEngines:
                 engine._on_tick(sid, price, segment)
 
     async def enter_signal(self, source: DayLeg, direction: str) -> None:
+        t0 = time.perf_counter()
         master = self.items["master"]
         if not self.entry_accounts:
             return
@@ -2081,6 +2102,11 @@ class AccountEngines:
             source.note = note
             return
         signal = asdict(source)
+        master._log(f"SIGNAL {source.index_key} {direction}: spot {source.spot} vs OR "
+                    f"H {source.or_high} / L {source.or_low}; contract {int(source.strike or 0)} "
+                    f"{'CE' if direction == 'CALL' else 'PE'} premium {feed.price(source.security_id, segment)} "
+                    f"-> sending to {','.join(self.entry_accounts)} "
+                    f"(+{(time.perf_counter() - t0) * 1000:.0f}ms)", index=source.index_key)
         master._signal_day = now_ist().date().isoformat()
         with account_scope("master"):
             master._persist()
@@ -2097,6 +2123,7 @@ class AccountEngines:
                         return
                     leg = DayLeg(**signal)
                     engine._legs[source.index_key] = leg
+                    engine._signal_t0 = t0
                     if engine is master:
                         await engine._enter(leg, direction)
                     else:

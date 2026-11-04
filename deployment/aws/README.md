@@ -175,7 +175,7 @@ Dhan token, so tokens must be refreshed before each trading day. Set
 ### Position sizing and rupee exits
 
 `ALGO_MAX_AFFORDABLE=true` (or the Settings tab "Max lots" checkbox) sizes each
-account at `floor(balance x 98% / (premium x lot size))` lots. `Max lots`,
+account at `floor(balance x 90% / (premium x lot size))` lots. `Max lots`,
 `risk_pct` and `max_capital_pct` are ignored; the only bound is the exchange
 per-order freeze quantity (`ALGO_FREEZE_QTY`, default NIFTY 1800, BANKNIFTY 900,
 SENSEX 1000), because a larger single order is rejected outright. Example: balance
