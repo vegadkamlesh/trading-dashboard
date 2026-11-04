@@ -69,6 +69,8 @@ TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 ALGO_PROTECTIVE_SL_PCT = 70.0
 # A funds/margin rejection is retried at once with one lot fewer, at most this many times.
 FUNDS_RETRY_MAX = 3
+# A funds rejection discovered later than this after the BUY is too stale to chase.
+FUNDS_RETRY_WINDOW = 120.0
 _FUNDS_REJECT = re.compile(r"insufficient|fund|margin|RMS", re.IGNORECASE)
 
 # Order-placement retry policy. `_evaluate` runs on EVERY feed tick, so without a
@@ -525,7 +527,10 @@ class AlgoEngine:
                     if await self._recover_historical_flat(pos):
                         return result
                 await self._refresh_entry(pos)
-                if self._position is None or pos.execution_state == "entry_pending":
+                if self._position is None:
+                    await self._retry_after_delayed_reject(pos)
+                    return result
+                if pos.execution_state == "entry_pending":
                     return result
             rows = await get_dhan_client().get_positions(fresh=True)
             if not isinstance(rows, list):
@@ -1443,6 +1448,17 @@ class AlgoEngine:
                   f"(retry {leg.funds_retries}/{FUNDS_RETRY_MAX})", level="warn", index=leg.index_key)
         await self._enter(leg, direction)
         return True
+
+    async def _retry_after_delayed_reject(self, pos: Position) -> bool:
+        """Funds REJECTED status found later (reconcile/order stream), not at placement."""
+        leg = self._legs.get(pos.index_key)
+        if leg is None or leg.status != "error" or not self.enabled or pos.dry_run:
+            return False
+        now = now_ist()
+        if (now.hour * 60 + now.minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
+                or time.time() - (pos.entry_ts or 0) > FUNDS_RETRY_WINDOW):
+            return False
+        return await self._retry_fewer_lots(leg, pos.option_type, pos.lots, leg.note)
 
     async def _refresh_entry(self, pos: Position) -> None:
         order = await self._order_state(pos.order_id, pos.entry_correlation_id)

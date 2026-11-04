@@ -648,6 +648,48 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(qtys, [100, 80])
         self.assertEqual(self.engine._position.quantity, 80)
 
+    async def test_funds_rejection_found_later_by_reconcile_retries_with_fewer_lots(self):
+        # Entry accepted as PENDING; the RMS funds REJECTED arrives on a later reconcile.
+        leg, qtys = await self._funds_entry(
+            [{"ok": True, "orderId": "entry-1"}, {"ok": True, "orderId": "entry-2"}],
+            [{"orderStatus": "PENDING", "orderId": "entry-1"},
+             {"orderStatus": "REJECTED", "orderId": "entry-1", "filledQty": 0,
+              "omsErrorDescription": "RMS:Margin Exceeds, insufficient funds"},
+             {"orderStatus": "PENDING", "orderId": "entry-2"}])
+        self.assertEqual(qtys, [100])
+        self.assertEqual(self.engine._position.execution_state, "entry_pending")
+        self.engine.enabled = True
+        self.engine._day = algo_module.now_ist().date().isoformat()
+        with patch.object(algo_module.runtime, "is_dry_run", return_value=False), \
+                patch.object(algo_module.feed, "price", return_value=128), \
+                patch.object(algo_module.feed, "age", return_value=0), \
+                patch.object(algo_module, "now_ist",
+                             return_value=algo_module.now_ist().replace(hour=11, minute=0)), \
+                patch.object(self.engine, "_place_protective_sl", AsyncMock()):
+            await self.engine.reconcile()
+        self.assertEqual([c.kwargs["qty"] for c in self.engine._send_order.await_args_list], [100, 80])
+        self.assertEqual(self.engine._position.quantity, 80)
+        self.assertEqual(leg.funds_retries, 1)
+
+    async def test_late_or_non_funds_rejection_found_by_reconcile_is_not_retried(self):
+        for reason, age in (("RMS:Margin Exceeds, insufficient funds", 600),
+                            ("Invalid strike price", 0)):
+            leg, _ = await self._funds_entry(
+                [{"ok": True, "orderId": "entry-1"}],
+                [{"orderStatus": "PENDING", "orderId": "entry-1"},
+                 {"orderStatus": "REJECTED", "orderId": "entry-1", "filledQty": 0,
+                  "omsErrorDescription": reason}])
+            self.engine._position.entry_ts -= age
+            self.engine.enabled = True
+            self.engine._day = algo_module.now_ist().date().isoformat()
+            with patch.object(algo_module.runtime, "is_dry_run", return_value=False), \
+                    patch.object(algo_module, "now_ist",
+                                 return_value=algo_module.now_ist().replace(hour=11, minute=0)):
+                await self.engine.reconcile()
+            self.assertEqual(self.engine._send_order.await_count, 1, reason)
+            self.assertIsNone(self.engine._position)
+            self.assertEqual(leg.status, "error")
+
     async def test_funds_retry_is_bounded_and_other_rejections_do_not_resize(self):
         reject = {"ok": False, "code": "RMS", "error": "insufficient funds"}
         leg, qtys = await self._funds_entry([reject] * 4, [])
