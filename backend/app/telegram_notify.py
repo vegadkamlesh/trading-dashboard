@@ -31,6 +31,7 @@ EVENTS = {
     "algo_disarmed": "Algo disarmed; new entries stopped, open-position management continues",
     "algo_entry": "Algo entry confirmed",
     "algo_exit": "Algo exit recorded; check journal for reconciliation/estimates",
+    "token_expiry": "Dhan access token expiry notice",
     "order_success": "Order action recorded; not a fill confirmation",
     "order_failed": "Order action failed/unresolved; check broker before retrying",
     "mode_changed": "Trading safety mode changed by operator",
@@ -62,7 +63,7 @@ class NotificationHandler(logging.Handler):
         # Only algo journal lines carry a detail: trading facts (index, strike, qty, price,
         # P&L, broker reason). Other records stay metadata-only.
         detail = getattr(record, "telegram_detail", "") if event.startswith("algo_") or \
-            getattr(record, "telegram_event", None) == "algo_update" else ""
+            event == "token_expiry" or getattr(record, "telegram_event", None) == "algo_update" else ""
         level = getattr(record, "telegram_level", "")
         account = getattr(record, "telegram_account", "")
         mode = getattr(record, "telegram_mode", "")

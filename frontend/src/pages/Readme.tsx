@@ -144,7 +144,7 @@ export function Readme() {
           </li>
           <li>
             <strong>Protective premium SL:</strong> confirmed fill ke baad Dhan pe pending
-            STOP_LOSS_MARKET SELL at 10% of entry premium (90% door), minimum 0.05, tick 0.05.
+            STOP_LOSS_MARKET SELL at 30% of entry premium (70% door), minimum 0.05, tick 0.05.
             Rs100 BUY ho to far SL Rs10. Close software SL nahi. Large loss possible;
             SL hit na hone ki guarantee nahi, gap mein aur loss ho sakta hai.
             Pending SELL dikhna matlab BUY ke turant baad actual SELL fill hona nahi hai.
@@ -162,7 +162,7 @@ export function Readme() {
             <strong>Lots:</strong> risk budget, premium affordability aur max lots se size.
             Default minimum 1 lot risk/capital % ko override kar sakta hai, actual cash ko nahi.
             Default max 10, capital 60%, effective risk 0.5%. Saved Settings defaults se alag ho sakti hain.
-            Target-only risk estimate 90% premium loss per lot leta hai, purana tight spot-stop estimate nahi.
+            Target-only risk estimate 70% premium loss per lot leta hai, purana tight spot-stop estimate nahi.
             Registry NIFTY 65 / SENSEX 20 ko LIVE se pehle current contract se verify karo.
           </li>
           <li>

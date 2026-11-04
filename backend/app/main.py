@@ -76,6 +76,9 @@ async def trading_lifespan(app: FastAPI):
 
     # Background thread: delete log files older than the retention window daily.
     threading.Thread(target=daily_cleanup_loop, daemon=True, name="log-cleanup").start()
+    from .token_watch import token_watch_loop
+    token_stop = threading.Event()
+    threading.Thread(target=token_watch_loop, args=(token_stop,), daemon=True, name="token-watch").start()
 
     logger.info(
         "SAFETY: dryRun=%s (true=simulate, false=REAL orders) | fastOrders=%s "
@@ -93,6 +96,7 @@ async def trading_lifespan(app: FastAPI):
     try:
         yield
     finally:
+        token_stop.set()
         await engines.stop()
         await engine.stop()
         await close_dhan_client()

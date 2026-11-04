@@ -10,7 +10,7 @@ What it does, once you flip it ON
                break DOWN -> buy PUT
   in trade     target = entry spot +/- (target_mult x OR range)
                target-only default: spot SL and break-even OFF
-               broker premium SL = 10% of entry premium (90% away)
+               broker premium SL = 30% of entry premium (70% away)
                classic spot stops require explicit target_only=False
   15:12        force square-off
   15:30        day closed, everything archived to the journal
@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -48,7 +49,7 @@ from .feed import feed
 from .instruments import get_index, lot_size_for
 from .optionchain import engine as chain_engine
 from .opening_range import WINDOW_END_MIN, WINDOW_START_MIN
-from .orders import MAX_SAFETY_SL_PCT, _round_tick
+from .orders import _round_tick
 
 logger = logging.getLogger("dhan.algo")
 
@@ -64,6 +65,11 @@ SIGNAL_RETRY_COOLDOWN = 3.0
 # Max-affordable sizing keeps this share of balance usable; the rest covers charges and MARKET slippage.
 AFFORDABLE_BALANCE_PCT = 90.0   # 10% buffer for premium move + Dhan market-order margin
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
+# Algo's broker-parked disaster SL: trigger when premium has fallen this % from entry.
+ALGO_PROTECTIVE_SL_PCT = 70.0
+# A funds/margin rejection is retried at once with one lot fewer, at most this many times.
+FUNDS_RETRY_MAX = 3
+_FUNDS_REJECT = re.compile(r"insufficient|fund|margin|RMS", re.IGNORECASE)
 
 # Order-placement retry policy. `_evaluate` runs on EVERY feed tick, so without a
 # cap+backoff a rejected entry is retried many times per second. On 2026-09-28 a
@@ -102,7 +108,7 @@ def _fmt_min(m: int) -> str:
 @dataclass
 class AlgoConfig:
     indices: List[str] = field(default_factory=lambda: ["NIFTY", "SENSEX"])
-    target_only: bool = True       # no software spot stop/break-even; broker SL 90% away
+    target_only: bool = True       # no software spot stop/break-even; broker SL 70% away
     sl_mult: float = 0.2            # stop   = sl_mult     x OR range
     target_mult: float = 2.0        # target = target_mult x OR range
     breakeven_at: float = 0.0       # move stop to entry after this many x OR (0=off)
@@ -171,6 +177,8 @@ class DayLeg:
     entry_attempts: int = 0
     next_try_at: float = 0.0        # epoch seconds; entry retried only after this
     error: str = ""
+    lot_cap: Optional[int] = None   # set after a funds rejection: retry with fewer lots
+    funds_retries: int = 0
 
     @property
     def or_range(self) -> Optional[float]:
@@ -1279,6 +1287,10 @@ class AlgoEngine:
         # Set the signal BEFORE sizing so _delta_for resolves the right leg.
         leg.signal = direction
         sizing = await self._size_position(leg, balance=balance)
+        if leg.lot_cap is not None and sizing["lots"] > leg.lot_cap:
+            per_lot = sizing["quantity"] // sizing["lots"]
+            sizing = {**sizing, "lots": leg.lot_cap, "quantity": leg.lot_cap * per_lot,
+                      "reason": f"{sizing.get('reason', '')} -> {leg.lot_cap} lot(s) after funds rejection"}
         if sizing["lots"] < max(1, self.cfg.min_lots):
             leg.status = "skipped"
             leg.note = sizing["reason"]
@@ -1289,9 +1301,10 @@ class AlgoEngine:
         inst = get_index(leg.index_key)
         spot_age = feed.age(inst.sec_id, "IDX_I") if inst else None
         live_spot = leg.spot or 0.0
-        if spot_age is None or spot_age > MAX_PRICE_AGE or (
+        # A funds retry re-sends an already accepted signal immediately; no breakout recheck.
+        if not leg.funds_retries and (spot_age is None or spot_age > MAX_PRICE_AGE or (
             direction == "CALL" and live_spot <= (leg.or_high or 0)
-        ) or (direction == "PUT" and live_spot >= (leg.or_low or 0)):
+        ) or (direction == "PUT" and live_spot >= (leg.or_low or 0))):
             leg.note = "Breakout no longer valid on a fresh spot quote; waiting."
             return
         if self.account_id is None:
@@ -1345,6 +1358,8 @@ class AlgoEngine:
             self._position = None
             code = str(fill.get("code") or "")
             msg = str(fill.get("error") or "order failed")
+            if await self._retry_fewer_lots(leg, direction, pos.lots, f"{code} {msg}"):
+                return
             leg.entry_attempts += 1
             leg.signal = None
             leg.error = f"{code}: {msg}" if code else msg
@@ -1397,6 +1412,9 @@ class AlgoEngine:
             except DhanAPIError as exc:
                 pos.execution_error = f"Entry awaiting broker confirmation: {exc.error_message}"
                 self._log(pos.execution_error, level="warn")
+            if self._position is None and leg.status == "error":
+                await self._retry_fewer_lots(leg, direction, pos.lots, leg.note)
+                return
         self.phase = "in_trade" if pos.execution_state == "open" else pos.execution_state
 
         # Lock out the other index (one trade per day).
@@ -1409,6 +1427,22 @@ class AlgoEngine:
         if pos.dry_run and self.cfg.protective_sl:
             await self._place_protective_sl(pos)
         self._persist()
+
+    async def _retry_fewer_lots(self, leg: DayLeg, direction: str, lots: int, reason: str) -> bool:
+        """Funds/margin rejection: immediately re-enter with one lot fewer. True if retried."""
+        if (not _FUNDS_REJECT.search(reason or "") or lots <= max(1, self.cfg.min_lots)
+                or leg.funds_retries >= FUNDS_RETRY_MAX):
+            return False
+        leg.funds_retries += 1
+        leg.lot_cap = lots - 1
+        leg.status = "watching"
+        leg.signal = None
+        leg.error = ""
+        self._log(f"{leg.index_key}: entry rejected for funds ({reason.strip()[:120]}) - "
+                  f"retrying NOW with {leg.lot_cap} lot(s) "
+                  f"(retry {leg.funds_retries}/{FUNDS_RETRY_MAX})", level="warn", index=leg.index_key)
+        await self._enter(leg, direction)
+        return True
 
     async def _refresh_entry(self, pos: Position) -> None:
         order = await self._order_state(pos.order_id, pos.entry_correlation_id)
@@ -1457,7 +1491,7 @@ class AlgoEngine:
     async def _size_position(self, leg: DayLeg, balance: Optional[float] = None) -> Dict[str, Any]:
         """Size using policy-specific risk, available cash and the lot bounds.
 
-        Target-only estimates 90% premium loss (100% without protection).
+        Target-only estimates 70% premium loss (100% without protection).
         Classic mode uses spot-stop distance x delta. The minimum-lot floor can
         exceed percentage budgets but never actual cash; neither is a loss cap.
         """
@@ -1468,7 +1502,7 @@ class AlgoEngine:
         delta = self._delta_for(leg, leg.signal) or get_settings().algo_paper_delta
         balance = await self._balance() if balance is None else balance
         risk_per_lot = max(
-            premium * (MAX_SAFETY_SL_PCT / 100 if self.cfg.protective_sl else 1) * lot
+            premium * (ALGO_PROTECTIVE_SL_PCT / 100 if self.cfg.protective_sl else 1) * lot
             if self.cfg.target_only else sl_points * delta * lot, 1e-6,
         )
         premium_per_lot = max(premium * lot, 1e-6)
@@ -1574,7 +1608,7 @@ class AlgoEngine:
     # --------------------------------------------------------------- orders
     def _protective_trigger(self, pos: Position) -> float:
         if self.cfg.target_only:
-            return max(.05, _round_tick(pos.entry_premium * (1 - MAX_SAFETY_SL_PCT / 100)))
+            return max(.05, _round_tick(pos.entry_premium * (1 - ALGO_PROTECTIVE_SL_PCT / 100)))
         distance = abs(pos.entry_spot - pos.initial_stop_spot) * self.cfg.protective_sl_mult
         return max(.05, _round_tick(pos.entry_premium - distance * get_settings().algo_paper_delta))
 
@@ -1589,7 +1623,7 @@ class AlgoEngine:
             pos.next_exit_try_at = 0
         pos.protective_policy_pending = False
         pos.execution_error = ""
-        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 90%-away premium trigger.",
+        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 70%-away premium trigger.",
                   level="warn")
         self._persist()
         return True
@@ -1895,7 +1929,7 @@ class AlgoEngine:
             if p.execution_state == "exit_pending":
                 return ["Exit submitted or protective stop filled; waiting for broker flat confirmation.",
                         "No duplicate SELL will be submitted while the outcome is unresolved."]
-            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (90% away)."
+            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (70% away)."
                           if self.cfg.protective_sl else "Broker protective SL OFF.")
             out.append(
                 f"Target-only: watching spot target {p.target_spot:,.1f}; software spot/break-even SL OFF. "

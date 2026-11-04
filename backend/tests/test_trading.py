@@ -537,7 +537,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.engine.cfg.protective_sl = True
         for side in ("CALL", "PUT"):
             pos = position(option_type=side, entry_premium=100)
-            self.assertEqual(self.engine._protective_trigger(pos), 10)
+            self.assertEqual(self.engine._protective_trigger(pos), 30)
             with patch.object(algo_module.feed, "price", return_value=99), \
                     patch.object(algo_module.feed, "age", return_value=0), \
                     patch.object(self.engine, "_send_order", AsyncMock(return_value={
@@ -545,7 +545,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
                     })) as send:
                 pos.dry_run = True
                 await self.engine._place_protective_sl(pos)
-                self.assertEqual(send.await_args.kwargs["trigger"], 10)
+                self.assertEqual(send.await_args.kwargs["trigger"], 30)
 
     async def test_target_only_keeps_1512_time_exit(self):
         self.engine.cfg.target_only = True
@@ -578,7 +578,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pos.protective_policy_pending)
         self.client.place_order.assert_not_awaited()
 
-    async def test_legacy_stop_is_replaced_by_90_percent_far_stop_after_cancel(self):
+    async def test_legacy_stop_is_replaced_by_70_percent_far_stop_after_cancel(self):
         pos = self.engine._position
         pos.protective_order_id = "old-sl"
         pos.protective_policy_pending = True
@@ -597,7 +597,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
             await self.engine.reconcile()
         self.client.cancel_order.assert_awaited_once_with("old-sl")
         send.assert_awaited_once()
-        self.assertEqual(send.await_args.kwargs["trigger"], 12.8)
+        self.assertEqual(send.await_args.kwargs["trigger"], 38.35)
         self.assertEqual(pos.protective_order_id, "far-sl")
         self.assertFalse(pos.protective_policy_pending)
         self.assertIs(self.engine._position, pos)
@@ -611,14 +611,63 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
             await self.engine._manage_position()
             exit_mock.assert_awaited_once_with(self.engine._position, "PROTECTIVE_SL")
 
-    async def test_target_only_risk_estimate_uses_90_percent_premium(self):
+    async def _funds_entry(self, send_results, order_states):
+        self.engine._position = None
+        leg = DayLeg("NIFTY", status="watching", or_high=100, or_low=80,
+                     spot=101, security_id=47153, strike=100, prepared_side="CALL",
+                     option_ltp=128, expiry="2026-10-19")
+        self.engine._legs = {"NIFTY": leg}
+        self.client.get_positions.return_value = []
+        self.client.get_order_by_id.side_effect = order_states
+        self.engine._prepare_contract = AsyncMock()
+        self.engine._size_position = AsyncMock(return_value={"lots": 5, "quantity": 100, "reason": "r"})
+        self.engine._send_order = AsyncMock(side_effect=send_results)
+        with patch.object(algo_module.runtime, "is_dry_run", return_value=False), \
+                patch.object(algo_module.feed, "price", return_value=128), \
+                patch.object(algo_module.feed, "age", return_value=0), \
+                patch.object(self.engine, "_place_protective_sl", AsyncMock()):
+            await self.engine._enter(leg, "CALL")
+        return leg, [c.kwargs["qty"] for c in self.engine._send_order.await_args_list]
+
+    async def test_funds_rejection_at_placement_retries_now_with_one_lot_fewer(self):
+        leg, qtys = await self._funds_entry(
+            [{"ok": False, "code": "RMS", "error": "Insufficient funds: need Rs2145.78 more"},
+             {"ok": True, "orderId": "entry-2"}],
+            [{"orderStatus": "PENDING", "orderId": "entry-2"}])
+        self.assertEqual(qtys, [100, 80])
+        self.assertEqual(self.engine._position.lots, 4)
+        self.assertEqual(leg.funds_retries, 1)
+
+    async def test_funds_rejection_after_acceptance_retries_with_fewer_lots(self):
+        # 2026-11-04 child: order accepted, then REJECTED by RMS for insufficient funds.
+        leg, qtys = await self._funds_entry(
+            [{"ok": True, "orderId": "entry-1"}, {"ok": True, "orderId": "entry-2"}],
+            [{"orderStatus": "REJECTED", "orderId": "entry-1", "filledQty": 0,
+              "omsErrorDescription": "RMS:Margin Exceeds, insufficient funds"},
+             {"orderStatus": "PENDING", "orderId": "entry-2"}])
+        self.assertEqual(qtys, [100, 80])
+        self.assertEqual(self.engine._position.quantity, 80)
+
+    async def test_funds_retry_is_bounded_and_other_rejections_do_not_resize(self):
+        reject = {"ok": False, "code": "RMS", "error": "insufficient funds"}
+        leg, qtys = await self._funds_entry([reject] * 4, [])
+        self.assertEqual(qtys, [100, 80, 60, 40])   # 3 retries, never below 1 lot
+        self.assertIsNone(self.engine._position)
+        leg, qtys = await self._funds_entry([{"ok": False, "code": "DH-906", "error": "Invalid order"}], [])
+        self.assertEqual(qtys, [100])
+
+    def test_algo_protective_sl_parks_at_70_percent_premium_drop(self):
+        self.engine.cfg.target_only = True
+        self.assertEqual(self.engine._protective_trigger(position(entry_premium=363.55)), 109.05)
+
+    async def test_target_only_risk_estimate_uses_70_percent_premium(self):
         self.engine.cfg.target_only = True
         self.engine.cfg.protective_sl = True
         leg = DayLeg("NIFTY", option_ltp=100, or_high=200, or_low=100)
         self.engine._balance = AsyncMock(return_value=100000)
         with patch.object(self.engine, "_delta_for", return_value=.5):
             sizing = await self.engine._size_position(leg)
-        self.assertEqual(sizing["riskPerLot"], 5850)
+        self.assertEqual(sizing["riskPerLot"], 4550)   # 100 x 70% x 65
 
     async def test_manual_far_sl_defaults_match_algo_for_long_option(self):
         from app.orders import OrderRequest, build_super_order
