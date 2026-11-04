@@ -4,6 +4,7 @@ import importlib
 import json
 import socket
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -542,6 +543,50 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(algo_module.feed, "price", return_value=100), \
                 patch.object(algo_module.feed, "age", return_value=0):
             await self.manager.enter_signal(source, "CALL")
+        self.assertTrue(all(e._position is not None for e in self.manager.items.values()))
+        self.assertEqual(master._signal_day, algo_module.now_ist().date().isoformat())
+
+    async def test_breakout_reverting_before_order_does_not_lock_the_day(self):
+        # 2026-11-04: NIFTY crossed the OR high, spot fell back to 23906.15 (< 23906.6)
+        # during pre-order checks, both accounts aborted, and the day stayed locked.
+        source = algo_module.DayLeg("NIFTY", status="watching",
+            or_high=23000, or_low=22900, spot=23001)
+        for e in self.manager.items.values():
+            e.cfg.risk_pct = 10
+            e.cfg.max_capital_pct = 60
+            e.cfg.protective_sl = True
+            e.cfg.indices = ["NIFTY"]
+        snap = {"expiry": "2026-10-29", "underlyingLtp": 23001, "rows": [{
+            "strike": 23050, "ce": {"securityId": 47153, "ltp": 100},
+            "pe": {"securityId": 47154, "ltp": 100},
+        }]}
+        originals = {a: e._size_position for a, e in self.manager.items.items()}
+        def reverting(account):
+            async def size(leg):
+                leg.spot = 22999.5
+                return await originals[account](leg)
+            return size
+        for account, engine in self.manager.items.items():
+            engine._size_position = reverting(account)
+        feeds = (patch.object(algo_module.chain_engine, "snapshot", return_value=snap),
+                 patch.object(algo_module.feed, "subscribe"),
+                 patch.object(algo_module.feed, "price", return_value=100),
+                 patch.object(algo_module.feed, "age", return_value=0))
+        with feeds[0], feeds[1], feeds[2], feeds[3]:
+            await self.manager.enter_signal(source, "CALL")
+        master = self.manager.items["master"]
+        self.assertIsNone(master._signal_day)
+        self.assertTrue(all(e._position is None for e in self.manager.items.values()))
+        self.assertTrue(all(not b.orders and not b.supers for b in self.brokers.values()))
+        leg = master._legs["NIFTY"]
+        self.assertEqual(leg.status, "watching")
+        self.assertGreater(leg.next_try_at, time.time())
+        # A genuine breakout later in the day must still be taken by both accounts.
+        for account, engine in self.manager.items.items():
+            engine._size_position = originals[account]
+        leg.spot = 23005
+        with feeds[0], feeds[1], feeds[2], feeds[3]:
+            await self.manager.enter_signal(leg, "CALL")
         self.assertTrue(all(e._position is not None for e in self.manager.items.values()))
         self.assertEqual(master._signal_day, algo_module.now_ist().date().isoformat())
 

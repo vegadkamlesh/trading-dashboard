@@ -59,6 +59,8 @@ OR_READY_MIN = 9 * 60 + 26          # start computing the OR at/after this minut
 TICKER = 15
 RECONCILE_SECONDS = 1.0
 MAX_PRICE_AGE = 5.0
+# Pause before re-checking a breakout whose entry aborted before any order was sent.
+SIGNAL_RETRY_COOLDOWN = 3.0
 # Max-affordable sizing keeps this share of balance usable; the rest covers charges and MARKET slippage.
 AFFORDABLE_BALANCE_PCT = 98.0
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
@@ -2082,11 +2084,15 @@ class AccountEngines:
         master._signal_day = now_ist().date().isoformat()
         with account_scope("master"):
             master._persist()
+        # Accounts where an order may have reached the broker (or the outcome is
+        # unknown). Only these consume the day's single signal.
+        consumed: set = set()
         async def enter(account: AccountId) -> None:
             engine = self.items[account]
             with account_scope(account):
                 try:
                     if engine._position is not None or engine._today_trades:
+                        consumed.add(account)
                         engine._log("Shared signal skipped: existing position/trade.", level="warn")
                         return
                     leg = DayLeg(**signal)
@@ -2098,11 +2104,16 @@ class AccountEngines:
                             leg = DayLeg(**signal)
                             engine._legs[source.index_key] = leg
                             await engine._enter(leg, direction)
+                    if (engine._position is not None or leg.entry_attempts > 0
+                            or leg.status in ("active", "error")):
+                        consumed.add(account)
                     if engine._position is None:
                         engine._last_error = leg.error or leg.note or "Signal did not open a position; inspect journal."
                     engine._log(f"shared_signal direction={direction} index={source.index_key} "
-                                f"result={engine._position.execution_state if engine._position else leg.note}")
+                                f"result={engine._position.execution_state if engine._position else leg.note}",
+                                level="info" if engine._position else "warn")
                 except Exception as exc:
+                    consumed.add(account)
                     engine._last_error = str(exc)
                     engine._log(f"Shared signal failed: {exc}", level="error")
                     logger.exception("account=%s shared signal failed", account)
@@ -2113,6 +2124,19 @@ class AccountEngines:
                         engine._last_error = f"State persistence failed: {exc}. Check this account at Dhan."
                         logger.exception("account=%s signal state persistence failed", account)
         await asyncio.gather(*(enter(account) for account in self.entry_accounts))
+        if not consumed:
+            # 2026-11-04: spot dipped back under the OR high during pre-order checks,
+            # every account aborted before sending an order, yet the day stayed locked.
+            master._signal_day = None
+            leg = master._legs.get(source.index_key, source)
+            if leg.status == "watching":
+                leg.next_try_at = time.time() + SIGNAL_RETRY_COOLDOWN
+            master._log(f"{source.index_key} {direction} breakout: no account sent an order "
+                        f"({leg.note or 'pre-order check failed'}); signal NOT consumed, "
+                        f"watching for the next valid breakout", level="warn", index=source.index_key)
+            with account_scope("master"):
+                master._persist()
+            return
         source.status = "locked"
         source.note = "Shared signal dispatched; inspect each account result. No blind replay."
         with account_scope("master"):
