@@ -48,7 +48,7 @@ from .accounts import ACCOUNT_IDS, AccountId, account_credentials, account_scope
 from .feed import feed
 from .instruments import get_index, lot_size_for
 from .optionchain import engine as chain_engine
-from .opening_range import WINDOW_END_MIN, WINDOW_START_MIN
+from .opening_range import INTRADAY_FROM_TIME, WINDOW_END_MIN, WINDOW_START_MIN
 from .orders import _round_tick
 
 logger = logging.getLogger("dhan.algo")
@@ -945,14 +945,14 @@ class AlgoEngine:
                     exchange_segment="IDX_I",
                     instrument="INDEX",
                     interval="1",
-                    from_dt=f"{today.isoformat()} 09:15:00",
+                    from_dt=f"{today.isoformat()} {INTRADAY_FROM_TIME}",
                     to_dt=f"{today.isoformat()} 09:26:00",
                 )
             except DhanAPIError as exc:
                 leg.note = f"OR fetch failed: {exc.error_message}"
                 self._last_error = exc.error_message
                 continue
-            highs, lows, ts = [], [], []
+            highs, lows, ts, minutes = [], [], [], set()
             data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
             if isinstance(data, dict):
                 ts = data.get("timestamp") or []
@@ -969,8 +969,16 @@ class AlgoEngine:
                     if WINDOW_START_MIN <= m <= WINDOW_END_MIN and mv > 0 and lv > 0:
                         highs.append(mv)
                         lows.append(lv)
+                        minutes.add(m)
             if not highs or not lows:
                 leg.note = "no opening-range candles yet"
+                continue
+            if WINDOW_START_MIN not in minutes:
+                # The 09:15 candle usually holds the day's opening extreme; never lock without it.
+                note = "09:15 candle missing from Dhan data - retrying OR fetch"
+                if leg.note != note:
+                    self._log(f"{key} {note}", level="warn", index=key)
+                leg.note = note
                 continue
             leg.or_high = max(highs)
             leg.or_low = min(lows)

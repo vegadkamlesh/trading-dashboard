@@ -42,6 +42,8 @@ MAX_DAYS_PER_CALL = 90          # Dhan intraday limit
 MAX_YEARS = 5
 WINDOW_START_MIN = 9 * 60 + 15  # 09:15
 WINDOW_END_MIN = 9 * 60 + 25    # 09:25 (inclusive)
+# Dhan /charts/intraday treats fromDate as exclusive: "09:15:00" drops the 09:15 candle.
+INTRADAY_FROM_TIME = "09:14:00"
 RECENT_SAMPLES = 20             # show the most recent N sessions
 # Bulk back-fill concurrency. Dhan's data API tolerates ~5 req/s; we stay well
 # under it with 3 in flight and retry on DH-904 (rate limit).
@@ -185,7 +187,7 @@ async def fetch_intraday_raw(
                         exchange_segment=seg,
                         instrument="INDEX",
                         interval="1",
-                        from_dt=a.strftime("%Y-%m-%d 09:15:00"),
+                        from_dt=f"{a.isoformat()} {INTRADAY_FROM_TIME}",
                         to_dt=b.strftime("%Y-%m-%d 15:30:00"),
                         throttle=False,
                     )

@@ -481,6 +481,41 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine._position.stop_spot, 97)
         self.assertEqual(self.engine._position.target_spot, 141)
 
+    def _or_candles(self, minutes):
+        day = algo_module.datetime(2026, 11, 5, tzinfo=algo_module.IST)
+        out = {"timestamp": [], "high": [], "low": []}
+        for minute, high, low in minutes:
+            out["timestamp"].append(int(day.replace(hour=9, minute=minute).timestamp()))
+            out["high"].append(high)
+            out["low"].append(low)
+        return {"data": out}
+
+    async def _compute_or(self, raw):
+        self.engine.cfg.indices = ["NIFTY"]
+        self.engine._legs = {}
+        intraday = AsyncMock(return_value=raw)
+        with patch.object(algo_module, "now_ist",
+                          return_value=algo_module.datetime(2026, 11, 5, 9, 26, 5, tzinfo=algo_module.IST)), \
+                patch.object(self.engine, "_intraday", intraday), \
+                patch.object(self.engine, "_prepare_contract", AsyncMock()), \
+                patch.object(algo_module.feed, "subscribe"):
+            await self.engine._maybe_compute_or()
+        return intraday, self.engine._legs["NIFTY"]
+
+    async def test_opening_range_includes_0915_candle(self):
+        # Dhan's fromDate is exclusive; 05-Nov SENSEX OR was wrong because 09:15 was dropped.
+        intraday, leg = await self._compute_or(self._or_candles(
+            [(15, 78922.44, 78520.56), (16, 78722.61, 78638.4), (25, 78800.0, 78600.0), (26, 79999.0, 1.0)]))
+        self.assertEqual(intraday.await_args.kwargs["from_dt"], "2026-11-05 09:14:00")
+        self.assertEqual((leg.or_high, leg.or_low), (78922.44, 78520.56))
+        self.assertEqual(leg.status, "watching")
+
+    async def test_opening_range_does_not_lock_without_0915_candle(self):
+        _, leg = await self._compute_or(self._or_candles([(m, 100.0 + m, 90.0) for m in range(16, 26)]))
+        self.assertIsNone(leg.or_high)
+        self.assertNotEqual(leg.status, "watching")
+        self.assertIn("09:15", leg.note)
+
     async def test_algo_entry_does_not_mix_with_pending_manual_entry(self):
         self.engine._position = None
         leg = DayLeg("NIFTY", status="watching", or_high=100, or_low=80,

@@ -530,9 +530,9 @@ class DhanClient:
         while day <= end.date():
             if day.weekday() < 5:  # skip weekends
                 base = 23000.0 + random.uniform(-400, 400)
-                # 09:16 .. 09:25 candles
+                # 09:15 .. 09:25 candles
                 px = base
-                for minute in range(16, 26):
+                for minute in range(15, 26):
                     o = px
                     c = o + random.uniform(-25, 25)
                     hi = max(o, c) + random.uniform(0, 20)
