@@ -28,6 +28,7 @@ class Broker:
         self.orders = []
         self.supers = []
         self.net = 0
+        self.product = "INTRADAY"
         self.reject = False
         self.timeout = False
         self.reject_status = False
@@ -81,7 +82,7 @@ class Broker:
             return httpx.Response(200, json={"orderStatus": "CANCELLED"})
         if path == "/positions":
             return httpx.Response(200, json=[dict(
-                securityId="47153", exchangeSegment="NSE_FNO", productType="INTRADAY",
+                securityId="47153", exchangeSegment="NSE_FNO", productType=self.product,
                 netQty=self.net, buyAvg=100, sellAvg=100,
                 realizedProfit=0, unrealizedProfit=0,
             )])
@@ -135,6 +136,8 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.patch.object(algo_module.engines, "selection_lock", asyncio.Lock())
         for account, engine in self.manager.items.items():
             engine._day = algo_module.now_ist().date().isoformat()
+            # Fixtures below model INTRADAY books; the MARGIN default has its own test.
+            engine.cfg.product_type = "INTRADAY"
             with account_scope(account):
                 audit.init_db()
         self.brokers = {"master": Broker("master-id", 100000),
@@ -668,6 +671,98 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(engine._today_trades[-1]["dryRun"])
             self.assertEqual(len([o for o in self.brokers[account].orders
                                   if o["transactionType"] == "SELL"]), 1)
+
+    async def test_two_trades_per_day_fresh_breakout_all_flat_margin(self):
+        """Trade 1 CALL -> both flat -> no re-buy while spot still above high ->
+        back inside -> PUT trade 2 -> day locked. MARGIN (carry-forward) product."""
+        master, child = self.manager.items["master"], self.manager.items["child"]
+        for b in self.brokers.values():
+            b.product = "MARGIN"
+        for e in self.manager.items.values():
+            e.enabled = True
+            e.cfg.product_type = "MARGIN"
+            e.cfg.risk_pct = 10
+            e.cfg.protective_sl = False
+            e.cfg.target_only = True
+            e.cfg.indices = ["NIFTY", "SENSEX"]
+        master._legs = {
+            "NIFTY": algo_module.DayLeg("NIFTY", status="watching", or_high=23000, or_low=22900, spot=23001),
+            "SENSEX": algo_module.DayLeg("SENSEX", status="watching", or_high=76000, or_low=75800, spot=75900),
+        }
+        snap = {"expiry": "2026-10-29", "underlyingLtp": 23000, "rows": [{
+            "strike": k, "ce": {"securityId": 47153 if k == 23050 else 47000 + k // 50, "ltp": 100},
+            "pe": {"securityId": 48000 + k // 50, "ltp": 100}} for k in range(22800, 23201, 50)]}
+        at = algo_module.datetime(2026, 11, 3, 9, 40, tzinfo=algo_module.IST)
+        today, minute = at.date().isoformat(), 9 * 60 + 40
+
+        async def look():
+            with patch.object(algo_module, "now_ist", return_value=at), \
+                    patch.object(algo_module.chain_engine, "snapshot", return_value=snap), \
+                    patch.object(algo_module.feed, "subscribe"), \
+                    patch.object(algo_module.feed, "price", return_value=100), \
+                    patch.object(algo_module.feed, "age", return_value=0), \
+                    account_scope("master"):
+                await master._look_for_entry()
+
+        def buys():
+            return [sum(1 for o in b.orders if o["transactionType"] == "BUY") for b in self.brokers.values()]
+
+        async def exit_flat(account, direction):
+            engine = self.manager.items[account]
+            pos = engine._position
+            pos.spot = pos.target_spot + (1 if direction == "CALL" else -1)
+            with account_scope(account), patch.object(algo_module.feed, "age", return_value=0):
+                await engine._manage_position()
+                pos.entry_confirmed_ts = 0
+                await engine.reconcile()
+                await engine.reconcile()
+            self.assertIsNone(engine._position)
+
+        # Trade 1: NIFTY breaks high -> CALL on both accounts, MARGIN product; SENSEX locked.
+        await look()
+        self.assertEqual(buys(), [1, 1], {k: (l.status, l.note) for k, l in master._legs.items()})
+        self.assertTrue(all(o["productType"] == "MARGIN" for b in self.brokers.values() for o in b.orders))
+        self.assertTrue(all(b.net > 0 for b in self.brokers.values()))
+        self.assertEqual(master._signals_used(today), 1)
+        self.assertNotIn("watching", [l.status for l in master._legs.values()])
+
+        # Master exits first; child still holds -> no re-watch, no new order.
+        await exit_flat("master", "CALL")
+        master._maybe_open_next_trade(today, minute)
+        self.assertNotIn("watching", [l.status for l in master._legs.values()])
+        await look()
+        self.assertEqual(buys(), [1, 1])
+
+        # Child exits -> every account flat -> both indices re-watched.
+        await exit_flat("child", "CALL")
+        master._maybe_open_next_trade(today, minute)
+        self.assertEqual([l.status for l in master._legs.values()], ["watching", "watching"])
+
+        # Spot still above the OR high: not a fresh breakout -> no re-buy.
+        master._legs["NIFTY"].spot = 23010
+        await look()
+        await look()
+        self.assertEqual(buys(), [1, 1])
+        # Back inside the range, then breaks the low -> PUT trade 2 on both accounts.
+        master._legs["NIFTY"].spot = 22950
+        await look()
+        self.assertEqual(buys(), [1, 1])
+        master._legs["NIFTY"].spot = 22899
+        await look()
+        self.assertEqual(buys(), [2, 2])
+        self.assertEqual({e._position.option_type for e in self.manager.items.values()}, {"PUT"})
+        self.assertEqual(master._signals_used(today), 2)
+
+        # After trade 2 nothing re-opens: day is done.
+        await exit_flat("master", "PUT")
+        await exit_flat("child", "PUT")
+        master._maybe_open_next_trade(today, minute)
+        self.assertNotIn("watching", [l.status for l in master._legs.values()])
+        master._legs["NIFTY"].status = "watching"  # even a stray watching leg must not trade
+        master._legs["NIFTY"].spot = 23050
+        await look()
+        self.assertEqual(buys(), [2, 2])
+        self.assertEqual([len(e._today_trades) for e in self.manager.items.values()], [2, 2])
 
     async def test_max_affordable_sizing_buys_every_lot_the_balance_allows(self):
         """User example: balance 15000, lot 65, premium 100 -> 6500/lot -> 2 lots = 130 qty."""

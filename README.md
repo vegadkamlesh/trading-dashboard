@@ -114,7 +114,7 @@ Market feed ONLINE, socket connected aur algo ON **open trade ka proof nahi**.
   + mandatory SL. No SL checkbox = confirmed/reference premium ke around **90% away**
   protective stop, zero stop nahi. LIMIT input auto-change nahi; MARKET estimate fill nahi.
 - **ORB default:** confirmed BUY ke baad protection; software spot SL/break-even OFF,
-  spot target first, broker premium SL ~70% below fill, manual EXIT, ORB 15:12 square-off.
+  spot target first, broker premium SL ~70% below fill, manual EXIT, ORB 15:29 square-off.
   Far SL hit na hone ki guarantee nahi: premium near-zero ho sakta hai.
 - Accepted/TRANSIT order != filled; rejection/timeout/partial fill account-wise.
   Same request UUID automatic repeat nahi; Child fail ho to Master rollback nahi.
@@ -254,7 +254,7 @@ mapping approval. This app does not submit the approval request automatically.
 - DRY-RUN/LIVE is global. Mode/config/selection changes coordinate both engines;
   a tracked position in either blocks unsafe changes. Backend startup always
   **disarms new algo entries**, but restores management of existing positions.
-  Existing target-only/far-SL and ORB-only 15:12 rules below are unchanged.
+  Existing target-only/far-SL and ORB-only 15:29 rules below are unchanged.
 
 ### Isolation, API budgets and debugging
 
@@ -303,7 +303,7 @@ IP for **each** account, then explicitly ARM the intended recipients.
    It locks only when both the 09:15 and 09:24 candles are present.
 3. The first watched index with spot **strictly above OR high buys a CALL**;
    spot **strictly below OR low buys a PUT**. Equal to a boundary is not a break.
-   One trade per day across both indices; no new entries at/after **15:00**.
+   Max **2 trades per day** (first index to break out wins, the other is locked). Trade 2 arms only after ALL accounts are flat and needs a FRESH breakout (spot must come back inside the OR first); no new entries at/after **15:00**. Product = MARGIN (no broker 3:18/3:19 auto square-off; app exits at 15:29).
    The signal is level-based: starting late can enter an already-broken range.
    Index feed values are rounded to 2 decimals before comparison so float32
    noise (22,752.300781 vs 22,752.30) is not treated as a breakout.
@@ -325,7 +325,7 @@ IP for **each** account, then explicitly ARM the intended recipients.
 **Current default: `target_only = true`** (`ALGO_TARGET_ONLY=true` for fresh
 config). Software spot SL and break-even exits are disabled even if old SL
 multipliers/break-even settings are present. CALL target = `S + target_mult x R`;
-PUT target = `S - target_mult x R`. Manual EXIT and **15:12 ORB time exit remain**.
+PUT target = `S - target_mult x R`. Manual EXIT and **15:29 ORB time exit remain**.
 The broker protective SELL SL is **70% below the confirmed entry premium**:
 `max(0.05, tick_round(fill premium x 0.30))`. Rs100 fill -> Rs30 trigger.
 This is deliberately far away, **not a guarantee it cannot hit**. You can lose
@@ -364,7 +364,7 @@ No artificial minimum holding time is imposed: a genuine stop hit can exit quick
 - Before parking it, require a fresh option price. If its trigger is already
   crossed, request an exit instead of submitting an immediately-triggerable stop.
   A failed/unknown protective order is shown as a warning; protection is not guaranteed.
-- Software stop, target, **15:12 forced exit**, PANIC, and Positions EXIT share
+- Software stop, target, **15:29 forced exit**, PANIC, and Positions EXIT share
   the algo execution lock. Verify/cancel the protective stop, confirm terminal
   cancellation/fill, then re-read actual holdings before any market SELL.
   If the stop already flattened the position, do **not** sell again.
@@ -421,9 +421,9 @@ cancellation blocks another SELL; verify Dhan if the app asks for attention.
 Manual exit correlations also persist in SQLite across restarts. An algo entry
 checks both holdings and pending standard/Super orders to avoid mixing with a
 pending manual entry. Manual cancellation and exits share the execution lock.
-**15:12 automatic square-off applies to the ORB position only**; manual Super
+**15:29 automatic square-off applies to the ORB position only**; manual Super
 Orders retain their broker target/SL and require manual EXIT or broker square-off
-rules. Do not assume the app closes every manual position at 15:12.
+rules. Do not assume the app closes every manual position at 15:29.
 
 ### Sync, health and verified Dhan limits
 

@@ -65,6 +65,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.engine._legs = {"NIFTY": DayLeg("NIFTY", status="active")}
         self.engine.cfg.protective_sl = False
         self.engine.cfg.target_only = False
+        self.engine.cfg.product_type = "INTRADAY"  # fixtures model INTRADAY books
         self.settings_patch = patch.object(algo_module, "get_settings", return_value=MagicMock(
             is_configured=MagicMock(return_value=True), dhan_client_id="test", algo_paper_delta=.5,
         ))
@@ -595,10 +596,16 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
                 await self.engine._place_protective_sl(pos)
                 self.assertEqual(send.await_args.kwargs["trigger"], 30)
 
-    async def test_target_only_keeps_1512_time_exit(self):
+    async def test_target_only_keeps_1529_time_exit(self):
         self.engine.cfg.target_only = True
         self.engine._last_reconcile_at = time.monotonic()
-        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 15, 12, tzinfo=algo_module.IST)), \
+        self.assertEqual(self.engine.cfg.exit_time, "15:29")
+        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 15, 28, 59, tzinfo=algo_module.IST)), \
+                patch.object(self.engine, "_exit_position_locked", AsyncMock()) as exit_mock, \
+                patch.object(self.engine, "_manage_position", AsyncMock()):
+            await self.engine._tick_supervisor()
+            exit_mock.assert_not_awaited()
+        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 15, 29, tzinfo=algo_module.IST)), \
                 patch.object(self.engine, "_exit_position_locked", AsyncMock()) as exit_mock:
             await self.engine._tick_supervisor()
             exit_mock.assert_awaited_once_with(self.engine._position, "TIME")

@@ -105,7 +105,8 @@ class Settings(BaseSettings):
     algo_target_mult: float = 2.0       # target = 2.0 x opening range
     algo_breakeven_at: float = 0.0      # move stop to entry after +N x OR (0 = off)
     algo_entry_cutoff: str = "15:00"    # no fresh entries after this time
-    algo_exit_time: str = "15:12"       # forced square-off
+    algo_exit_time: str = "15:29"       # forced square-off (MARGIN product: no broker auto square-off)
+    algo_max_trades: int = 2            # ORB signals per day; the next one needs all accounts flat
     algo_strike_offset: int = 1         # +1 strike in the trade direction
     # ---- Lot sizing (READ THIS BEFORE CHANGING) ----
     # Do NOT size off a single trade's risk. This strategy wins only ~15% of the
@@ -128,7 +129,7 @@ class Settings(BaseSettings):
     algo_min_or_pct: float = 0.0        # skip if OR range < this % of price (0=off)
     algo_max_or_pct: float = 0.0        # skip if OR range > this % of price (0=off)
     algo_order_type: str = "MARKET"     # MARKET (fast) | LIMIT (no slippage)
-    algo_product_type: str = "INTRADAY"
+    algo_product_type: str = "MARGIN"   # Dhan carry-forward (NRML); INTRADAY is auto-squared ~15:18
     # Buy every lot the balance affords (minus a small charges/slippage buffer).
     algo_max_affordable: bool = False
     # Rupee exits on each account's live premium P&L; 0 = off.

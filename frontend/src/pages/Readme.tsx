@@ -155,7 +155,7 @@ export function Readme() {
             → zaroorat ho tab MARKET SELL. Duplicate PANIC / auto / Positions EXIT serialized hain.
             Exit PENDING ya rejected ho to dashboard CLOSED nahi bolta.
             Broker zero qty aur pending SELL clear hone par trade journal mein close hota hai.
-            Default ORB forced exit 15:12. Manual Super Orders par ye app-wide timer nahi hai.
+            Default ORB forced exit 15:29. Manual Super Orders par ye app-wide timer nahi hai.
             Broker/connection failure ho to Dhan par manually check karo.
           </li>
           <li>
@@ -189,7 +189,7 @@ export function Readme() {
           <li>Current balance unknown/malformed ho to order send nahi hota. Start-of-day balance available cash nahi hai. Short SELL ke liye premium estimate full exchange margin approval nahi hai.</li>
           <li>Har ticket ka request ID aur broker correlation SQLite mein save hota hai. Same ID retry pe duplicate BUY/SELL nahi; unknown result pe block. Naya ticket naya intent hai: timeout ke baad Dhan check kiye bina reopen/reorder mat karo.</li>
           <li>Manual EXIT identity restart ke baad bhi recover hoti hai. Pending entry pe pehle entry cancel karo; protective legs terminal-confirm hone aur actual holdings check ke baad exit order send hota hai.</li>
-          <li>Manual target/SL broker ke Super Order legs hain. 15:12 app timer sirf ORB holding ke liye hai; manual trades mein EXIT aur broker square-off rules follow karo.</li>
+          <li>Manual target/SL broker ke Super Order legs hain. 15:29 app timer sirf ORB holding ke liye hai; manual trades mein EXIT aur broker square-off rules follow karo.</li>
         </ul>
       </Section>
 

@@ -10,7 +10,7 @@ it on with real money — it is the single most important part of this document.
 
 **The historical study and classic 0.20x stop formulas below are NOT the current
 default exit policy.** `target_only=true` disables software spot SL and
-break-even exits. Spot target stays 2x OR; manual EXIT and 15:12 forced exit stay.
+break-even exits. Spot target stays 2x OR; manual EXIT and 15:29 forced exit stay.
 Broker protective SL = 10% of confirmed BUY premium (90% away), rounded to
 0.05 with minimum 0.05. Rs100 BUY -> Rs10 SL trigger.
 
@@ -58,11 +58,11 @@ after 09:25     watch BOTH indices tick-by-tick
 in the trade    managed on SPOT levels:
                   stop   = entry -/+ (0.2 x OR range)
                   target = entry +/- (2.0 x OR range)
-15:12           forced square-off
+15:29           forced square-off
 15:30           session closed, everything archived
 ```
 
-**One trade per day, whichever index moves first.** That is the whole edge:
+**Up to 2 trades per day (`ALGO_MAX_TRADES`), whichever index moves first; trade 2 only after all accounts are flat and on a fresh breakout.** That is the whole edge:
 the opening range is a volatility filter, and a clean break of it tends to
 extend. Everything else in this repo exists to execute that reliably.
 
@@ -501,7 +501,7 @@ All settings also live in the **Settings** sub-tab and persist across restarts.
 | `ALGO_TARGET_MULT` | `2.0` | target = this × opening range |
 | `ALGO_BREAKEVEN_AT` | `0.0` | move stop to entry after +N × OR (0 = off) |
 | `ALGO_ENTRY_CUTOFF` | `15:00` | no fresh entries after this (IST) |
-| `ALGO_EXIT_TIME` | `15:12` | forced square-off |
+| `ALGO_EXIT_TIME` | `15:29` | forced square-off |
 | `ALGO_STRIKE_OFFSET` | `0` | 0 = ATM, 1 = one strike OTM |
 | `ALGO_RISK_PCT` | `0.5` | risk estimate per trade, capped by streak budget in .env defaults |
 | `ALGO_MAX_CAPITAL_PCT` | `60.0` | max % of balance spent on premium |
@@ -509,7 +509,8 @@ All settings also live in the **Settings** sub-tab and persist across restarts.
 | `ALGO_MIN_LOTS` | `1` | minimum-lot floor can override percentage budgets, never actual affordability |
 | `ALGO_MIN_OR_PCT` / `ALGO_MAX_OR_PCT` | `0` | skip days whose OR is too small/large (0 = off) |
 | `ALGO_ORDER_TYPE` | `MARKET` | MARKET (fast) or LIMIT |
-| `ALGO_PRODUCT_TYPE` | `INTRADAY` | `INTRADAY` or `MARGIN` |
+| `ALGO_MAX_TRADES` | `2` | trades per day (1-5) |
+| `ALGO_PRODUCT_TYPE` | `MARGIN` | `INTRADAY` or `MARGIN` |
 | `ALGO_LOT_SIZES` | *(empty)* | override, e.g. `NIFTY=65,SENSEX=20`; verify current exchange contract sizes |
 
 **Position sizing** uses the live fund balance (or the paper balance in dry-run):

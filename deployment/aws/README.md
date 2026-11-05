@@ -151,7 +151,7 @@ readiness before trading.
 The stop is intentional even if positions, orders or their status remain open
 or unknown. The AWS stop schedule does **not** square off positions. Separately,
 the existing ORB strategy may request a time-based exit at its configured
-exit time (default 15:12 IST) before the server stops; verify strategy settings
+exit time (default 15:29 IST) before the server stops; verify strategy settings
 and broker fills rather than assuming an exit succeeded. At and after shutdown,
 software-managed exits, feed monitoring and application alerts stop; a
 next-morning reconciliation cannot protect overnight exposure. Always inspect
@@ -187,7 +187,7 @@ ticks can also change while armed: unticking stops new entries for that
 account (its open position is still managed), ticking joins after the IP check. Each
 account exits with a MARKET SELL when its own gross premium P&L reaches
 `+profit` (`PROFIT_RS`) or `-loss` (`LOSS_RS`), checked only on a fresh (<5 s)
-option price. The spot target and the 15:12 time exit still apply.
+option price. The spot target and the 15:29 time exit still apply.
 
 ### Bootstrap application package
 

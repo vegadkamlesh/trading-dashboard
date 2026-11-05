@@ -5,14 +5,17 @@ What it does, once you flip it ON
   09:15-09:24:59 builds the opening range (OR high / OR low) for NIFTY + SENSEX
   09:25        locks the levels, pre-picks the option contract, sizes the lots
   after 09:25  watches BOTH indices tick-by-tick. The FIRST one to break its
-               range takes the trade; the other is locked out for the day.
+               range takes the trade; the other is locked out for that trade.
+  after exit   up to max_trades (default 2) per day: once EVERY account is
+               flat, both indices are re-watched with the same OR. A side spot
+               is already beyond needs a fresh breakout (back inside first).
                break UP   -> buy CALL (ATM, or ATM +/- offset)
                break DOWN -> buy PUT
   in trade     target = entry spot +/- (target_mult x OR range)
                target-only default: spot SL and break-even OFF
                broker premium SL = 30% of entry premium (70% away)
                classic spot stops require explicit target_only=False
-  15:12        force square-off
+  15:29        force square-off (MARGIN product, so Dhan does not auto-square ~15:18)
   15:30        day closed, everything archived to the journal
 
 Safety model (read this)
@@ -115,7 +118,8 @@ class AlgoConfig:
     target_mult: float = 2.0        # target = target_mult x OR range
     breakeven_at: float = 0.0       # move stop to entry after this many x OR (0=off)
     entry_cutoff: str = "15:00"     # no new entries after this IST time
-    exit_time: str = "15:12"        # forced square-off
+    exit_time: str = "15:29"        # forced square-off
+    max_trades: int = 2             # ORB signals per day (next one only after every account is flat)
     strike_offset: int = 0          # 0 = ATM, +1 = one strike further OTM
     risk_pct: float = 0.5           # % of balance risked per trade (see Settings)
     max_capital_pct: float = 60.0   # max % of balance spent on premium
@@ -124,7 +128,7 @@ class AlgoConfig:
     min_or_pct: float = 0.0         # skip if OR range < this % of spot (0 = off)
     max_or_pct: float = 0.0         # skip if OR range > this % of spot (0 = off)
     order_type: str = "MARKET"
-    product_type: str = "INTRADAY"
+    product_type: str = "MARGIN"
     protective_sl: bool = True      # park a wide real SL at Dhan as a disaster stop
     protective_sl_mult: float = 2.0 # ... at this many x the software stop distance
     # Size with every lot the balance can buy (capped by max_lots), ignoring risk_pct/max_capital_pct.
@@ -144,6 +148,7 @@ class AlgoConfig:
             breakeven_at=s.algo_breakeven_at,
             entry_cutoff=s.algo_entry_cutoff,
             exit_time=s.algo_exit_time,
+            max_trades=s.algo_max_trades,
             strike_offset=s.algo_strike_offset,
             risk_pct=s.algo_effective_risk_pct,
             max_capital_pct=s.algo_max_capital_pct,
@@ -181,6 +186,9 @@ class DayLeg:
     error: str = ""
     lot_cap: Optional[int] = None   # set after a funds rejection: retry with fewer lots
     funds_retries: int = 0
+    # Next-trade re-watch: a side spot is already beyond needs a fresh breakout.
+    rearm: bool = False
+    blocked_side: str = ""
 
     @property
     def or_range(self) -> Optional[float]:
@@ -282,6 +290,12 @@ class AlgoEngine:
         self._today_trades: List[Dict[str, Any]] = []
         self._recovered: Optional[str] = None
         self._signal_day: Optional[str] = None
+        self._signal_count = 0
+
+    def _signals_used(self, today: str) -> int:
+        if self._signal_day != today:
+            return 0
+        return max(1, self._signal_count)
 
     # ------------------------------------------------------------------ log
     def _log(self, msg: str, level: str = "info", notification: str = "algo_update", **extra: Any) -> None:
@@ -347,6 +361,7 @@ class AlgoEngine:
                 "todayTrades": self._today_trades,
                 "savedAt": time.time(),
                 "signalDay": self._signal_day,
+                "signalCount": self._signal_count,
                 "accountId": self.account_id or current_account(),
                 "clientId": account_credentials(self.account_id)[0] if self.account_id else None,
             }
@@ -367,6 +382,7 @@ class AlgoEngine:
             pass
         self.enabled = bool(data.get("enabled"))
         self._signal_day = data.get("signalDay")
+        self._signal_count = int(data.get("signalCount") or (1 if self._signal_day else 0))
         self._day = data.get("day")
         self._today_trades = list(data.get("todayTrades") or [])
         legs = data.get("legs") or {}
@@ -790,6 +806,8 @@ class AlgoEngine:
                 raise HTTPException(400, f"{key} must be finite and nonnegative")
         if cfg.max_or_pct and cfg.min_or_pct > cfg.max_or_pct:
             raise HTTPException(400, "min_or_pct cannot exceed max_or_pct")
+        if not isinstance(cfg.max_trades, int) or not 1 <= cfg.max_trades <= 5:
+            raise HTTPException(400, "max_trades must be between 1 and 5")
         if cfg.order_type not in {"MARKET", "LIMIT"} or cfg.product_type not in {"INTRADAY", "MARGIN"}:
             raise HTTPException(400, "Unsupported algo order/product type")
         if not cfg.indices or any(get_index(key) is None for key in cfg.indices):
@@ -869,10 +887,13 @@ class AlgoEngine:
         if minute >= OR_READY_MIN:
             if self.account_id == "child":
                 master = engines.items["master"]
-                if master._signal_day != today and not self._today_trades:
+                if self._position is None and (
+                        master._signal_day != today
+                        or any(l.status == "watching" for l in master._legs.values())):
                     self._legs = {key: DayLeg(**asdict(leg)) for key, leg in master._legs.items()}
             else:
                 await self._maybe_compute_or()
+                self._maybe_open_next_trade(today, minute)
 
         # Forced square-off
         if self._position is not None and minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12):
@@ -898,6 +919,36 @@ class AlgoEngine:
         self._legs = {k: DayLeg(k) for k in self.cfg.indices}
         self.phase = "preopen" if now.hour < 9 else "building_or"
         self._persist()
+
+    def _maybe_open_next_trade(self, today: str, minute: int) -> None:
+        """Once every account is flat after a consumed signal, re-watch both indices."""
+        used = self._signals_used(today)
+        if (self.account_id != "master" or not 0 < used < self.cfg.max_trades
+                or minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
+                or any(e._position is not None for e in engines.items.values())
+                or any(l.status == "watching" for l in self._legs.values())):
+            return
+        reopened = []
+        for key, leg in self._legs.items():
+            if leg.or_high is None or leg.or_low is None:
+                continue
+            leg.status = "watching"
+            leg.rearm = True
+            leg.blocked_side = ""
+            leg.signal = None
+            leg.entry_attempts = 0
+            leg.next_try_at = 0.0
+            leg.error = ""
+            leg.lot_cap = None
+            leg.funds_retries = 0
+            leg.note = f"Trade {used + 1}: waiting for a fresh breakout"
+            reopened.append(key)
+        if reopened:
+            self._log(f"Trade {used}/{self.cfg.max_trades} done and all accounts flat; watching "
+                      f"{', '.join(reopened)} for a fresh breakout (trade {used + 1}). "
+                      f"A side spot is already beyond needs spot back inside the range first.",
+                      level="info")
+            self._persist()
 
     # -------------------------------------------------------------- OR build
     def _can_compute_or(self) -> bool:
@@ -1200,9 +1251,13 @@ class AlgoEngine:
             return
         now = now_ist()
         minute = now.hour * 60 + now.minute
+        today = now.date().isoformat()
         if (now.weekday() >= 5 or minute < OR_READY_MIN
                 or minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
-                or self._today_trades or self._signal_day == now.date().isoformat()):
+                or len(self._today_trades) >= self.cfg.max_trades
+                or self._signals_used(today) >= self.cfg.max_trades):
+            return
+        if self.account_id is not None and any(e._position is not None for e in engines.items.values()):
             return
         for key in self.cfg.indices:
             leg = self._legs.get(key)
@@ -1214,6 +1269,22 @@ class AlgoEngine:
             age = feed.age(inst.sec_id, "IDX_I") if inst else None
             if age is None or age > MAX_PRICE_AGE:
                 leg.note = "Waiting for a fresh spot quote (maximum age 5s)"
+                continue
+            side = ("CALL" if leg.spot > leg.or_high
+                    else "PUT" if leg.or_low is not None and leg.spot < leg.or_low else "")
+            if leg.rearm:
+                leg.rearm = False
+                leg.blocked_side = side
+                if side:
+                    leg.note = (f"Spot {leg.spot} already beyond OR {'high' if side == 'CALL' else 'low'}; "
+                                "waiting for it to return inside the range")
+                continue
+            if side and side == leg.blocked_side:
+                continue
+            if not side and leg.blocked_side:
+                leg.blocked_side = ""
+                leg.note = "Back inside the range; the next breakout will trade"
+                self._log(f"{key} back inside the range ({leg.spot}); fresh breakout armed", index=key)
                 continue
             rng = leg.or_range or 0.0
             if rng <= 0:
@@ -1434,7 +1505,7 @@ class AlgoEngine:
                 return
         self.phase = "in_trade" if pos.execution_state == "open" else pos.execution_state
 
-        # Lock out the other index (one trade per day).
+        # Lock out the other index for this trade.
         for other in self.cfg.indices:
             if other != leg.index_key and self._legs.get(other, DayLeg(other)).status == "watching":
                 o = self._legs[other]
@@ -1985,7 +2056,10 @@ class AlgoEngine:
         if minute >= _to_min(self.cfg.entry_cutoff, 15 * 60) and not self._today_trades:
             out.append(f"No fresh entries after {self.cfg.entry_cutoff}. Trade window closed.")
         if self._today_trades:
-            out.append("Today's trade is done - waiting for the next session.")
+            done = len(self._today_trades)
+            out.append(f"{done}/{self.cfg.max_trades} trade(s) done today."
+                       + (" Waiting for the next session." if done >= self.cfg.max_trades else
+                          " Next trade needs every account flat and a fresh breakout."))
         return out
 
     def status(self) -> Dict[str, Any]:
@@ -2164,12 +2238,17 @@ class AccountEngines:
             source.note = note
             return
         signal = asdict(source)
-        master._log(f"SIGNAL {source.index_key} {direction}: spot {source.spot} vs OR "
+        today = now_ist().date().isoformat()
+        prev_signal = (master._signal_day, master._signal_count)
+        trade_no = master._signals_used(today) + 1
+        master._log(f"SIGNAL {source.index_key} {direction} (trade {trade_no}/{master.cfg.max_trades}): "
+                    f"spot {source.spot} vs OR "
                     f"H {source.or_high} / L {source.or_low}; contract {int(source.strike or 0)} "
                     f"{'CE' if direction == 'CALL' else 'PE'} premium {feed.price(source.security_id, segment)} "
                     f"-> sending to {','.join(self.entry_accounts)} "
                     f"(+{(time.perf_counter() - t0) * 1000:.0f}ms)", index=source.index_key)
-        master._signal_day = now_ist().date().isoformat()
+        master._signal_day = today
+        master._signal_count = trade_no
         with account_scope("master"):
             master._persist()
         # Accounts where an order may have reached the broker (or the outcome is
@@ -2179,7 +2258,7 @@ class AccountEngines:
             engine = self.items[account]
             with account_scope(account):
                 try:
-                    if engine._position is not None or engine._today_trades:
+                    if engine._position is not None or len(engine._today_trades) >= engine.cfg.max_trades:
                         consumed.add(account)
                         engine._log("Shared signal skipped: existing position/trade.", level="warn")
                         return
@@ -2216,7 +2295,7 @@ class AccountEngines:
         if not consumed:
             # 2026-11-04: spot dipped back under the OR high during pre-order checks,
             # every account aborted before sending an order, yet the day stayed locked.
-            master._signal_day = None
+            master._signal_day, master._signal_count = prev_signal
             leg = master._legs.get(source.index_key, source)
             if leg.status == "watching":
                 leg.next_try_at = time.time() + SIGNAL_RETRY_COOLDOWN
@@ -2228,6 +2307,12 @@ class AccountEngines:
             return
         source.status = "locked"
         source.note = "Shared signal dispatched; inspect each account result. No blind replay."
+        # This signal is spent: nothing else may fire until every account is flat
+        # and _maybe_open_next_trade re-watches with the fresh-breakout guard.
+        for other in master._legs.values():
+            if other.status == "watching":
+                other.status = "locked"
+                other.note = f"{source.index_key} took trade {trade_no}"
         with account_scope("master"):
             master._persist()
 
