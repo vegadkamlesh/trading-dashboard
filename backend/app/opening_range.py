@@ -1,4 +1,4 @@
-"""Opening-range (first 10 minutes, 09:15-09:25) study engine.
+"""Opening-range (first 10 minutes, 09:15:00-09:24:59) study engine.
 
 Question it answers
 -------------------
@@ -41,7 +41,7 @@ CACHE_TTL_SECONDS = 6 * 3600
 MAX_DAYS_PER_CALL = 90          # Dhan intraday limit
 MAX_YEARS = 5
 WINDOW_START_MIN = 9 * 60 + 15  # 09:15
-WINDOW_END_MIN = 9 * 60 + 25    # 09:25 (inclusive)
+WINDOW_END_MIN = 9 * 60 + 24    # 09:24 candle (inclusive) -> window ends 09:24:59
 # Dhan /charts/intraday treats fromDate as exclusive: "09:15:00" drops the 09:15 candle.
 INTRADAY_FROM_TIME = "09:14:00"
 RECENT_SAMPLES = 20             # show the most recent N sessions
@@ -107,7 +107,7 @@ class OpeningRangeResult:
             "index": self.index_key,
             "years": self.years,
             "windowStart": "09:15",
-            "windowEnd": "09:25",
+            "windowEnd": "09:24:59",
             "sampleDays": self.sample_days,
             "avgRangePoints": self.avg_range_points,
             "avgRangePct": self.avg_range_pct,

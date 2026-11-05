@@ -113,8 +113,8 @@ export function Readme() {
       <Section title="ORB Algo: BUY, SL, target aur exit ka exact flow">
         <ol className="list-decimal space-y-2 pl-5 text-xs">
           <li>
-            <strong>Range:</strong> 09:26 IST ke baad 09:15 se 09:25 inclusive candle timestamps
-            ka high/low lock hota hai (existing window: 11 one-minute timestamps).
+            <strong>Range:</strong> 09:25 IST par pehle 10 minute (09:15:00–09:24:59, 10 candles)
+            ka high/low lock hota hai.
             Spot high se strictly upar = CALL BUY; low se strictly neeche = PUT BUY.
             First index trade leta hai; doosra lock. Default 15:00 se fresh entry band.
             Index quotes 2 decimals pe compare hote hain, float noise breakout nahi banta.

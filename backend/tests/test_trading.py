@@ -495,7 +495,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.engine._legs = {}
         intraday = AsyncMock(return_value=raw)
         with patch.object(algo_module, "now_ist",
-                          return_value=algo_module.datetime(2026, 11, 5, 9, 26, 5, tzinfo=algo_module.IST)), \
+                          return_value=algo_module.datetime(2026, 11, 5, 9, 25, 5, tzinfo=algo_module.IST)), \
                 patch.object(self.engine, "_intraday", intraday), \
                 patch.object(self.engine, "_prepare_contract", AsyncMock()), \
                 patch.object(algo_module.feed, "subscribe"):
@@ -505,13 +505,26 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_opening_range_includes_0915_candle(self):
         # Dhan's fromDate is exclusive; 05-Nov SENSEX OR was wrong because 09:15 was dropped.
         intraday, leg = await self._compute_or(self._or_candles(
-            [(15, 78922.44, 78520.56), (16, 78722.61, 78638.4), (25, 78800.0, 78600.0), (26, 79999.0, 1.0)]))
+            [(15, 78922.44, 78520.56), (16, 78722.61, 78638.4), (24, 78800.0, 78600.0), (26, 79999.0, 1.0)]))
         self.assertEqual(intraday.await_args.kwargs["from_dt"], "2026-11-05 09:14:00")
         self.assertEqual((leg.or_high, leg.or_low), (78922.44, 78520.56))
         self.assertEqual(leg.status, "watching")
 
+    async def test_opening_range_is_first_ten_minutes_only(self):
+        # OR = 09:15:00-09:24:59 (10 candles); the 09:25 candle is already post-OR.
+        _, leg = await self._compute_or(self._or_candles(
+            [(m, 100.0 + m, 90.0 - m) for m in range(15, 25)] + [(25, 500.0, 1.0)]))
+        self.assertEqual((leg.or_high, leg.or_low), (124.0, 66.0))
+        self.assertEqual(leg.status, "watching")
+
+    async def test_opening_range_waits_for_0924_candle(self):
+        _, leg = await self._compute_or(self._or_candles([(m, 100.0 + m, 90.0) for m in range(15, 24)]))
+        self.assertIsNone(leg.or_high)
+        self.assertNotEqual(leg.status, "watching")
+        self.assertIn("09:24", leg.note)
+
     async def test_opening_range_does_not_lock_without_0915_candle(self):
-        _, leg = await self._compute_or(self._or_candles([(m, 100.0 + m, 90.0) for m in range(16, 26)]))
+        _, leg = await self._compute_or(self._or_candles([(m, 100.0 + m, 90.0) for m in range(16, 25)]))
         self.assertIsNone(leg.or_high)
         self.assertNotEqual(leg.status, "watching")
         self.assertIn("09:15", leg.note)

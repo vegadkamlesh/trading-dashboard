@@ -48,9 +48,9 @@ is separate from explicit EXIT BOTH. See [README](./README.md#master-dhan--child
 for environment keys, controls, restart behavior, rate budgets and log locations.
 
 ```
-09:15 - 09:25   build the opening range (OR high / OR low) for both indices
-09:26           lock the levels, pre-pick the ATM option, size the lots
-after 09:26     watch BOTH indices tick-by-tick
+09:15 - 09:24:59 build the opening range (OR high / OR low) for both indices
+09:25           lock the levels, pre-pick the ATM option, size the lots
+after 09:25     watch BOTH indices tick-by-tick
                   spot breaks OR HIGH  ->  BUY CALL (ATM)
                   spot breaks OR LOW   ->  BUY PUT  (ATM)
                 the FIRST index to break takes the trade;
@@ -382,8 +382,9 @@ The current execution/synchronization contract is also documented in
 [README.md](./README.md#order-execution-and-stop-loss-rules-current-implementation).
 The performance figures above are the previous study, **not a rerun validating
 these execution changes**. Prices, fills, slippage and API outages can differ.
-The historical OR window is preserved: candle timestamps 09:15 through 09:25
-inclusive (11 one-minute timestamps), evaluated from 09:26 IST.
+The OR window is the first 10 minutes: candle timestamps 09:15 through 09:24
+inclusive (09:15:00-09:24:59), evaluated from 09:25 IST. The study figures above
+used the older 09:15-09:25 (11-candle) window.
 
 ### Stop / target: software **and** broker-side
 

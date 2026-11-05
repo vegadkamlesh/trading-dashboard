@@ -314,7 +314,7 @@ function IndexCard({ leg, cfg, status }: { leg: AlgoLeg; cfg: AlgoConfig; status
       </div>
 
       <div className="grid grid-cols-3 gap-2">
-        <Stat label="OR High (9:25)" value={n(leg.orHigh, 1)} />
+        <Stat label="OR High (9:15–9:24)" value={n(leg.orHigh, 1)} />
         <Stat label="OR Low" value={n(leg.orLow, 1)} />
         <Stat label="OR Range" value={leg.orRange !== null ? `${n(leg.orRange, 1)} pts` : "—"} />
       </div>

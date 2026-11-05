@@ -2,9 +2,9 @@
 
 What it does, once you flip it ON
 ---------------------------------
-  09:15-09:25  builds the opening range (OR high / OR low) for NIFTY + SENSEX
-  09:26        locks the levels, pre-picks the option contract, sizes the lots
-  after 09:26  watches BOTH indices tick-by-tick. The FIRST one to break its
+  09:15-09:24:59 builds the opening range (OR high / OR low) for NIFTY + SENSEX
+  09:25        locks the levels, pre-picks the option contract, sizes the lots
+  after 09:25  watches BOTH indices tick-by-tick. The FIRST one to break its
                range takes the trade; the other is locked out for the day.
                break UP   -> buy CALL (ATM, or ATM +/- offset)
                break DOWN -> buy PUT
@@ -56,7 +56,7 @@ logger = logging.getLogger("dhan.algo")
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN_MIN = 9 * 60 + 15
 MARKET_CLOSE_MIN = 15 * 60 + 30
-OR_READY_MIN = 9 * 60 + 26          # start computing the OR at/after this minute
+OR_READY_MIN = 9 * 60 + 25          # start computing the OR at/after this minute
 TICKER = 15
 RECONCILE_SECONDS = 1.0
 MAX_PRICE_AGE = 5.0
@@ -802,7 +802,7 @@ class AlgoEngine:
             except ValueError:
                 raise HTTPException(400, "Use valid HH:MM times in IST")
         if not OR_READY_MIN <= entry_min <= exit_min <= MARKET_CLOSE_MIN:
-            raise HTTPException(400, "Require 09:26 <= entry cutoff <= exit time <= 15:30 IST")
+            raise HTTPException(400, "Require 09:25 <= entry cutoff <= exit time <= 15:30 IST")
         self.cfg = cfg
         self._log("Configuration updated by operator")
         self._subscribe_tracked()
@@ -946,7 +946,7 @@ class AlgoEngine:
                     instrument="INDEX",
                     interval="1",
                     from_dt=f"{today.isoformat()} {INTRADAY_FROM_TIME}",
-                    to_dt=f"{today.isoformat()} 09:26:00",
+                    to_dt=f"{today.isoformat()} 09:26:00",  # 09:25+ candles are filtered out below
                 )
             except DhanAPIError as exc:
                 leg.note = f"OR fetch failed: {exc.error_message}"
@@ -979,6 +979,10 @@ class AlgoEngine:
                 if leg.note != note:
                     self._log(f"{key} {note}", level="warn", index=key)
                 leg.note = note
+                continue
+            if WINDOW_END_MIN not in minutes:
+                # Right at 09:25 Dhan may not have published the 09:24 candle yet.
+                leg.note = "waiting for the 09:24 candle"
                 continue
             leg.or_high = max(highs)
             leg.or_low = min(lows)
@@ -1931,7 +1935,7 @@ class AlgoEngine:
         return {
             "off": "OFF - algo is not armed",
             "preopen": "Pre-open - waiting for 09:15",
-            "building_or": "Building opening range (09:15-09:25)",
+            "building_or": "Building opening range (09:15-09:24:59)",
             "watching": "Watching both indices for a breakout",
             "in_trade": "In a trade - managing stop & target",
             "day_done": "Done for today (trade taken or no breakout)",
@@ -1972,8 +1976,8 @@ class AlgoEngine:
             return out
         if minute < 9 * 60 + 15:
             out.append("Waiting for the 09:15 open.")
-        elif minute < 9 * 60 + 26:
-            out.append("Will lock the opening range (09:15-09:25) and pre-pick contracts.")
+        elif minute < OR_READY_MIN:
+            out.append("Will lock the opening range (09:15-09:24:59) at 09:25 and pre-pick contracts.")
         watching = [k for k, l in self._legs.items() if l.status == "watching"]
         if watching:
             out.append(f"Watching {', '.join(watching)} for the first break of the range.")

@@ -298,9 +298,9 @@ IP for **each** account, then explicitly ARM the intended recipients.
 
 1. Arm the algo from its tab. LIVE arming checks Dhan's registered-IP verdict.
    DRY-RUN simulates orders; it does not submit them.
-2. At/after **09:26 IST**, build today's opening range from candle timestamps
-   **09:15 through 09:25 inclusive**. This preserves the existing study window
-   (11 one-minute candle timestamps, despite the older "first 10 minutes" label).
+2. At/after **09:25 IST**, build today's opening range from the first 10
+   one-minute candles, **09:15 through 09:24 inclusive** (09:15:00-09:24:59).
+   It locks only when both the 09:15 and 09:24 candles are present.
 3. The first watched index with spot **strictly above OR high buys a CALL**;
    spot **strictly below OR low buys a PUT**. Equal to a boundary is not a break.
    One trade per day across both indices; no new entries at/after **15:00**.
