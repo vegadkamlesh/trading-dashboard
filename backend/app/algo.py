@@ -303,6 +303,8 @@ class AlgoEngine:
         self.phase = "off"
         self._day: Optional[str] = None
         self._legs: Dict[str, DayLeg] = {}
+        # Backup opening range built from live index ticks, used only if /charts/intraday fails.
+        self._tick_or: Dict[str, Dict[str, Any]] = {}
         self._position: Optional[Position] = None
         self._events: List[Dict[str, Any]] = []
         self._task: Optional[asyncio.Task] = None
@@ -1017,6 +1019,34 @@ class AlgoEngine:
                 logger.info("intraday 429; retry %d in %.1fs", attempt + 1, delay)
         raise last if last else DhanAPIError(429, "DH-904", "rate limited")
 
+    def _record_tick_or(self, security_id: int, ltp: float, now: Optional[datetime] = None) -> None:
+        now = now or now_ist()
+        sess = session_for(now)
+        minute = now.hour * 60 + now.minute
+        if not sess.trading_day or not sess.open_min <= minute <= sess.or_end_min or ltp <= 0:
+            return
+        for key in self.cfg.indices:
+            inst = get_index(key)
+            if inst is None or inst.sec_id != security_id:
+                continue
+            day = now.date().isoformat()
+            rec = self._tick_or.get(key)
+            if rec is None or rec["day"] != day:
+                rec = self._tick_or[key] = {"day": day, "high": ltp, "low": ltp, "minutes": set()}
+            rec["high"] = max(rec["high"], ltp)
+            rec["low"] = min(rec["low"], ltp)
+            rec["minutes"].add(minute)
+            return
+
+    def _tick_or_range(self, key: str, day: str, sess: Session) -> Optional[tuple]:
+        """(high, low) from live ticks, only when every OR minute saw at least one tick."""
+        rec = self._tick_or.get(key)
+        if rec is None or rec["day"] != day:
+            return None
+        if not set(range(sess.open_min, sess.or_end_min + 1)) <= rec["minutes"]:
+            return None
+        return rec["high"], rec["low"]
+
     async def _maybe_compute_or(self, force: bool = False) -> None:
         if not self._can_compute_or():
             return
@@ -1047,8 +1077,23 @@ class AlgoEngine:
                     to_dt=f"{today.isoformat()} {_hhmm(sess.or_ready_min + 1)}:00",  # later candles filtered below
                 )
             except DhanAPIError as exc:
-                leg.note = f"OR fetch failed: {exc.error_message}"
                 self._last_error = exc.error_message
+                now_min = now_ist().hour * 60 + now_ist().minute
+                backup = self._tick_or_range(key, today.isoformat(), sess)
+                if backup is None or now_min < sess.or_ready_min + 1:
+                    leg.note = f"OR fetch failed: {exc.error_message}"
+                    continue
+                leg.or_high, leg.or_low = backup
+                leg.status = "watching"
+                leg.note = ""
+                self._log(
+                    f"{key} opening range locked from LIVE TICKS (Dhan candle API failed: "
+                    f"{exc.error_message})  H {leg.or_high:,.1f}  L {leg.or_low:,.1f}  "
+                    f"({leg.or_range:,.1f} pts)",
+                    level="warn", index=key, orHigh=leg.or_high, orLow=leg.or_low,
+                )
+                feed.subscribe(inst.sec_id, "IDX_I")
+                asyncio.ensure_future(self._prepare_contract(leg))
                 continue
             highs, lows, ts, minutes = [], [], [], set()
             data = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
@@ -1178,6 +1223,8 @@ class AlgoEngine:
     # ------------------------------------------------------------- tick loop
     def _on_tick(self, security_id: int, ltp: float, segment: Optional[str] = None) -> None:
         """Called from the feed on every price change. Must stay non-blocking."""
+        if segment in (None, "IDX_I") and self.account_id != "child":
+            self._record_tick_or(security_id, ltp)
         for leg in self._legs.values():
             if leg.index_key in self.cfg.indices and get_index(leg.index_key) and \
                     get_index(leg.index_key).sec_id == security_id and segment in (None, "IDX_I"):

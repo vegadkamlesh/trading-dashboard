@@ -530,6 +530,40 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(leg.status, "watching")
         self.assertIn("09:15", leg.note)
 
+    async def _tick_fallback(self, tick_minutes, at_minute=26):
+        self.engine.cfg.indices = ["NIFTY"]
+        self.engine._legs = {}
+        self.engine._tick_or = {}
+        sid = algo_module.get_index("NIFTY").sec_id
+        day = algo_module.datetime(2026, 11, 5, tzinfo=algo_module.IST)
+        self.engine._record_tick_or(sid, 999.0, day.replace(hour=9, minute=14, second=59))
+        for m in tick_minutes:
+            self.engine._record_tick_or(sid, 100.0 + m, day.replace(hour=9, minute=m, second=1))
+            self.engine._record_tick_or(sid, 90.0 - m, day.replace(hour=9, minute=m, second=40))
+        self.engine._record_tick_or(sid, 1.0, day.replace(hour=9, minute=25, second=0))
+        throttled = AsyncMock(side_effect=algo_module.DhanAPIError(429, "DH-904", "Too many requests"))
+        with patch.object(algo_module, "now_ist", return_value=day.replace(hour=9, minute=at_minute, second=5)), \
+                patch.object(self.engine, "_intraday", throttled), \
+                patch.object(self.engine, "_prepare_contract", AsyncMock()), \
+                patch.object(algo_module.feed, "subscribe"):
+            await self.engine._maybe_compute_or()
+        return self.engine._legs["NIFTY"]
+
+    async def test_opening_range_falls_back_to_live_ticks_when_candles_throttled(self):
+        leg = await self._tick_fallback(range(15, 25))
+        self.assertEqual((leg.or_high, leg.or_low), (124.0, 66.0))
+        self.assertEqual(leg.status, "watching")
+
+    async def test_tick_fallback_waits_one_minute_for_candle_api(self):
+        leg = await self._tick_fallback(range(15, 25), at_minute=25)
+        self.assertIsNone(leg.or_high)
+        self.assertIn("OR fetch failed", leg.note)
+
+    async def test_tick_fallback_needs_every_or_minute(self):
+        leg = await self._tick_fallback([m for m in range(15, 25) if m != 15])
+        self.assertIsNone(leg.or_high)
+        self.assertNotEqual(leg.status, "watching")
+
     async def test_muhurat_special_session_shifts_or_and_limits_trades(self):
         day = algo_module.datetime(2026, 11, 8, tzinfo=algo_module.IST)  # Sunday
         raw = {"data": {"timestamp": [], "high": [], "low": []}}
