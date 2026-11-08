@@ -4,14 +4,17 @@
 
 OR = 09:15:00-09:24:59 (10 candles), same as the live algo. Post-OR window = 09:25-15:29.
 Days without both the 09:15 and 09:24 candles (holidays, Muhurat, data gaps) are skipped.
-Expiry weekdays are the exchange schedule with holiday roll-back to the previous trading
-day (approximation; one-off exchange shifts are not modelled).
+Expiry days come from data/history/expiry_calendar.json (run_expiry_calendar.py), built from
+the real NSE/BSE F&O bhavcopies, so holiday and one-off exchange shifts are included. The
+expiry comparison only uses each index's weekly-expiry era (NIFTY Feb-2019, SENSEX May-2023).
 """
 from __future__ import annotations
 
 import csv
 import gzip
+import json
 import statistics as st
+import sys
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -36,8 +39,26 @@ def load(key: str) -> dict[date, list[tuple]]:
 
 
 # ---------------------------------------------------------------- expiry calendar
+CALENDAR = HIST / "expiry_calendar.json"
+# (label, from, to) — weekday regimes of the weekly contract, from the exchange calendar.
+REGIMES = {
+    "NIFTY": [("Thu weekly", "2019-02-14", "2025-08-31"), ("Tue weekly", "2025-09-01", "9999")],
+    "SENSEX": [("Fri weekly", "2023-05-19", "2024-12-31"), ("Tue weekly", "2025-01-01", "2025-08-31"),
+               ("Thu weekly", "2025-09-01", "9999")],
+}
+
+
+def load_calendar(key: str) -> tuple[set[str], str]:
+    """Exchange expiry dates and the first weekly-era expiry for one index."""
+    if not CALENDAR.exists():
+        sys.exit(f"{CALENDAR} missing — run run_expiry_calendar.py first.")
+    c = json.loads(CALENDAR.read_text(encoding="utf-8"))[key]
+    return set(c["expiries"]), c["weekly_start"]
+
+
 def expiry_weekday(key: str, d: date) -> int | None:
-    """0=Mon .. 4=Fri, or None when the index had no liquid weekly contract."""
+    """Old weekday rule, kept only to report how many days it misclassified.
+    0=Mon .. 4=Fri, or None when the index had no liquid weekly contract."""
     if key == "NIFTY":
         if d < date(2019, 2, 11):
             return None
@@ -263,36 +284,51 @@ def section(key: str, rows: list[dict], label: str, spot: float, lot: int) -> li
     return out
 
 
-def expiry_section(key: str, rows: list[dict], spot: float) -> list[str]:
-    e = [r for r in rows if r["expiry"]]
-    ne = [r for r in rows if not r["expiry"] and r["day"] >= (e[0]["day"] if e else "9")]
-    if not e:
-        return []
+def expiry_section(key: str, rows: list[dict], weekly_start: str) -> list[str]:
+    """Expiry vs non-expiry days, both restricted to the weekly-expiry era, overall and per regime."""
     def stats(rs):
         tr = [r for r in rs if r["first"]]
         return (st.median([r["or_pct"] for r in rs]), st.median([max(r["up_ext"], r["dn_ext"]) for r in rs]),
                 pct(sum(1 for r in rs if r["both"]), len(rs)), pct(sum(1 for r in tr if r["full_reverse"]), len(tr)),
                 pct(sum(1 for r in tr if r["hits"][0.25] == "hit"), len(tr)),
                 pct(sum(1 for r in tr if r["hits"][0.5] == "hit"), len(tr)))
-    a, b = stats(e), stats(ne)
-    return [f"| {key} | {len(e)} | {a[0]:.2f}% / {b[0]:.2f}% | {a[1]:.2f}% / {b[1]:.2f}% | {a[2]} / {b[2]} | "
-            f"{a[3]} / {b[3]} | {a[4]} / {b[4]} | {a[5]} / {b[5]} |"]
+    out = []
+    periods = [("poora weekly era", weekly_start, "9999")] + REGIMES[key]
+    for label, lo, hi in periods:
+        era = [r for r in rows if max(lo, weekly_start) <= r["day"] <= hi]
+        e = [r for r in era if r["expiry"]]
+        ne = [r for r in era if not r["expiry"]]
+        if len(e) < 5 or not ne:
+            continue
+        a, b = stats(e), stats(ne)
+        out.append(f"| {key} — {label} ({e[0]['day']} → {e[-1]['day']}) | {len(e)} / {len(ne)} | "
+                   f"{a[0]:.2f}% / {b[0]:.2f}% | {a[1]:.2f}% / {b[1]:.2f}% | {a[2]} / {b[2]} | "
+                   f"{a[3]} / {b[3]} | {a[4]} / {b[4]} | {a[5]} / {b[5]} |")
+    return out
 
 
 def main() -> None:
     lots = {"NIFTY": 65, "SENSEX": 20}
     report = ["# ORB market study (10-min opening range, 1-minute Dhan data)", ""]
-    exp_rows = []
+    exp_rows, cal_notes = [], []
     for key in ("NIFTY", "SENSEX"):
         days = load(key)
-        trading = set(days)
-        exps = expiry_days(key, trading)
+        exps, weekly_start = load_calendar(key)
+        rule = {d.isoformat() for d in expiry_days(key, set(days))}
         rows = []
         for d in sorted(days):
             r = analyse_day(days[d])
             if r:
-                r["day"], r["expiry"] = d.isoformat(), d in exps
+                r["day"] = d.isoformat()
+                r["expiry"] = r["day"] in exps and r["day"] >= weekly_start
                 rows.append(r)
+        era = {r["day"] for r in rows if r["day"] >= weekly_start}
+        cal = {d for d in exps if d in era}
+        wrong_in, wrong_out = sorted((rule & era) - cal), sorted(cal - rule)
+        cal_notes.append(f"- {key}: weekly era {weekly_start} se, {len(cal)} expiry din (exchange bhavcopy). "
+                         f"Purana weekday rule {len(wrong_in) + len(wrong_out)} din galat tha "
+                         f"({len(wrong_in)} galti se expiry maana, {len(wrong_out)} asli expiry miss)."
+                         + (f" Example: {', '.join((wrong_in + wrong_out)[:6])}" if wrong_in or wrong_out else ""))
         spot = rows[-1]["close"]
         report.append(f"## {key} (aaj ka spot ~{spot:,.0f}, lot {lots[key]}, option pts = spot pts × delta "
                       f"{DELTA['normal']} normal / {DELTA['expiry']} expiry)")
@@ -302,12 +338,15 @@ def main() -> None:
         report += section(key, r5, "last 5 saal", spot, lots[key])
         if rows[0]["day"] < cut5:
             report += section(key, rows, "poora data", spot, lots[key])
-        exp_rows += expiry_section(key, rows, spot)
-    report += ["## Expiry din vs normal din (expiry / normal)", "",
-               "| Index | Expiry din | OR chaudai | Max ek-side move | Dono side break | Full reversal | 0.25% target hit | 0.5% target hit |",
+        exp_rows += expiry_section(key, rows, weekly_start)
+    report += ["## Expiry din vs normal din (expiry / normal, dono sirf weekly-expiry era ke)", "",
+               "Expiry dates: NSE/BSE F&O bhavcopy se bana asli exchange calendar (holiday shift sahit).", ""]
+    report += cal_notes + ["",
+               "| Index — period | Din (expiry / normal) | OR chaudai | Max ek-side move | Dono side break | Full reversal | 0.25% target hit | 0.5% target hit |",
                "|---|---|---|---|---|---|---|---|"] + exp_rows + [""]
     out = HIST / "orb_market_report.md"
     out.write_text("\n".join(report), encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
     print("\n".join(report))
     print(f"\nWritten {out}")
 
