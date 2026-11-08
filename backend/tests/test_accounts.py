@@ -676,6 +676,7 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         """Trade 1 CALL -> both flat -> no re-buy while spot still above high ->
         back inside -> PUT trade 2 -> day locked. MARGIN (carry-forward) product."""
         master, child = self.manager.items["master"], self.manager.items["child"]
+        self.enterContext(patch.dict(algo_module.SPECIAL_SESSIONS, clear=True))
         for b in self.brokers.values():
             b.product = "MARGIN"
         for e in self.manager.items.values():

@@ -530,6 +530,35 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(leg.status, "watching")
         self.assertIn("09:15", leg.note)
 
+    async def test_muhurat_special_session_shifts_or_and_limits_trades(self):
+        day = algo_module.datetime(2026, 11, 8, tzinfo=algo_module.IST)  # Sunday
+        raw = {"data": {"timestamp": [], "high": [], "low": []}}
+        for m, h, lo in [(19, 999.0, 1.0)] + [(20 + i, 100.0 + i, 90.0 - i) for i in range(10)] + [(30, 999.0, 1.0)]:
+            raw["data"]["timestamp"].append(int(day.replace(hour=14, minute=m).timestamp()))
+            raw["data"]["high"].append(h)
+            raw["data"]["low"].append(lo)
+        self.engine.cfg.indices = ["NIFTY"]
+        self.engine._legs = {}
+        intraday = AsyncMock(return_value=raw)
+        with patch.object(algo_module, "now_ist", return_value=day.replace(hour=14, minute=29, second=50)):
+            self.assertFalse(self.engine._can_compute_or())
+        with patch.object(algo_module, "now_ist", return_value=day.replace(hour=14, minute=30, second=5)), \
+                patch.object(self.engine, "_intraday", intraday), \
+                patch.object(self.engine, "_prepare_contract", AsyncMock()), \
+                patch.object(algo_module.feed, "subscribe"):
+            await self.engine._maybe_compute_or()
+            self.assertEqual(self.engine._max_trades(), 1)
+            self.assertEqual(self.engine._exit_min(), 15 * 60 + 30)
+            self.assertEqual(self.engine._cutoff_min(), 15 * 60 + 15)
+        leg = self.engine._legs["NIFTY"]
+        self.assertEqual(intraday.await_args.kwargs["from_dt"], "2026-11-08 14:19:00")
+        self.assertEqual((leg.or_high, leg.or_low), (109.0, 81.0))
+        self.assertEqual(leg.status, "watching")
+        normal = algo_module.datetime(2026, 11, 9, 10, tzinfo=algo_module.IST)
+        self.assertEqual(self.engine._max_trades(normal), self.engine.cfg.max_trades)
+        self.assertEqual(algo_module.session_for(normal).or_ready_min, 9 * 60 + 25)
+        self.assertFalse(algo_module.session_for(algo_module.datetime(2026, 11, 15, 14, 30, tzinfo=algo_module.IST)).trading_day)
+
     async def test_algo_entry_does_not_mix_with_pending_manual_entry(self):
         self.engine._position = None
         leg = DayLeg("NIFTY", status="watching", or_high=100, or_low=80,

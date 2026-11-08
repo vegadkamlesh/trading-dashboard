@@ -60,6 +60,37 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN_MIN = 9 * 60 + 15
 MARKET_CLOSE_MIN = 15 * 60 + 30
 OR_READY_MIN = 9 * 60 + 25          # start computing the OR at/after this minute
+
+# One-off exchange sessions (e.g. Diwali Muhurat). Same ORB rules, shifted clock.
+# open = first CTS minute; OR = open..open+9 (10 candles); lock at open+10.
+SPECIAL_SESSIONS: Dict[str, Dict[str, Any]] = {
+    "2026-11-08": {"name": "Muhurat", "open": 14 * 60 + 20, "close": 15 * 60 + 40,
+                   "entry_cutoff": "15:15", "exit_time": "15:30", "max_trades": 1},
+}
+
+
+@dataclass(frozen=True)
+class Session:
+    trading_day: bool
+    open_min: int
+    or_end_min: int
+    or_ready_min: int
+    close_min: int
+    special: Optional[Dict[str, Any]] = None
+
+
+def session_for(now: datetime) -> Session:
+    sp = SPECIAL_SESSIONS.get(now.date().isoformat())
+    if sp:
+        o = int(sp["open"])
+        return Session(True, o, o + 9, o + 10, int(sp["close"]), sp)
+    return Session(now.weekday() < 5, MARKET_OPEN_MIN, WINDOW_END_MIN, OR_READY_MIN, MARKET_CLOSE_MIN)
+
+
+def _hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
 TICKER = 15
 RECONCILE_SECONDS = 1.0
 MAX_PRICE_AGE = 5.0
@@ -296,6 +327,19 @@ class AlgoEngine:
         if self._signal_day != today:
             return 0
         return max(1, self._signal_count)
+
+    def _sess_val(self, key: str, now: Optional[datetime] = None) -> Any:
+        sp = session_for(now or now_ist()).special
+        return sp[key] if sp and key in sp else getattr(self.cfg, key)
+
+    def _max_trades(self, now: Optional[datetime] = None) -> int:
+        return int(self._sess_val("max_trades", now))
+
+    def _exit_min(self, now: Optional[datetime] = None) -> int:
+        return _to_min(self._sess_val("exit_time", now), 15 * 60 + 12)
+
+    def _cutoff_min(self, now: Optional[datetime] = None) -> int:
+        return _to_min(self._sess_val("entry_cutoff", now), 15 * 60)
 
     # ------------------------------------------------------------------ log
     def _log(self, msg: str, level: str = "info", notification: str = "algo_update", **extra: Any) -> None:
@@ -858,13 +902,13 @@ class AlgoEngine:
         if self._position is not None:
             self.phase = self._position.execution_state if self._position.execution_state != "open" else "in_trade"
             if (self._position.execution_state == "entry_pending"
-                    and (self._day != today or minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12))):
+                    and (self._day != today or minute >= self._exit_min(now))):
                 await self._exit_position_locked(self._position, "TIME")
                 return
             if self._position.execution_state in {"open", "attention"}:
                 if self._position.exit_reason:
                     await self._exit_position_locked(self._position, self._position.exit_reason)
-                elif self._day != today or minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12):
+                elif self._day != today or minute >= self._exit_min(now):
                     await self._exit_position_locked(self._position, "TIME")
                 else:
                     await self._manage_position()
@@ -873,18 +917,19 @@ class AlgoEngine:
             self.phase = "off"
             return
 
-        if now.weekday() >= 5:
+        sess = session_for(now)
+        if not sess.trading_day:
             self.phase = "closed"
             return
-        if minute < MARKET_OPEN_MIN:
+        if minute < sess.open_min:
             self.phase = "preopen"
             return
-        if minute >= MARKET_CLOSE_MIN:
+        if minute >= sess.close_min:
             self.phase = "closed"
             return
 
         # OR build + watch
-        if minute >= OR_READY_MIN:
+        if minute >= sess.or_ready_min:
             if self.account_id == "child":
                 master = engines.items["master"]
                 if self._position is None and (
@@ -896,14 +941,14 @@ class AlgoEngine:
                 self._maybe_open_next_trade(today, minute)
 
         # Forced square-off
-        if self._position is not None and minute >= _to_min(self.cfg.exit_time, 15 * 60 + 12):
+        if self._position is not None and minute >= self._exit_min(now):
             await self._exit_position_locked(self._position, "TIME")
 
         if self._position is not None:
             self.phase = "in_trade"
         elif any(l.status == "watching" for l in self._legs.values()):
             self.phase = "watching"
-        elif minute < OR_READY_MIN:
+        elif minute < sess.or_ready_min:
             self.phase = "building_or"
         else:
             self.phase = "day_done"
@@ -917,14 +962,14 @@ class AlgoEngine:
         self._today_trades = []
         self._recovered = None
         self._legs = {k: DayLeg(k) for k in self.cfg.indices}
-        self.phase = "preopen" if now.hour < 9 else "building_or"
+        self.phase = "preopen" if now.hour * 60 + now.minute < session_for(now).open_min else "building_or"
         self._persist()
 
     def _maybe_open_next_trade(self, today: str, minute: int) -> None:
         """Once every account is flat after a consumed signal, re-watch both indices."""
         used = self._signals_used(today)
-        if (self.account_id != "master" or not 0 < used < self.cfg.max_trades
-                or minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
+        if (self.account_id != "master" or not 0 < used < self._max_trades()
+                or minute >= self._cutoff_min()
                 or any(e._position is not None for e in engines.items.values())
                 or any(l.status == "watching" for l in self._legs.values())):
             return
@@ -944,7 +989,7 @@ class AlgoEngine:
             leg.note = f"Trade {used + 1}: waiting for a fresh breakout"
             reopened.append(key)
         if reopened:
-            self._log(f"Trade {used}/{self.cfg.max_trades} done and all accounts flat; watching "
+            self._log(f"Trade {used}/{self._max_trades()} done and all accounts flat; watching "
                       f"{', '.join(reopened)} for a fresh breakout (trade {used + 1}). "
                       f"A side spot is already beyond needs spot back inside the range first.",
                       level="info")
@@ -953,9 +998,8 @@ class AlgoEngine:
     # -------------------------------------------------------------- OR build
     def _can_compute_or(self) -> bool:
         now = now_ist()
-        if now.weekday() >= 5:
-            return False
-        return (now.hour * 60 + now.minute) >= OR_READY_MIN
+        sess = session_for(now)
+        return sess.trading_day and (now.hour * 60 + now.minute) >= sess.or_ready_min
 
     async def _intraday(self, **kwargs: Any) -> Dict[str, Any]:
         """Intraday fetch with throttle + 429 backoff (arming fires 2 back-to-back)."""
@@ -983,6 +1027,8 @@ class AlgoEngine:
         if not pending:
             return
         today = now_ist().date()
+        sess = session_for(now_ist())
+        or_start, or_end = sess.open_min, sess.or_end_min
         for key in pending:
             leg = self._legs.setdefault(key, DayLeg(key))
             inst = get_index(key)
@@ -996,8 +1042,9 @@ class AlgoEngine:
                     exchange_segment="IDX_I",
                     instrument="INDEX",
                     interval="1",
-                    from_dt=f"{today.isoformat()} {INTRADAY_FROM_TIME}",
-                    to_dt=f"{today.isoformat()} 09:26:00",  # 09:25+ candles are filtered out below
+                    from_dt=(f"{today.isoformat()} {INTRADAY_FROM_TIME}" if not sess.special
+                             else f"{today.isoformat()} {_hhmm(or_start - 1)}:00"),
+                    to_dt=f"{today.isoformat()} {_hhmm(sess.or_ready_min + 1)}:00",  # later candles filtered below
                 )
             except DhanAPIError as exc:
                 leg.note = f"OR fetch failed: {exc.error_message}"
@@ -1017,23 +1064,23 @@ class AlgoEngine:
                     except (TypeError, ValueError, OSError, OverflowError):
                         continue
                     m = t.hour * 60 + t.minute
-                    if WINDOW_START_MIN <= m <= WINDOW_END_MIN and mv > 0 and lv > 0:
+                    if or_start <= m <= or_end and mv > 0 and lv > 0:
                         highs.append(mv)
                         lows.append(lv)
                         minutes.add(m)
             if not highs or not lows:
                 leg.note = "no opening-range candles yet"
                 continue
-            if WINDOW_START_MIN not in minutes:
+            if or_start not in minutes:
                 # The 09:15 candle usually holds the day's opening extreme; never lock without it.
-                note = "09:15 candle missing from Dhan data - retrying OR fetch"
+                note = f"{_hhmm(or_start)} candle missing from Dhan data - retrying OR fetch"
                 if leg.note != note:
                     self._log(f"{key} {note}", level="warn", index=key)
                 leg.note = note
                 continue
-            if WINDOW_END_MIN not in minutes:
+            if or_end not in minutes:
                 # Right at 09:25 Dhan may not have published the 09:24 candle yet.
-                leg.note = "waiting for the 09:24 candle"
+                leg.note = f"waiting for the {_hhmm(or_end)} candle"
                 continue
             leg.or_high = max(highs)
             leg.or_low = min(lows)
@@ -1252,10 +1299,11 @@ class AlgoEngine:
         now = now_ist()
         minute = now.hour * 60 + now.minute
         today = now.date().isoformat()
-        if (now.weekday() >= 5 or minute < OR_READY_MIN
-                or minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
-                or len(self._today_trades) >= self.cfg.max_trades
-                or self._signals_used(today) >= self.cfg.max_trades):
+        sess = session_for(now)
+        if (not sess.trading_day or minute < sess.or_ready_min
+                or minute >= self._cutoff_min(now)
+                or len(self._today_trades) >= self._max_trades(now)
+                or self._signals_used(today) >= self._max_trades(now)):
             return
         if self.account_id is not None and any(e._position is not None for e in engines.items.values()):
             return
@@ -1538,7 +1586,7 @@ class AlgoEngine:
         if leg is None or leg.status != "error" or not self.enabled or pos.dry_run:
             return False
         now = now_ist()
-        if (now.hour * 60 + now.minute >= _to_min(self.cfg.entry_cutoff, 15 * 60)
+        if (now.hour * 60 + now.minute >= self._cutoff_min(now)
                 or time.time() - (pos.entry_ts or 0) > FUNDS_RETRY_WINDOW):
             return False
         return await self._retry_fewer_lots(leg, pos.option_type, pos.lots, leg.note)
@@ -1570,7 +1618,7 @@ class AlgoEngine:
                 self._log(f"Entry confirmed: {pos.index_key} {int(pos.strike)} "
                           f"{'CE' if pos.option_type == 'CALL' else 'PE'} {filled} units @ {average:.2f}"
                           f"{f' (+{(time.perf_counter() - t0) * 1000:.0f}ms since signal)' if t0 else ''}"
-                          f" | next: watching profit/loss rule + target, exit {self.cfg.exit_time}",
+                          f" | next: watching profit/loss rule + target, exit {self._sess_val('exit_time')}",
                           level="success", notification="algo_entry")
                 if self.cfg.protective_sl:
                     await self._place_protective_sl(pos)
@@ -2040,25 +2088,31 @@ class AlgoEngine:
                 be = p.entry_spot + (self.cfg.breakeven_at * p.or_range
                                      * (1 if p.option_type == "CALL" else -1))
                 out.append(f"Stop moves to break-even when spot touches {be:,.1f}.")
-            out.append(f"Forced square-off at {self.cfg.exit_time} unless target/stop hits first.")
+            out.append(f"Forced square-off at {self._sess_val('exit_time')} unless target/stop hits first.")
             return out
         if not self.enabled:
             out.append("Flip the switch ON to arm new entries.")
             return out
-        if minute < 9 * 60 + 15:
-            out.append("Waiting for the 09:15 open.")
-        elif minute < OR_READY_MIN:
-            out.append("Will lock the opening range (09:15-09:24:59) at 09:25 and pre-pick contracts.")
+        sess = session_for(now)
+        if sess.special:
+            out.append(f"{sess.special['name']} session: OR {_hhmm(sess.open_min)}-{_hhmm(sess.or_end_min)}:59, "
+                       f"{self._max_trades()} trade, entries till {self._sess_val('entry_cutoff')}, "
+                       f"exit {self._sess_val('exit_time')}.")
+        if minute < sess.open_min:
+            out.append(f"Waiting for the {_hhmm(sess.open_min)} open.")
+        elif minute < sess.or_ready_min:
+            out.append(f"Will lock the opening range ({_hhmm(sess.open_min)}-{_hhmm(sess.or_end_min)}:59) "
+                       f"at {_hhmm(sess.or_ready_min)} and pre-pick contracts.")
         watching = [k for k, l in self._legs.items() if l.status == "watching"]
         if watching:
             out.append(f"Watching {', '.join(watching)} for the first break of the range.")
             out.append("First index to break takes the trade; the other is locked out for the day.")
-        if minute >= _to_min(self.cfg.entry_cutoff, 15 * 60) and not self._today_trades:
-            out.append(f"No fresh entries after {self.cfg.entry_cutoff}. Trade window closed.")
+        if minute >= self._cutoff_min(now) and not self._today_trades:
+            out.append(f"No fresh entries after {self._sess_val('entry_cutoff')}. Trade window closed.")
         if self._today_trades:
             done = len(self._today_trades)
-            out.append(f"{done}/{self.cfg.max_trades} trade(s) done today."
-                       + (" Waiting for the next session." if done >= self.cfg.max_trades else
+            out.append(f"{done}/{self._max_trades()} trade(s) done today."
+                       + (" Waiting for the next session." if done >= self._max_trades() else
                           " Next trade needs every account flat and a fresh breakout."))
         return out
 
@@ -2095,8 +2149,8 @@ class AlgoEngine:
             "serverTime": now.strftime("%Y-%m-%d %H:%M:%S"),
             "serverTimeShort": now.strftime("%H:%M:%S"),
             "day": self._day,
-            "marketOpen": (now.weekday() < 5
-                           and MARKET_OPEN_MIN <= now.hour * 60 + now.minute < MARKET_CLOSE_MIN),
+            "marketOpen": (session_for(now).trading_day
+                           and session_for(now).open_min <= now.hour * 60 + now.minute < session_for(now).close_min),
             "config": asdict(self.cfg),
             "legs": legs,
             "position": self._position_dict(),
@@ -2241,7 +2295,7 @@ class AccountEngines:
         today = now_ist().date().isoformat()
         prev_signal = (master._signal_day, master._signal_count)
         trade_no = master._signals_used(today) + 1
-        master._log(f"SIGNAL {source.index_key} {direction} (trade {trade_no}/{master.cfg.max_trades}): "
+        master._log(f"SIGNAL {source.index_key} {direction} (trade {trade_no}/{master._max_trades()}): "
                     f"spot {source.spot} vs OR "
                     f"H {source.or_high} / L {source.or_low}; contract {int(source.strike or 0)} "
                     f"{'CE' if direction == 'CALL' else 'PE'} premium {feed.price(source.security_id, segment)} "
@@ -2258,7 +2312,7 @@ class AccountEngines:
             engine = self.items[account]
             with account_scope(account):
                 try:
-                    if engine._position is not None or len(engine._today_trades) >= engine.cfg.max_trades:
+                    if engine._position is not None or len(engine._today_trades) >= engine._max_trades():
                         consumed.add(account)
                         engine._log("Shared signal skipped: existing position/trade.", level="warn")
                         return
