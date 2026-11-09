@@ -1,0 +1,4 @@
+# Local research/backtest scripts only (not needed on the server)
+-r requirements.txt
+numpy>=1.26
+pandas>=2.2
