@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -15,6 +16,7 @@ from botocore.stub import ANY, Stubber
 
 
 HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HERE))
 
 
 def load_module(name):
@@ -26,6 +28,7 @@ def load_module(name):
 
 alerts = load_module("alerts")
 monitor = load_module("monitor")
+start_gate = load_module("start_gate")
 write_config = load_module("write_config")
 deploy = load_module("deploy")
 
@@ -43,10 +46,67 @@ class CloudHelpersTest(unittest.TestCase):
             (datetime(2026, 11, 2, 16, 14, tzinfo=tz), "grace"),
             (datetime(2026, 11, 2, 16, 15, tzinfo=tz), "stopped"),
             (datetime(2026, 11, 7, 12, 0, tzinfo=tz), "stopped"),
+            (datetime(2026, 11, 10, 9, 5, tzinfo=tz), "stopped"),
+            (datetime(2026, 11, 10, 12, 0, tzinfo=tz), "stopped"),
+            (datetime(2026, 11, 11, 12, 0, tzinfo=tz), "running"),
         ]
         for now, expected in cases:
             with self.subTest(now=now):
                 self.assertEqual(monitor.expected_state(now), expected)
+
+    def test_start_gate_skips_nse_holidays_and_flags_missing_year(self):
+        tz = ZoneInfo("Asia/Kolkata")
+        cases = [
+            (datetime(2026, 11, 9, 9, 0, tzinfo=tz), "start"),
+            (datetime(2026, 11, 10, 9, 0, tzinfo=tz), "skip-holiday"),
+            (datetime(2026, 11, 24, 9, 0, tzinfo=tz), "skip-holiday"),
+            (datetime(2026, 12, 25, 9, 0, tzinfo=tz), "skip-holiday"),
+            (datetime(2026, 11, 14, 9, 0, tzinfo=tz), "skip-weekend"),
+            (datetime(2099, 1, 5, 9, 0, tzinfo=tz), "start-unverified"),
+        ]
+        for now, expected in cases:
+            with self.subTest(now=now):
+                self.assertEqual(start_gate.decide(now), expected)
+
+    def test_start_gate_handler_starts_only_on_trading_days(self):
+        ec2 = Mock()
+        clients = {"ec2": ec2, "ssm": Mock()}
+        tz = ZoneInfo("Asia/Kolkata")
+        with (
+            patch.dict("os.environ", {"INSTANCE_ID": "i-123", "TELEGRAM_PARAMETER": "/p"}),
+            patch.object(start_gate.boto3, "client", side_effect=clients.__getitem__),
+            patch.object(start_gate, "notify") as notify,
+            patch.object(start_gate, "datetime") as clock,
+        ):
+            clock.now.return_value = datetime(2026, 11, 10, 9, 0, tzinfo=tz)
+            self.assertEqual(start_gate.handler({}, None), {"decision": "skip-holiday"})
+            ec2.start_instances.assert_not_called()
+            notify.assert_called_once()
+            clock.now.return_value = datetime(2026, 11, 11, 9, 0, tzinfo=tz)
+            self.assertEqual(start_gate.handler({"dry_run": True}, None), {"decision": "start", "dry_run": True})
+            ec2.start_instances.assert_not_called()
+            self.assertEqual(start_gate.handler({}, None), {"decision": "start"})
+            ec2.start_instances.assert_called_once_with(InstanceIds=["i-123"])
+
+    def test_automation_infra_review_rejects_instance_and_unrelated_changes(self):
+        def change(name, action="Add", replacement=None):
+            resource = {"LogicalResourceId": name, "Action": action, "Details": []}
+            if replacement:
+                resource["Replacement"] = replacement
+            return {"ResourceChange": resource}
+
+        deploy.assert_safe_automation_infra_update([
+            change("StartGateFunction"), change("StartGateRole"),
+            change("WeekdayStart", "Modify", "False"), change("MonitorFunction", "Modify", "False"),
+        ])
+        for unsafe in (
+            [change("DashboardInstance", "Modify", "False")],
+            [change("DataVolume", "Modify", "False")],
+            [change("WeekdayStop", "Remove")],
+            [change("WeekdayStart", "Modify", "True")],
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(RuntimeError):
+                deploy.assert_safe_automation_infra_update(unsafe)
 
     def test_sns_messages_do_not_forward_raw_payload(self):
         text = alerts.notification_text(
@@ -326,6 +386,8 @@ class CloudHelpersTest(unittest.TestCase):
             self.assertIn("monitor.py", archive.namelist())
             self.assertIn("alerts.py", archive.namelist())
             self.assertIn("cost_report.py", archive.namelist())
+            self.assertIn("start_gate.py", archive.namelist())
+            self.assertIn("market_holidays.py", archive.namelist())
             self.assertIn("tzdata/zoneinfo/Asia/Kolkata", archive.namelist())
 
     def test_lambda_pointer_review_allows_only_function_codes_and_expected_dependents(self):
@@ -336,7 +398,10 @@ class CloudHelpersTest(unittest.TestCase):
                 "Details": [{"Target": {"Name": target}, "ChangeSource": source, "CausingEntity": cause}],
             }}
 
-        valid = [change(name) for name in ("AlertFunction", "MonitorFunction", "CostReportFunction")]
+        valid = [
+            change(name)
+            for name in ("AlertFunction", "MonitorFunction", "CostReportFunction", "StartGateFunction")
+        ]
         dependent = {"ResourceChange": {
             "LogicalResourceId": "MonitorSchedule", "Action": "Modify", "Replacement": "False",
             "ResourceType": "AWS::Events::Rule",

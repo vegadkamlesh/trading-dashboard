@@ -139,12 +139,21 @@ Dhan sees for that account.
 The start/stop schedules are created **disabled**. Once verified and enabled,
 EventBridge Scheduler requests start at **09:00** and stop at **16:00
 Asia/Kolkata, Monday-Friday**. Invocation has up to 60-second precision; boot,
-application readiness and shutdown take additional time. No exchange-holiday
-exclusions are configured. Add the owner's holiday list before relying on
-holiday handling. An EC2 start can fail if AWS has insufficient capacity in
+application readiness and shutdown take additional time. The 09:00 schedule
+invokes the `start-gate` Lambda, which skips the start on NSE trading holidays
+listed in `market_holidays.py` (and sends a Telegram note); the health monitor
+also expects the server to be stopped on those days. Add each new year's NSE
+holiday list when NSE publishes it (usually December): while a year is missing,
+the gate still starts the server and sends a Telegram warning. Deploy holiday
+or start-gate changes with
+`python deploy.py update-automation-infra --preview`, then
+`--approved-automation-update`; check the decision without starting anything
+with `aws lambda invoke --function-name trading-dashboard-start-gate --payload '{"dry_run": true}'`.
+An EC2 start can fail if AWS has insufficient capacity in
 the instance's availability zone; the schedule does not reserve capacity or
-guarantee that the dashboard is ready by 09:00. The start scheduler retries
-failed requests for at most 15 minutes; the stop schedule retains its shorter
+guarantee that the dashboard is ready by 09:00. A failed start is retried twice
+by Lambda within 15 minutes and then sent to the scheduler dead-letter queue
+(scheduler alarm); the stop schedule retains its shorter
 retry window. Investigate scheduler and availability alerts and verify
 readiness before trading.
 

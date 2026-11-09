@@ -83,7 +83,10 @@ def application_archive() -> bytes:
 
 
 def lambda_archive() -> bytes:
-    files = {name: linux_text(HERE / name) for name in ("alerts.py", "monitor.py", "cost_report.py")}
+    files = {
+        name: linux_text(HERE / name)
+        for name in ("alerts.py", "monitor.py", "cost_report.py", "start_gate.py", "market_holidays.py")
+    }
     tzdata = importlib.resources.files("tzdata")
     for name in ("__init__.py", "zoneinfo/__init__.py", "zoneinfo/Asia/__init__.py", "zoneinfo/Asia/Kolkata"):
         files[f"tzdata/{name}"] = tzdata.joinpath(*name.split("/")).read_bytes()
@@ -813,6 +816,11 @@ def assert_safe_mock_app_pointer_update(changes: list[dict]) -> None:
         },
         "RootDiskAlarm": {("Dimensions", "ResourceReference", "DashboardInstance")},
         "SchedulerRole": {("Policies", "ResourceReference", "DashboardInstance")},
+        "StartGateFunction": {
+            ("Environment", "ResourceReference", "DashboardInstance"),
+            ("Role", "ResourceAttribute", "StartGateRole.Arn"),
+        },
+        "StartGateRole": {("Policies", "ResourceReference", "DashboardInstance")},
         "StaticAddressAssociation": {("InstanceId", "ResourceReference", "DashboardInstance")},
         "SecondaryNetworkInterfaceAttachment": {("InstanceId", "ResourceReference", "DashboardInstance")},
         "WeekdayCostReport": {
@@ -851,7 +859,7 @@ def assert_safe_mock_app_pointer_update(changes: list[dict]) -> None:
 
 
 def assert_safe_mock_lambda_pointer_update(changes: list[dict]) -> None:
-    functions = {"AlertFunction", "MonitorFunction", "CostReportFunction"}
+    functions = {"AlertFunction", "MonitorFunction", "CostReportFunction", "StartGateFunction"}
     code = {
         ("Code", "ParameterReference", "LambdaArtifactKey"),
         ("Code", "DirectModification", None),
@@ -875,6 +883,18 @@ def assert_safe_mock_lambda_pointer_update(changes: list[dict]) -> None:
         "MonitorSchedule": (
             "AWS::Events::Rule", "False",
             {("Targets", "ResourceAttribute", "MonitorFunction.Arn")},
+        ),
+        "StartGateFunction": ("AWS::Lambda::Function", "False", code),
+        "StartGateSchedulerRole": (
+            "AWS::IAM::Role", "False",
+            {("Policies", "ResourceAttribute", "StartGateFunction.Arn")},
+        ),
+        "WeekdayStart": (
+            "AWS::Scheduler::Schedule", "False",
+            {
+                ("Target", "ResourceAttribute", "StartGateFunction.Arn"),
+                ("Target", "ResourceAttribute", "StartGateSchedulerRole.Arn"),
+            },
         ),
         "WeekdayCostReport": (
             "AWS::Scheduler::Schedule", "False",
@@ -910,7 +930,7 @@ def assert_safe_mock_lambda_pointer_update(changes: list[dict]) -> None:
             raise RuntimeError(f"Expected the Lambda artifact parameter to change {name}")
         seen.add(name)
     if not functions.issubset(seen):
-        raise RuntimeError("Expected all three Lambda functions to use the updated artifact")
+        raise RuntimeError("Expected all four Lambda functions to use the updated artifact")
 
 
 def update_mock_lambda_artifact(profile: str, stack: str, confirmed: bool) -> None:
@@ -942,6 +962,54 @@ def update_mock_lambda_artifact(profile: str, stack: str, confirmed: bool) -> No
     ]
     execute_reviewed_update(cloudformation, stack, params, review=assert_safe_mock_lambda_pointer_update)
     print("Mock Lambda artifact updated without changing instance or schedules")
+
+
+AUTOMATION_INFRA_CHANGES = {
+    "StartGateLogGroup", "StartGateRole", "StartGateFunction", "StartGateAsyncConfig",
+    "StartGateSchedulerRole", "WeekdayStart", "AlertFunction", "AlertSubscription", "MonitorFunction",
+    "MonitorSchedule", "MonitorInvocationPermission", "CostReportFunction", "CostReportSchedulerRole",
+    "WeekdayCostReport",
+}
+
+
+def assert_safe_automation_infra_update(changes: list[dict]) -> None:
+    assert_safe_changes(changes, forbid_instance_change=True)
+    for change in changes:
+        name = change["ResourceChange"]["LogicalResourceId"]
+        if name not in AUTOMATION_INFRA_CHANGES:
+            raise RuntimeError(f"Refusing an unexpected automation infrastructure change to {name}")
+
+
+def update_automation_infra(profile: str, stack: str, confirmed: bool, preview: bool) -> None:
+    if not confirmed and not preview:
+        raise ValueError("Confirm the holiday start-gate and Lambda update, or use --preview")
+    if not STACK_NAME.fullmatch(stack):
+        raise ValueError("Invalid stack name")
+    session = boto3.Session(profile_name=profile, region_name=REGION)
+    cloudformation = session.client("cloudformation")
+    current = cloudformation.describe_stacks(StackName=stack)["Stacks"][0]
+    if current["StackStatus"] not in UPDATABLE_STACK_STATES:
+        raise RuntimeError("Stack is not in an updateable state")
+    values = {item["ParameterKey"]: item["ParameterValue"] for item in current["Parameters"]}
+    if "LambdaArtifactKey" not in values or "ArtifactBucket" not in values:
+        raise RuntimeError("The stack does not expose the expected Lambda artifact parameters")
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    s3 = session.client("s3")
+    create_or_verify_bucket(s3, values["ArtifactBucket"], account_id, REGION)
+    key = upload_artifact(s3, values["ArtifactBucket"], stack, "lambda", lambda_archive())
+    params = [
+        {"ParameterKey": name, "ParameterValue": key}
+        if name == "LambdaArtifactKey" else {"ParameterKey": name, "UsePreviousValue": True}
+        for name in values
+    ]
+    template = (HERE / "stack.yaml").read_text(encoding="utf-8")
+    cloudformation.validate_template(TemplateBody=template)
+    execute_reviewed_update(
+        cloudformation, stack, params, template=template,
+        review=assert_safe_automation_infra_update, preview_only=preview,
+    )
+    if not preview:
+        print("Holiday-aware start gate and Lambda artifact updated without changing the instance")
 
 
 def assert_safe_recovery_stop_removal(changes: list[dict]) -> None:
@@ -1648,6 +1716,9 @@ def main() -> None:
     )
     lambda_update = subparsers.add_parser("update-mock-lambda")
     lambda_update.add_argument("--approved-mock-lambda-update", action="store_true")
+    automation_infra = subparsers.add_parser("update-automation-infra")
+    automation_infra.add_argument("--approved-automation-update", action="store_true")
+    automation_infra.add_argument("--preview", action="store_true", help="Review the AWS change set without applying it")
     subparsers.add_parser("remove-recovery-stop")
     operator = subparsers.add_parser("setup-mock-operator")
     operator.add_argument("--approved-operator-setup", action="store_true")
@@ -1688,6 +1759,8 @@ def main() -> None:
         update_mock_deployment(args.profile, args.stack, reporting_only=args.reporting_only)
     elif args.command == "update-mock-lambda":
         update_mock_lambda_artifact(args.profile, args.stack, args.approved_mock_lambda_update)
+    elif args.command == "update-automation-infra":
+        update_automation_infra(args.profile, args.stack, args.approved_automation_update, args.preview)
     elif args.command == "remove-recovery-stop":
         remove_recovery_stop(args.profile, args.stack)
     elif args.command == "setup-mock-operator":

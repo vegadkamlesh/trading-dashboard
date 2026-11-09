@@ -104,6 +104,12 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-cost-report"
       RetentionInDays: 30
 
+  StartGateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-start-gate"
+      RetentionInDays: 30
+
   DataVolume:
     Type: AWS::EC2::Volume
     DeletionPolicy: RetainExceptOnCreate
@@ -458,20 +464,108 @@ Resources:
                 Action: sqs:SendMessage
                 Resource: !GetAtt SchedulerDeadLetterQueue.Arn
 
+  StartGateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-dashboard-on-trading-days
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:StartInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DashboardInstance}"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt StartGateLogGroup.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  StartGateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-start-gate"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: start_gate.handler
+      Role: !GetAtt StartGateRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      DeadLetterConfig:
+        TargetArn: !GetAtt SchedulerDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref DashboardInstance
+          TELEGRAM_PARAMETER: !Ref TelegramParameter
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  StartGateAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref StartGateFunction
+      Qualifier: "$LATEST"
+      MaximumEventAgeInSeconds: 900
+      MaximumRetryAttempts: 2
+
+  StartGateSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-start-gate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt StartGateFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
   WeekdayStart:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub "${AWS::StackName}-weekday-start"
-      Description: Request server start Monday to Friday at 09:00 India time.
+      Description: Request server start Monday to Friday at 09:00 India time unless NSE is on holiday.
       State: !If [AutomationOn, ENABLED, DISABLED]
       ScheduleExpression: "cron(0 9 ? * MON-FRI *)"
       ScheduleExpressionTimezone: Asia/Kolkata
       FlexibleTimeWindow:
         Mode: "OFF"
       Target:
-        Arn: !Sub "arn:${AWS::Partition}:scheduler:::aws-sdk:ec2:startInstances"
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: !Sub '{"InstanceIds":["${DashboardInstance}"]}'
+        Arn: !GetAtt StartGateFunction.Arn
+        RoleArn: !GetAtt StartGateSchedulerRole.Arn
+        Input: "{}"
         DeadLetterConfig:
           Arn: !GetAtt SchedulerDeadLetterQueue.Arn
         RetryPolicy:

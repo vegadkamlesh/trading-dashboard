@@ -9,12 +9,14 @@ from zoneinfo import ZoneInfo
 import boto3
 from botocore.exceptions import ClientError
 
+from market_holidays import is_trading_holiday
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
 def expected_state(now: datetime) -> str:
-    if now.weekday() >= 5:
+    if now.weekday() >= 5 or is_trading_holiday(now.date()):
         return "stopped"
     minute = now.hour * 60 + now.minute
     if 9 * 60 + 10 <= minute < 16 * 60:
