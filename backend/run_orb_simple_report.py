@@ -3,7 +3,7 @@
     .venv\\Scripts\\python.exe run_orb_simple_report.py
     Report: data/history/orb_simple_report.md
 
-Data: har index ka MAXIMUM data jahan index candles + option premium dono hain (common-din wala cut nahi).
+Data: har index ke common din = index candles poore AND us din ka option data download ho chuka (maximum history).
 Breakout count rule: OR ke bahar gaya = breakout. Candle ka close OR ke andar kam se kam 0.10% (ya OR ke
 beech tak, jo pehle ho) wapas aaya to "re-arm"; uske baad phir bahar gaya (upar ya niche) = agla breakout.
 Level ke paas ka chhota andar-bahar naya breakout nahi ginta. Entry 15:00 tak hi.
@@ -19,12 +19,13 @@ import sys
 import numpy as np
 
 from run_orb_5v10_study import (COLS, CUT, HIST, INDICES, M0, OR_LENS, STEP, THRESH, analyse, load_index,
-                                load_options, or_levels, take)
+                                load_options, take)
 from run_orb_market_study import load_calendar
 
 SHOW = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.75, 1.00]
 MAXN = 5                                    # 5+ breakouts ek bucket
 REARM = 0.10                                # agla breakout tabhi jab close OR ke andar 0.10% (ya OR ke beech) tak aaye
+INFO: dict[str, tuple[int, str, int, str]] = {}
 
 
 def md(header, rows):
@@ -43,12 +44,12 @@ def medp(x):
 
 
 def load(k: str):
-    """Ek index ke saare usable din (index + option data dono) -> days, index arrays, option arrays, expiry flag."""
+    """Common din = index candles poore AND option data download ho chuka -> days, index, option, expiry flag."""
     days, a = load_index(k)
     done = set(json.loads((HIST / f"{k}_opt_done.json").read_text()))
     valid = ~np.isnan(a["h"][:, :10]).any(1) & ((~np.isnan(a["c"][:, 10:])).sum(1) >= 200)
-    _, _, b10 = or_levels(a, 10)
-    ok = valid & (days >= min(done)) & (days <= max(done)) & ((b10 >= COLS) | np.isin(days, list(done)))
+    ok = valid & np.isin(days, list(done))
+    INFO[k] = (int(valid.sum()), str(days[valid][0]), len(done), str(min(done)))
     days = days[ok]
     a = {f: v[ok] for f, v in a.items()}
     exps, ws = load_calendar(k)
@@ -125,19 +126,22 @@ def count_table(groups: list[tuple[str, list[list[dict]]]]) -> list[str]:
 
 
 def nth_table(evs: list[list[dict]]) -> list[str]:
+    """1st, 2nd, 3rd... breakout: kitne din aaya, UP aur DOWN alag — kitni baar, index kitna gaya, option kitna bada."""
     d = len(evs)
     rows = []
     for i in range(MAXN):
         es = [e[i] for e in evs if len(e) > i]
         if not es:
             continue
-        mv = np.array([e["move"] for e in es])
-        up = sum(e["up"] for e in es)
-        rows.append([f"{i + 1}{'st' if i == 0 else 'nd' if i == 1 else 'rd' if i == 2 else 'th'}", len(es), p(len(es), d),
-                     f"{up} / {len(es) - up}", f"{np.median(mv):.2f}%", p((mv >= .1).sum(), len(es)),
-                     p((mv >= .2).sum(), len(es)), p((mv >= .3).sum(), len(es)), medp([e["opt"] for e in es])])
-    return md(["Breakout no.", "Kitne din aaya", "100 me se", "Upar / Niche", "Move (median)", "0.10%+ gaya",
-               "0.20%+ gaya", "0.30%+ gaya", "Option max (median)"], rows)
+        row = [f"{i + 1}{'st' if i == 0 else 'nd' if i == 1 else 'rd' if i == 2 else 'th'}", f"{len(es)} ({p(len(es), d)})"]
+        for up in (True, False):
+            s = [e for e in es if e["up"] == up]
+            mv = np.array([e["move"] for e in s])
+            row += [len(s), f"{np.median(mv):.2f}%" if len(s) else "–", p((mv >= .2).sum(), len(s)),
+                    medp([e["opt"] for e in s])]
+        rows.append(row)
+    return md(["Breakout no.", "Kitne din aaya (100 me se)", "UP din", "UP index move", "UP 0.20%+ gaya",
+               "UP Call option bada", "DOWN din", "DOWN index move", "DOWN 0.20%+ gaya", "DOWN Put option bada"], rows)
 
 
 def pattern_table(groups: list[tuple[str, list[list[dict]]]], top: int = 8) -> list[str]:
@@ -154,9 +158,12 @@ def pattern_table(groups: list[tuple[str, list[list[dict]]]], top: int = 8) -> l
 def main() -> None:
     data = {k: load(k) for k in INDICES}
     rep = ["# ORB simple report — NIFTY + SENSEX", "",
-           "| Index | Din (index + option dono) | Normal din | Expiry din |", "|---|---|---|---|"]
+           "| Index | Index data din | Option data din | **Common din (100%)** | Normal din | Expiry din |",
+           "|---|---|---|---|---|---|"]
     for k, (days, _, _, exp) in data.items():
-        rep.append(f"| {k} | {len(days)} ({days[0]} → {days[-1]}) | {int((~exp).sum())} | {int(exp.sum())} |")
+        iv, i0, od, o0 = INFO[k]
+        rep.append(f"| {k} | {iv} ({i0} se) | {od} ({o0} se) | **{len(days)}** ({days[0]} → {days[-1]}) | "
+                   f"{int((~exp).sum())} | {int(exp.sum())} |")
     rep += ["", "Option = breakout level ka ATM weekly option. \"Option kitna bada\" = jab index us % par pahucha "
             "us minute ka option high vs entry. Breakout = OR high ke upar (CE) ya OR low ke niche (PE).",
             "Breakout ginti: agla breakout tabhi gina jab price OR ke andar 0.10% (ya OR ke beech tak) wapas aaya.", ""]
