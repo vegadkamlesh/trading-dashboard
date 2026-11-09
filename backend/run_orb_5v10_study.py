@@ -1,6 +1,8 @@
 """5-min vs 10-min ORB study: index move % buckets mapped to real option-premium expansion.
 
-    .venv\\Scripts\\python.exe run_orb_5v10_study.py     # writes data/history/orb_5v10_report.md
+    .venv\\Scripts\\python.exe run_orb_5v10_study.py             # latest 450 common din (default)
+    .venv\\Scripts\\python.exe run_orb_5v10_study.py --days 0    # saare common din
+    Report: data/history/orb_5v10_report.md
 
 Pehle ye chalao: run_history_cache.py, run_expiry_calendar.py, run_option_cache.py (Master Dhan API).
 Needs numpy + pandas (requirements-research.txt).
@@ -9,7 +11,8 @@ Data alignment:
   * Index 1-min candles (NIFTY, SENSEX) aur option premium cache, dono ke common trading days hi use hote hain.
   * Common day = dono index ke poore candles (09:15-09:24 + kam se kam 200 post-OR candles) AND dono ke
     option-cache range ke andar AND jis din breakout hua us din ka option data download ho chuka.
-  * Ye common days = 100% sample.
+  * In common days me se sabse naye SAMPLE_DAYS (default 450) din kaate jaate hain; yahi 100% sample hai.
+    Common din 450 se kam hon to jitne hain utne use hote hain aur report me warning aati hai.
 Option data: Dhan expired-options 1-min data, sirf wo strike jo live algo kharidta hai
 (10-min OR level ka ATM, nearest weekly expiry). 5-min ORB ka ATM strike alag ho to us trade ka premium
 nahi milta; aise trades index stats me gine jaate hain, premium stats me nahi (coverage % report me hai).
@@ -35,6 +38,7 @@ THRESH = np.round(np.arange(1, 21) * 0.05, 2)   # 0.05% ... 1.00%
 STEP = {"NIFTY": 50, "SENSEX": 100}
 INDICES = ("NIFTY", "SENSEX")
 CIDX = np.arange(COLS)
+SAMPLE_DAYS = 450                           # common din ka fixed baseline (0 = saare common din)
 
 
 # ---------------------------------------------------------------- chhote helpers
@@ -151,6 +155,13 @@ def align() -> tuple[np.ndarray, dict, dict, list[list[str]]]:
         info.append([k, f"{int(valid.sum())} ({days[valid][0]} → {days[valid][-1]})",
                      f"{len(done)} ({min(done)} → {max(done)})", f"{int(ok.sum())}"])
     common = np.array(sorted(set.intersection(*keep.values())))
+    if not len(common):
+        sys.exit("Koi common din nahi mila — pehle cache scripts chalao.")
+    info.append(["Common (dono index)", f"{len(common)} ({common[0]} → {common[-1]})", "", ""])
+    # Truncation rule: sabse naye SAMPLE_DAYS common din hi rakho, baaki sab sources isi par kaate jaate hain
+    if SAMPLE_DAYS and len(common) > SAMPLE_DAYS:
+        common = common[-SAMPLE_DAYS:]
+    info.append(["**Sample (100%)**", f"**{len(common)}** ({common[0]} → {common[-1]})", "", ""])
     idx, opt = {}, {}
     for k, (days, a) in raw.items():
         pos = np.searchsorted(days, common)
@@ -290,7 +301,12 @@ def first_trigger(res: dict, n: int, cats: dict[str, np.ndarray]) -> list[str]:
 
 # ---------------------------------------------------------------- main
 def main() -> None:
+    global SAMPLE_DAYS
+    if "--days" in sys.argv:
+        SAMPLE_DAYS = int(sys.argv[sys.argv.index("--days") + 1])
     common, idx, opt, info = align()
+    short = (f"⚠️ Sirf {len(common)} common din mile, {SAMPLE_DAYS} se kam — jitne hain utne use kiye."
+             if SAMPLE_DAYS and len(common) < SAMPLE_DAYS else "")
     exp = {}
     for k in INDICES:
         exps, ws = load_calendar(k)
@@ -301,7 +317,8 @@ def main() -> None:
     rep = [f"# 5-min vs 10-min ORB study — NIFTY + SENSEX ({common[0]} → {common[-1]})", "",
            "## Data alignment", "",
            *md(["Index", "Index din (valid)", "Option-cache din (range)", "Is index ke liye usable din"], info),
-           f"**Common sample = {len(common)} trading din = 100%** (dono index ke candles + option data dono maujood).",
+           f"**Sample = {len(common)} common trading din = 100%** (dono index ke candles + option data dono "
+           f"maujood; sabse naye din liye).", short,
            "Option gain = (option ka high jab index us % par pahucha − entry) / entry. Entry = breakout minute "
            "ka option close (live algo jaisa), strike = breakout level ka ATM, nearest weekly expiry.", ""]
     for sec, k in ((1, "NIFTY"), (2, "SENSEX")):
