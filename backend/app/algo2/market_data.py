@@ -317,6 +317,10 @@ class Algo2MarketData:
         snap = chain_engine.snapshot(index_key) or {}
         return list(snap.get("rows") or [])
 
+    def chain_expiry(self, index_key: str) -> Optional[str]:
+        snap = chain_engine.snapshot(index_key) or {}
+        return snap.get("expiry")
+
     def sample_chain(self, index_key: str, spot: Optional[float], strikes_each_side: int) -> None:
         if time.time() - self._last_chain_sample.get(index_key, 0.0) < CHAIN_SAMPLE_SECONDS:
             return

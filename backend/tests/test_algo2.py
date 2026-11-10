@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import tempfile
 import time
 import unittest
@@ -10,10 +12,12 @@ from fastapi import HTTPException
 import app.algo as algo_module
 from app.algo import DayLeg
 from app.algo2 import calculations as calc
+from app.algo2 import daily_cache
 from app.algo2 import engine as engine_module
 from app.algo2.engine import Algo2Group, Algo2Position, parse_windows, validate_algo2_config
 from app.algo2.market_data import Series, parse_candles, resolve_futures_from_csv
 from app.algo2.news_events import NewsEventFetcher
+from app.dhan_client import DhanAPIError
 
 
 def chain_row(strike, ce_oi, pe_oi, ce_delta, pe_delta, ce_gamma=0.001, pe_gamma=0.001):
@@ -507,6 +511,102 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine.set_config({"product_type": "MARGIN", "t1_pct": 60})
         self.assertEqual(self.engine.cfg.product_type, "INTRADAY")
         self.assertEqual(self.engine.cfg.t1_pct, 60)
+
+    def test_raw_chain_snapshot_once_per_minute_and_journals_never_pruned(self):
+        hist = self.group.history
+        now = datetime(2026, 11, 10, 10, 0, 5)
+        hist.chain_snapshot(now, "NIFTY", 23500.0, 23560.0, "2026-11-17", CHAIN)
+        hist.chain_snapshot(now.replace(second=40), "NIFTY", 23501.0, 23561.0, "2026-11-17", CHAIN)
+        hist.chain_snapshot(now.replace(minute=1), "NIFTY", 23502.0, 23562.0, "2026-11-17", CHAIN)
+        rows = daily_cache._read_jsonl(os.path.join(hist.dir, "2026-11-10", "chain.jsonl"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["strikes"][2], {"k": 23500, "ce": {"ltp": 100.0, "oi": 3000, "prevOi": None,
+                         "vol": None, "iv": None, "d": 0.5, "g": 0.004, "t": None, "v": None},
+                         "pe": {"ltp": 90.0, "oi": 3000, "prevOi": None, "vol": None, "iv": None, "d": -0.5,
+                                "g": 0.002, "t": None, "v": None}})
+        store = self.engine._store
+        store.append_event({"event": "old"}, day="2000-01-01")
+        self.assertEqual(store.prune_journals(), 0)
+        self.assertIn("2000-01-01", store.journal_days())
+
+
+class DailyCacheTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = MagicMock(futures={"NIFTY": {"securityId": 61471, "segment": "NSE_FNO"}},
+                              ensure_futures=AsyncMock())
+        self.trades = MagicMock()
+        self.trades.read_trades.return_value = [
+            {"date": "2026-11-10", "premiumPnl": 1200.0, "exitReason": "T1_FULL"},
+            {"date": "2026-11-09", "premiumPnl": -500.0, "exitReason": "SL"}]
+        self.client = MagicMock()
+        self.client.place_order = AsyncMock(side_effect=AssertionError("cache must never trade"))
+        self.client.get_intraday = AsyncMock(return_value={
+            "timestamp": [1, 2], "open": [10, 11], "high": [12, 13], "low": [9, 10], "close": [11, 12],
+            "volume": [5, 6], "open_interest": [100, 120]})
+        patcher = patch.object(daily_cache, "get_data_client", return_value=self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sleep = AsyncMock()
+        self.cache = daily_cache.Algo2DailyCache(self.tmp.name, self.data, lambda: {"master": self.trades},
+                                                 sleep=self.sleep)
+
+    def write(self, day, name, rows):
+        os.makedirs(os.path.join(self.tmp.name, day), exist_ok=True)
+        with open(os.path.join(self.tmp.name, day, f"{name}.jsonl"), "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+
+    async def test_after_close_saves_candles_summary_once(self):
+        self.write("2026-11-10", "breakouts", [
+            {"type": "breakout", "index": "NIFTY", "side": "CALL", "taken": False,
+             "blockers": ["news", "score 4/10 < 6"], "score": {"CALL": {"passed": 4, "total": 10}}},
+            {"type": "outcome", "taken": False, "firstHit": "target_2R"}])
+        in_market = datetime(2026, 11, 10, 14, 0)
+        self.assertFalse(self.cache.due(in_market))   # Master quota stays free for live trading
+        after = datetime(2026, 11, 10, 15, 35)
+        self.assertEqual(self.cache.pending_days(after), ["2026-11-10"])
+        task = self.cache.schedule(after, ["NIFTY"])
+        await task
+        # NIFTY spot + NIFTY fut + VIX + 6 heavyweights, 1-min candles, 3 s apart
+        self.assertEqual(self.client.get_intraday.await_count, 9)
+        first = self.client.get_intraday.await_args_list[0].args
+        self.assertEqual(first[2:], ("INDEX", "1", "2026-11-10 09:15:00", "2026-11-10 15:30:00"))
+        fut_call = next(c for c in self.client.get_intraday.await_args_list if c.args[2] == "FUTIDX")
+        self.assertTrue(fut_call.kwargs["oi"])
+        self.assertEqual(self.sleep.await_count, 9)
+        folder = os.path.join(self.tmp.name, "2026-11-10")
+        fut = daily_cache._read_json(os.path.join(folder, "candles", "NIFTY_fut.json"))
+        self.assertEqual([c["oi"] for c in fut["candles"]], [100.0, 120.0])
+        summary = daily_cache._read_json(os.path.join(folder, "day_summary.json"))
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["scoreDistribution"], {"4/10": 1})
+        self.assertEqual(summary["blockers"], {"news": 1, "score_below_min": 1})
+        self.assertEqual(summary["skippedWouldHit2R"], 1)
+        self.assertEqual(summary["trades"]["master"], {"count": 1, "premiumPnl": 1200.0,
+                                                       "exitReasons": {"T1_FULL": 1}})
+        self.assertEqual(summary["candles"]["RELIANCE"], 2)
+        self.assertTrue(self.cache.is_done("2026-11-10"))
+        self.assertIsNone(self.cache.schedule(datetime(2026, 11, 10, 15, 50), ["NIFTY"]))
+        self.client.place_order.assert_not_awaited()
+
+    async def test_rate_limit_stops_and_retries_later_then_catches_up(self):
+        self.write("2026-11-09", "reports", [{"x": 1}])
+        self.client.get_intraday.side_effect = [
+            {"timestamp": [1], "open": [1], "high": [2], "low": [1], "close": [2]},
+            DhanAPIError(429, "DH-904", "Too many requests")]
+        morning = datetime(2026, 11, 10, 9, 5)        # pre-market catch-up of a missed day
+        self.assertEqual(self.cache.pending_days(morning), ["2026-11-09"])
+        await self.cache.schedule(morning, ["NIFTY"])
+        self.assertFalse(self.cache.is_done("2026-11-09"))
+        self.assertIn("rate limited", self.cache.error)
+        self.assertFalse(self.cache.due(morning))     # backs off
+        self.cache._next_try = 0
+        self.client.get_intraday.side_effect = None
+        await self.cache.schedule(morning, ["NIFTY"])
+        self.assertTrue(self.cache.is_done("2026-11-09"))
+        self.assertEqual(self.client.get_intraday.await_count, 2 + 8)   # resumed, saved file not re-fetched
 
 
 if __name__ == "__main__":

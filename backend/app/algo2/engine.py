@@ -49,6 +49,7 @@ from ..dhan_client import DhanAPIError
 from ..feed import feed
 from ..instruments import get_index, lot_size_for
 from . import calculations as calc
+from .daily_cache import Algo2DailyCache
 from .market_data import HEAVYWEIGHT_IDS, INDIA_VIX_ID, VELOCITY_WINDOW, Algo2MarketData
 from .news_events import NewsEventFetcher
 
@@ -163,6 +164,13 @@ def parse_windows(text: str) -> List[Tuple[int, int]]:
     return out
 
 
+class Algo2Store(AlgoStore):
+    """Algo 2 journals are research data: kept forever (Algo 1 keeps 7 days)."""
+
+    def prune_journals(self, keep_days: int = 0) -> int:
+        return 0
+
+
 class Algo2Engine(AlgoEngine):
     ALGO_LABEL = "Algo 2"
     ORDER_TAG = "AL2"
@@ -170,7 +178,7 @@ class Algo2Engine(AlgoEngine):
 
     def __init__(self, group: "Algo2Group", account_id: AccountId) -> None:
         self._group_ref = group
-        self._store_ref = AlgoStore(group.dir if account_id == "master" else os.path.join(group.dir, account_id))
+        self._store_ref = Algo2Store(group.dir if account_id == "master" else os.path.join(group.dir, account_id))
         super().__init__(account_id)
         self.cfg = Algo2Config()
 
@@ -676,17 +684,40 @@ class Algo2History:
 
     reports.jsonl   - every 5-min situation report with per-index metrics
     metrics.jsonl   - one metrics row per index per minute
+    chain.jsonl     - raw option chain (ATM +/-10: OI, LTP, IV, greeks) per index per minute
     breakouts.jsonl - every breakout (taken or skipped) with gates/score, plus a
                       follow-up "outcome" row 20 min later (move, MFE/MAE, 2R/stop hit first)
+    candles/ + day_summary.json - end-of-day 1-min candles and summary (see daily_cache.py)
     """
 
     OUTCOME_MINUTES = 20
+    CHAIN_STRIKES = 10
 
     def __init__(self, directory: str) -> None:
         self.dir = directory
         self._last_minute: Dict[str, str] = {}
+        self._last_chain_minute: Dict[str, str] = {}
         self._seen: Dict[Tuple[str, float, str], bool] = {}
         self._pending: List[Dict[str, Any]] = []
+
+    def chain_snapshot(self, now: datetime, key: str, spot: Optional[float], futures: Optional[float],
+                       expiry: Optional[str], rows: List[Dict[str, Any]]) -> None:
+        """Raw option chain (ATM +/-10) once per minute - Dhan has no historical chain/greeks."""
+        minute = now.strftime("%Y-%m-%d %H:%M")
+        if not rows or not spot or self._last_chain_minute.get(key) == minute:
+            return
+        self._last_chain_minute[key] = minute
+
+        def leg(row: Dict[str, Any], side: str) -> Dict[str, Any]:
+            lg = row.get(side) or {}
+            g = lg.get("greeks") or {}
+            return {"ltp": lg.get("ltp"), "oi": lg.get("oi"), "prevOi": lg.get("prevOi"),
+                    "vol": lg.get("volume"), "iv": lg.get("iv"), "d": g.get("delta"), "g": g.get("gamma"),
+                    "t": g.get("theta"), "v": g.get("vega")}
+        strikes = [{"k": r.get("strike"), "ce": leg(r, "ce"), "pe": leg(r, "pe")}
+                   for r in calc.near_rows(rows, spot, self.CHAIN_STRIKES)]
+        self.append(now, "chain", {"time": now.isoformat(timespec="seconds"), "index": key, "spot": spot,
+                                   "futures": futures, "expiry": expiry, "strikes": strikes})
 
     def append(self, now: datetime, name: str, row: Dict[str, Any]) -> None:
         try:
@@ -794,6 +825,8 @@ class Algo2Group:
         self._blocked_logged: Dict[str, Tuple[float, str]] = {}
         self._blocked_recent: List[str] = []
         self.history = Algo2History(os.path.join(directory, "history"))
+        self.cache = Algo2DailyCache(self.history.dir, self.data,
+                                     lambda: {a: e._store for a, e in self.items.items()})
         # "What happens next" is refreshed only on the 5-min slot or on entry/exit, never every second.
         self.snapshot: Dict[str, Any] = {"time": None, "lines": []}
         self._snapshot_holding: Optional[bool] = None
@@ -891,6 +924,7 @@ class Algo2Group:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._task = None
+        await self.cache.cancel()
         for account, engine in self.items.items():
             with account_scope(account):
                 await engine.stop()
@@ -1122,6 +1156,7 @@ class Algo2Group:
     async def _signal_loop(self) -> None:
         while self._running:
             try:
+                self.cache.schedule(now_ist(), [k for k in self.cfg.indices if get_index(k)])
                 await self.tick()
                 self.loop_error = None
             except asyncio.CancelledError:
@@ -1146,6 +1181,8 @@ class Algo2Group:
             await self.data.refresh_candles(key, now)
             self.data.sample_chain(key, self.data.spot(key), self.cfg.oi_strikes)
             self.metrics[key] = self.compute_metrics(key, now)
+            self.history.chain_snapshot(now, key, self.data.spot(key), self.data.futures_price(key),
+                                        self.data.chain_expiry(key), self.data.chain_rows(key))
         self.history.on_tick(now, self.metrics)
         self._notify_updates(now)
         if self.has_position() or not self.enabled or self._dispatching:
@@ -1410,6 +1447,7 @@ class Algo2Group:
             "metrics": self.metrics,
             "news": self.news.status(now),
             "data": self.data.status(),
+            "dailyCache": self.cache.status(),
             "signals": {"day": self.signal_day, "count": self.signals_used(now.date().isoformat()),
                         "max": self.cfg.max_trades, "last": self.last_signal},
             "loopError": self.loop_error,

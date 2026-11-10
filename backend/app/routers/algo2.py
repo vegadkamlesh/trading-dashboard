@@ -150,7 +150,7 @@ def _store(account: str):
 async def journal(account: str = Query("master"), days: int = Query(7, ge=1, le=30),
                   _session: str = Depends(require_session)) -> Dict[str, Any]:
     store = _store(account)
-    return {"days": store.journal_days()[:days], "events": store.read_journal(days=days), "keepDays": 7}
+    return {"days": store.journal_days()[:days], "events": store.read_journal(days=days), "keepDays": None}
 
 
 @router.get("/trades")

@@ -303,7 +303,7 @@ IP for **each** account, then explicitly ARM the intended recipients.
 | Market data | Master Data API only; Child is trading-only. |
 | Product split | Algo 1 = MARGIN (exit 15:29), Algo 2 = INTRADAY (exit 15:15). Never mix. |
 | Balance | Shared broker balance. **Algo 2 has priority** (LIVE): if Algo 1's open trade leaves too little balance for an Algo 2 signal, Algo 1 is exited at market and Algo 2 enters as soon as that SELL fills. |
-| Telegram / logs | Same channel and journal; Algo 2 messages start with "Algo 2". Logs kept 7 days. |
+| Telegram / logs | Same channel and journal; Algo 2 messages start with "Algo 2". Algo 1 journal 7 days; Algo 2 journal + research history kept forever. |
 | Manual EXIT | Positions tab EXIT routes a tracked algo contract to that algo's own exit. |
 | Defaults | Both algos **ON + LIVE**, fast orders ON (no PIN): `APP_DRY_RUN=false`, `APP_FAST_ORDERS=true`, `ALGO_AUTO_ARM=true`; Algo 2 ON + LIVE unless turned OFF on its tab. |
 | Restart | Positions are restored and managed; Algo 1 auto-arms (`ALGO_AUTO_ARM`), Algo 2 re-arms unless it was turned OFF. Telegram gets "Algo 2 ON - LIVE after server start" (or ARM FAILED). |
@@ -508,14 +508,27 @@ Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
 
 ### Algo 2: permanent research log (never deleted)
 
-Saved under `data/algo2/history/YYYY-MM-DD/` (append-only JSONL, no retention/pruning;
-the 7-day journal limit does not apply):
+Saved under `data/algo2/history/YYYY-MM-DD/` (append-only, no retention/pruning).
+Algo 2's trade journals (`data/algo2/journal-*.jsonl`, `trades.jsonl`) are also kept
+forever; the 7-day journal limit applies only to Algo 1:
 
 | File | Contents |
 | --- | --- |
 | `reports.jsonl` | every 5-min report text + per-index metrics, gates, score and checks |
 | `metrics.jsonl` | one row per index per minute (spot, PCR, delta, GEX, OI velocity, HSMI, VWAP, profile, basis, VIX, checks) |
+| `chain.jsonl` | raw option chain per index per minute: ATM ±10 strikes, CE/PE LTP, OI, prev OI, volume, IV, delta/gamma/theta/vega, plus spot, futures and expiry (Dhan has no historical chain/greeks, so this is captured live) |
 | `breakouts.jsonl` | every breakout, taken or skipped, with blockers/score; plus an `outcome` row 20 min later (move, max favourable/adverse pts, 2R target or candle stop hit first) |
+| `candles/*.json` | daily cache: that day's 1-min candles for NIFTY/SENSEX spot, nearest futures (with OI), India VIX and the 6 heavyweights |
+| `day_summary.json` | breakouts taken/skipped, score distribution, top blockers, outcomes, skipped-but-would-hit-2R, trades and P&L per account |
+
+**Daily cache update** (`backend/app/algo2/daily_cache.py`): every trading day after
+15:31 IST (before the 16:00 server stop) about 11 Master Data API calls, 3 s apart, in
+the background. It runs whether Algo 2 is ON or OFF, never during 09:15–15:31 (quota
+is shared with live trading), stops on 429/DH-904 and retries after 10 min, and resumes
+without re-downloading saved files. Days missed because the server was off (up to the 5
+most recent with a history folder) are caught up on the next start before 09:15.
+`candles/done.json` marks a finished day. Status: `dailyCache` in `/api/algo2/status`.
+The raw chain (`chain.jsonl`) is written only while Algo 2 is ON or holding a position.
 
 Use it to tune `min_score`, thresholds or condition choice later.
 
@@ -699,7 +712,8 @@ All activity is written to daily log files under **`backend/logs/`**:
 
 Files older than **`LOG_RETENTION_DAYS` (default 7)** are deleted automatically at
 startup and once a day, so disk usage stays bounded. Order history also lives in
-`backend/audit.sqlite3` (powers the EOD Summary).
+`backend/audit.sqlite3` (powers the EOD Summary). Exception: Algo 2's
+`data/algo2/` journals and `history/` research data are never deleted.
 
 ### Telegram updates (optional, private, outbound-only)
 

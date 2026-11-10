@@ -117,7 +117,7 @@ export function Readme() {
           <li>Product alag: Algo 1 = MARGIN (exit 15:29), Algo 2 = INTRADAY (exit 15:15). Kabhi mix nahi.</li>
           <li>Balance shared hai. <b>Algo 2 ko priority</b> (LIVE): Algo 1 ka trade margin rok raha ho aur Algo 2 ka signal aaye → Algo 1 turant market exit (ALGO2_PRIORITY), SELL fill hote hi Algo 2 entry (~0.5–1 s, Dhan ke confirmation pe depend).</li>
           <li><b>Default:</b> dono algo ON + LIVE, fast orders ON (APP_DRY_RUN=false, APP_FAST_ORDERS=true, ALGO_AUTO_ARM=true). Restart pe Telegram: "Algo 2 ON - LIVE after server start".</li>
-          <li>Same Telegram channel aur journal; Algo 2 ke messages "Algo 2" se shuru. Logs 7 din.</li>
+          <li>Same Telegram channel; Algo 2 ke messages "Algo 2" se shuru. Algo 1 journal 7 din; Algo 2 journal + history hamesha save.</li>
           <li>AWS server Mon–Fri 09:00 start, 16:00 stop (NSE holiday skip). Stop square-off nahi karta.</li>
         </ul>
       </Section>
@@ -199,7 +199,8 @@ export function Readme() {
           <li>Sirf <b>INTRADAY</b>; Algo 1 MARGIN pe rehna chahiye warna Algo 2 ARM nahi hoga.</li>
           <li>Trade time: 09:45–11:15 aur 13:30–15:00. 15:00 ke baad entry nahi, 15:15 pe exit. News event ke ±15 min entry nahi (events tab mein add/remove).</li>
           <li>Entry: last closed 5-min candle high + buffer (NIFTY 0.5 / SENSEX 1.5) toota = CALL; low − buffer = PUT. <b>🔒 4 gates hamesha pass</b> (News, Trade window, Heavyweight divergence, VIX) <b>+ 🎯 10 score conditions mein se kam se kam 6</b> (Settings → "Min score", badal sakte ho; score conditions ke ON/OFF switch). OI velocity 10%, VWAP band 1.0 SD. Strike ITM, delta ~0.70.</li>
-          <li><b>Permanent log (kabhi delete nahi):</b> <code>data/algo2/history/YYYY-MM-DD/</code> — reports.jsonl (har 5 min report), metrics.jsonl (har minute data), breakouts.jsonl (har breakout liya/skip + 20 min baad result). Future tuning ke liye.</li>
+          <li><b>Permanent log (kabhi delete nahi):</b> <code>data/algo2/history/YYYY-MM-DD/</code> — reports.jsonl (har 5 min report), metrics.jsonl (har minute data), chain.jsonl (har minute raw option chain ATM ±10: OI, LTP, IV, greeks), breakouts.jsonl (har breakout liya/skip + 20 min baad result). Algo 2 trade journal bhi kabhi delete nahi.</li>
+          <li><b>Daily cache update:</b> har trading din 15:31 ke baad (16:00 stop se pehle) us din ki 1-min candles — NIFTY/SENSEX spot, futures (OI ke saath), VIX, 6 heavyweights — <code>candles/</code> mein, aur <code>day_summary.json</code> (breakouts, score distribution, kaunsa rule fail, skip hua par 2R hit hota, trades/P&amp;L). ~11 calls, 3 s gap, market time mein kabhi nahi. Rate-limit pe 10 min baad retry; server band tha to agle start pe 09:15 se pehle catch-up.</li>
           <li>SL: breakout candle ka low (CALL) / high (PUT). 0.75% capital cap default OFF. Broker pe 2× doori pe safety SL. OI trap pe Data SL.</li>
           <li>Target: T1 = OI wall ya 2R pe 70% booking, SL cost pe, baaki VWAP trail / T2. 20 min mein T1 nahi aaya to exit.</li>
           <li><b>Priority over Algo 1</b> (Settings switch, default ON, sirf LIVE): balance kam ho aur Algo 1 ki LIVE position ho → Algo 1 ka parked broker SL order <b>ek hi call mein MARKET mein modify</b> (same order, double SELL nahi), fill ka pata Dhan order-update stream se turant, TRADED hote hi Algo 2 BUY (funds update ke liye 5 tries, 0.1 s gap). Modify fail ho to safe exit (SL cancel + MARKET SELL). Lagbhag 5 broker round-trip ≈ 0.5–1 s; har step Dhan confirm karta hai, isliye second ke andar ki guarantee nahi — Telegram pe asli ms dikhega. 6 s mein SELL fill nahi hua to Algo 2 skip + error. OFF/PAPER mein sirf "insufficient balance" skip.</li>
