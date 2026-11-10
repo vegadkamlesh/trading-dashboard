@@ -43,7 +43,7 @@ type Config = Record<string, unknown> & {
   entry_cutoff: string; exit_time: string; max_stop_loss_pct: number; max_hold_minutes: number;
   oi_velocity_spike: number; t1_pct: number; target_delta: number; event_window_minutes: number;
   pcr_chop_low: number; pcr_chop_high: number; vix_spike_pct: number; data_sl: boolean; partial_booking: boolean;
-  capital_sl_cap: boolean; stop_after_sl: boolean; status_report_minutes: number; protective_sl_mult: number;
+  capital_sl_cap: boolean; stop_after_sl: boolean; priority_over_algo1: boolean; status_report_minutes: number; protective_sl_mult: number;
   entry_buffer: Record<string, number>;
 };
 
@@ -421,7 +421,7 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
     }
     void call("/api/algo2/config", patch, "Algo 2 settings saved").then(() => setDraft({}));
   };
-  const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl", label: string) => (
+  const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl" | "priority_over_algo1", label: string) => (
     <label className="flex items-center gap-1 text-xs">
       <input type="checkbox" disabled={busy} checked={!!st.config[k]}
         onChange={(e) => call("/api/algo2/config", { [k]: e.target.checked }, `${label} ${e.target.checked ? "ON" : "OFF"}`)} />
@@ -448,6 +448,7 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
         {flag("data_sl", "Data SL (OI trap exit)")}
         {flag("partial_booking", "T1 partial booking (70%)")}
         {flag("capital_sl_cap", "Cap candle SL at capital %")}
+        {flag("priority_over_algo1", "Priority: exit Algo 1 if its margin blocks an Algo 2 entry (LIVE)")}
       </div>
       <div className="mt-3 text-xs font-semibold text-slate-300">Values</div>
       <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
@@ -500,6 +501,7 @@ function ExitRulesCard({ st }: { st: Algo2Status }) {
     `${c.max_hold_minutes}-minute rule: T1 not reached in ${c.max_hold_minutes} min → exit (theta).`,
     `Time exit: ${c.exit_time} (before Dhan INTRADAY auto square-off). New entries till ${c.entry_cutoff}, windows ${c.trade_windows}.`,
     `Trades: max ${c.max_trades}/day, next only after the previous one closes${c.stop_after_sl ? "; after any stop-loss exit no more trades today" : ""}.`,
+    `Priority over Algo 1: ${c.priority_over_algo1 ? "ON — if Algo 1's open LIVE trade leaves too little balance, Algo 1 is exited at market and Algo 2 enters as soon as that SELL fills" : "OFF — Algo 2 skips the signal when balance is short"}.`,
   ];
   return (
     <div className="card p-3">

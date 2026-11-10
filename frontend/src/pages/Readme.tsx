@@ -115,7 +115,8 @@ export function Readme() {
           <li>Do tab: <b>🤖 Algo 1</b> (ORB) aur <b>🤖 Algo 2</b> (options-flow). Dono ka apna ON/OFF aur apna PAPER/LIVE.</li>
           <li>Master + Child: same signal, har account apne balance se size. Market data sirf Master Data API se; Child sirf trading.</li>
           <li>Product alag: Algo 1 = MARGIN (exit 15:29), Algo 2 = INTRADAY (exit 15:15). Kabhi mix nahi.</li>
-          <li>Balance shared hai: Algo 1 ka trade chal raha ho to Algo 2 ko margin kam padega → skip + log, trade count use nahi hota.</li>
+          <li>Balance shared hai. <b>Algo 2 ko priority</b> (LIVE): Algo 1 ka trade margin rok raha ho aur Algo 2 ka signal aaye → Algo 1 turant market exit (ALGO2_PRIORITY), SELL fill hote hi Algo 2 entry (~1-2 s).</li>
+          <li><b>Default:</b> dono algo ON + LIVE, fast orders ON (APP_DRY_RUN=false, APP_FAST_ORDERS=true, ALGO_AUTO_ARM=true). Restart pe Telegram: "Algo 2 ON - LIVE after server start".</li>
           <li>Same Telegram channel aur journal; Algo 2 ke messages "Algo 2" se shuru. Logs 7 din.</li>
           <li>AWS server Mon–Fri 09:00 start, 16:00 stop (NSE holiday skip). Stop square-off nahi karta.</li>
         </ul>
@@ -194,12 +195,13 @@ export function Readme() {
 
       <Section title="🤖 Algo 2 (options-flow): alag ON/OFF aur alag Paper/Live">
         <ul className="list-disc space-y-2 pl-5 text-xs">
-          <li>Algo 2 ka apna tab, ON/OFF, PAPER/LIVE aur Master/Child ticks. <b>Default: OFF + LIVE</b> — ON karte hi real order. Paper↔Live sirf OFF aur flat hone par.</li>
+          <li>Algo 2 ka apna tab, ON/OFF, PAPER/LIVE aur Master/Child ticks. <b>Default: ON + LIVE</b> — server start pe khud arm, signal pe real order. Paper↔Live sirf OFF aur flat hone par.</li>
           <li>Sirf <b>INTRADAY</b>; Algo 1 MARGIN pe rehna chahiye warna Algo 2 ARM nahi hoga.</li>
           <li>Trade time: 09:45–11:15 aur 13:30–15:00. 15:00 ke baad entry nahi, 15:15 pe exit. News event ke ±15 min entry nahi (events tab mein add/remove).</li>
           <li>Entry: last closed 5-min candle high + buffer (NIFTY 0.5 / SENSEX 1.5) toota = CALL; low − buffer = PUT. Har ON condition pass honi chahiye (14 conditions, har ek ka switch Settings mein). Strike ITM, delta ~0.70.</li>
           <li>SL: breakout candle ka low (CALL) / high (PUT). 0.75% capital cap default OFF. Broker pe 2× doori pe safety SL. OI trap pe Data SL.</li>
           <li>Target: T1 = OI wall ya 2R pe 70% booking, SL cost pe, baaki VWAP trail / T2. 20 min mein T1 nahi aaya to exit.</li>
+          <li><b>Priority over Algo 1</b> (Settings switch, default ON, sirf LIVE): balance kam ho aur Algo 1 ki LIVE position ho → Algo 1 ka broker SL cancel + MARKET SELL, 0.1 s pe fill check, TRADED hote hi Algo 2 BUY (funds update ke liye 5 tries). 6 s mein SELL fill nahi hua to Algo 2 skip + error. OFF/PAPER mein sirf "insufficient balance" skip.</li>
           <li>Din mein max 2 trade (Algo 1 ON ho ya OFF). SL hit hua to us din aur trade nahi; target/20-min exit ke baad 2nd allowed.</li>
           <li><b>Notifications (quiet):</b> entry, T1, exit, SL turant. Baaki sirf har 5 min report — spot, triggers, conditions pass/fail, position, aur us 5 min mein skip hue breakouts. "Aage kya hoga" bhi sirf 5 min pe ya entry/exit pe update hota hai.</li>
           <li>Data sirf Master Data API; option chain shared, extra calls nahi. Historical backtest possible nahi (Dhan ke paas purana chain greeks/OI nahi).</li>
@@ -354,7 +356,8 @@ DHAN_ACCESS_TOKEN=eyJ...aapka-pura-token...`}</pre>
         </div>
         <p className="mt-2 text-xs text-slate-500">
           Dono switches <strong>Settings tab</strong> se live flip kar sakte ho — restart ki zaroorat
-          nahi. Restart pe <code>.env</code> ke default par wapas aa jate hain.
+          nahi. Restart pe <code>.env</code> ke default par wapas aa jate hain. Code default:
+          <code>APP_DRY_RUN=false</code> (LIVE) + <code>APP_FAST_ORDERS=true</code>.
         </p>
       </Section>
 

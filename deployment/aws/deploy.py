@@ -1417,7 +1417,9 @@ st = os.stat(path)
 lines = [l for l in open(path, encoding="utf-8").read().splitlines() if l.split("=", 1)[0] not in managed]
 # Operator trading defaults (APP_FAST_ORDERS, TRADING_DEFAULT_ACCOUNTS, ALGO_AUTO_ARM) are preserved.
 if not any(l.startswith("APP_FAST_ORDERS=") for l in lines):
-    lines.append("APP_FAST_ORDERS=false")
+    lines.append("APP_FAST_ORDERS=true")
+if not any(l.startswith("ALGO_AUTO_ARM=") for l in lines):
+    lines.append("ALGO_AUTO_ARM=true")
 lines += [f"{{k}}={{v}}" for k, v in creds.items()] + ["APP_DRY_RUN={dry}"]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
 with os.fdopen(fd, "w", encoding="utf-8") as f:

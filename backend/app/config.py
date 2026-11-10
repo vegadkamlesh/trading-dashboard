@@ -37,15 +37,16 @@ class Settings(BaseSettings):
     app_order_pin: str = "000000"
 
     # --- Safety ---
-    app_dry_run: bool = True
+    # Operator-approved defaults: LIVE orders, no PIN, algo armed at startup.
+    # Override in .env (APP_DRY_RUN=true etc.) for a safe local/test setup.
+    app_dry_run: bool = False
     # Fast orders: when True, the order PIN is NOT required (1-click scalping).
-    # Set to True only while actively scalping; keep False otherwise.
-    app_fast_orders: bool = False
+    app_fast_orders: bool = True
     # Accounts enabled for orders/algo at startup, e.g. "master,child".
     trading_default_accounts_raw: str = Field("master", validation_alias="TRADING_DEFAULT_ACCOUNTS")
     # When True, the algo is armed for the default accounts right after startup
-    # (same IP preflight as a manual ARM). Keep False unless unattended trading is intended.
-    algo_auto_arm: bool = False
+    # (same IP preflight as a manual ARM).
+    algo_auto_arm: bool = True
 
     @property
     def trading_default_accounts(self) -> list[str]:

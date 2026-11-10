@@ -44,6 +44,7 @@ from ..algo import (
     _as_float, _as_int, now_ist, session_for,
 )
 from ..algo_store import AlgoStore, base_dir
+from ..config import get_settings
 from ..dhan_client import DhanAPIError
 from ..feed import feed
 from ..instruments import get_index, lot_size_for
@@ -75,6 +76,9 @@ CONDITIONS: List[Tuple[str, str]] = [
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
 SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
+PRIORITY_EXIT_SECONDS = 6.0     # max wait for Algo 1's SELL fill before giving up the Algo 2 entry
+PRIORITY_POLL_SECONDS = 0.1
+PRIORITY_ENTRY_TRIES = 5        # broker funds can lag the SELL fill by a few hundred ms
 
 
 def _default_conditions() -> Dict[str, bool]:
@@ -97,6 +101,7 @@ class Algo2Config(AlgoConfig):
     max_stop_loss_pct: float = 0.75
     capital_sl_cap: bool = False      # operator choice: SL = breakout candle low/high only
     stop_after_sl: bool = True        # no more entries today once a trade exits on a stop
+    priority_over_algo1: bool = True  # LIVE: exit Algo 1's position when its margin blocks an Algo 2 entry
     status_report_minutes: int = 5
     max_hold_minutes: int = 20
     oi_velocity_spike: float = 30.0
@@ -306,6 +311,62 @@ class Algo2Engine(AlgoEngine):
         if isinstance(pos, Algo2Position) and not pos.t1_spot:
             pos.t1_spot = pos.target_spot
             self._persist()
+
+    # ------------------------------------------------- priority over Algo 1
+    def _algo1_blocking_position(self) -> Optional[Position]:
+        """Algo 1's live position on this account that Algo 2 may close to free margin."""
+        if not self.cfg.priority_over_algo1 or self._is_dry():
+            return None
+        algo1 = base.engines.items.get(self.account_id)
+        pos = getattr(algo1, "_position", None)
+        if pos is None or pos.dry_run or pos.execution_state not in {"open", "exit_pending"}:
+            return None
+        return pos
+
+    async def free_margin_from_algo1(self, key: str) -> bool:
+        """Exit Algo 1 now; True once its SELL is filled (funds free) or it is already flat."""
+        pos = self._algo1_blocking_position()
+        if pos is None:
+            return False
+        algo1 = base.engines.items[self.account_id]
+        t0 = time.perf_counter()
+        self._log(f"PRIORITY: {key} signal needs the margin held by Algo 1 ({pos.index_key} {pos.option_type} "
+                  f"{int(pos.strike)} x{pos.quantity}) -> exiting Algo 1 now", level="warn", index=key)
+        algo1._log("Exit requested by Algo 2 priority (Algo 2 signal needs the margin)", level="warn")
+        filled = False
+        async with algo1._execution_lock:
+            deadline = time.monotonic() + PRIORITY_EXIT_SECONDS
+            while time.monotonic() < deadline and algo1._position is pos:
+                if not (pos.exit_order_id or pos.exit_correlation_id):
+                    await algo1._exit_position_locked(pos, "ALGO2_PRIORITY")
+                    if algo1._position is not pos:
+                        break
+                    if not (pos.exit_order_id or pos.exit_correlation_id):
+                        await asyncio.sleep(PRIORITY_POLL_SECONDS)
+                        continue
+                try:
+                    order = await algo1._order_state(pos.exit_order_id, pos.exit_correlation_id)
+                except DhanAPIError:
+                    order = {}
+                status = str(order.get("orderStatus") or "").upper()
+                if status == "TRADED":
+                    filled = True
+                    break
+                if status in TERMINAL_ORDERS:
+                    break
+                await asyncio.sleep(PRIORITY_POLL_SECONDS)
+            filled = filled or algo1._position is not pos
+            try:
+                await algo1._reconcile_locked()
+            except Exception:  # noqa: BLE001
+                logger.exception("account=%s Algo 1 reconcile after priority exit failed", self.account_id)
+        ms = (time.perf_counter() - t0) * 1000
+        if not filled:
+            self._log(f"PRIORITY: Algo 1 exit not filled within {PRIORITY_EXIT_SECONDS:g}s - Algo 2 {key} entry "
+                      f"skipped. Check Dhan.", level="error", index=key)
+            return False
+        self._log(f"PRIORITY: Algo 1 exit filled in {ms:.0f} ms -> entering Algo 2 now", level="success", index=key)
+        return True
 
     # ------------------------------------------------------- management
     def _t1_lots(self, pos: Algo2Position) -> int:
@@ -537,8 +598,9 @@ class Algo2Group:
         os.makedirs(directory, exist_ok=True)
         self.settings_path = os.path.join(directory, "group.json")
         self.dry_run = False
-        self.saved_enabled = False
-        self.entry_accounts: Tuple[AccountId, ...] = ("master",)
+        self.saved_enabled = True     # default ON + LIVE until the operator turns it OFF
+        defaults = tuple(a for a in ACCOUNT_IDS if a in get_settings().trading_default_accounts)
+        self.entry_accounts: Tuple[AccountId, ...] = defaults or ("master",)
         self.signal_day: Optional[str] = None
         self.signal_count = 0
         self._load_settings()
@@ -569,8 +631,8 @@ class Algo2Group:
         except (OSError, ValueError):
             return
         self.dry_run = bool(data.get("dryRun", False))
-        self.saved_enabled = bool(data.get("enabled", False))
-        accounts = tuple(a for a in data.get("accounts") or ["master"] if a in ACCOUNT_IDS)
+        self.saved_enabled = bool(data.get("enabled", True))
+        accounts = tuple(a for a in data.get("accounts") or self.entry_accounts if a in ACCOUNT_IDS)
         self.entry_accounts = accounts or ("master",)
         self.signal_day = data.get("signalDay")
         self.signal_count = int(data.get("signalCount") or 0)
@@ -617,6 +679,19 @@ class Algo2Group:
             await self._rearm_after_restart()
         self._task = asyncio.create_task(self._signal_loop(), name="algo2-signal")
         logger.info("Algo 2 started (paper=%s, accounts=%s)", self.dry_run, ",".join(self.entry_accounts))
+        self._announce_startup()
+
+    def _announce_startup(self) -> None:
+        on = self.enabled
+        armed = ",".join(a for a in self.entry_accounts if self.items[a].enabled) or "none"
+        msg = (f"Algo 2 {'ON' if on else 'OFF'} - {'PAPER' if self.dry_run else 'LIVE'} after server start | "
+               f"accounts {armed} | priority over Algo 1 {'ON' if self.cfg.priority_over_algo1 else 'OFF'}")
+        if self.saved_enabled and not on:
+            msg += " | ARM FAILED: Algo 2 will NOT trade, check the Algo 2 tab"
+        event = "auto_armed" if on else ("auto_arm_failed" if self.saved_enabled else "algo_disarmed")
+        with account_scope("master"):
+            self.master._log(msg, level="success" if on else ("error" if self.saved_enabled else "warn"),
+                             notification=event)
 
     async def _rearm_after_restart(self) -> None:
         for account in self.entry_accounts:
@@ -1075,6 +1150,17 @@ class Algo2Group:
                         engine._legs[key] = local
                         engine._signal_t0 = time.perf_counter()
                         await engine._enter(local, side)
+                        if (engine._position is None and local.status == "skipped"
+                                and "insufficient balance" in (local.note or "")
+                                and await engine.free_margin_from_algo1(key)):
+                            consumed = True
+                            for _ in range(PRIORITY_ENTRY_TRIES):
+                                # Already-accepted signal: re-send without a breakout recheck.
+                                local.status, local.note, local.funds_retries = "watching", "", 1
+                                await engine._enter(local, side)
+                                if engine._position is not None or "insufficient balance" not in (local.note or ""):
+                                    break
+                                await asyncio.sleep(PRIORITY_POLL_SECONDS * 2)
                         if engine._position is not None or local.entry_attempts > 0:
                             consumed = True
                         elif local.note:

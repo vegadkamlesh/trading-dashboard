@@ -22,15 +22,17 @@ class StartupDefaultsTests(unittest.IsolatedAsyncioTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def test_defaults_are_master_only_and_no_auto_arm(self):
+    def test_defaults_are_master_only_live_fast_and_auto_arm(self):
         s = Settings(_env_file=None)
         self.assertEqual(s.trading_default_accounts, ["master"])
-        self.assertFalse(s.algo_auto_arm)
+        self.assertTrue(s.algo_auto_arm)
+        self.assertFalse(s.app_dry_run)
+        self.assertTrue(s.app_fast_orders)
         self.assertEqual(settings(TRADING_DEFAULT_ACCOUNTS=" Master, child ").trading_default_accounts,
                          ["master", "child"])
 
     async def test_selects_without_arming_when_auto_arm_off(self):
-        s = settings(TRADING_DEFAULT_ACCOUNTS="master,child")
+        s = settings(TRADING_DEFAULT_ACCOUNTS="master,child", algo_auto_arm=False)
         with patch.object(trading_accounts, "get_settings", return_value=s), \
              patch.object(trading_accounts, "select_accounts") as select, \
              patch.object(trading_accounts, "algo_action", new=AsyncMock()) as arm:

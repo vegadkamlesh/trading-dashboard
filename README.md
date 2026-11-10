@@ -302,10 +302,11 @@ IP for **each** account, then explicitly ARM the intended recipients.
 | Accounts | Master + Child, same signal to each selected account, each sizes from its own balance. |
 | Market data | Master Data API only; Child is trading-only. |
 | Product split | Algo 1 = MARGIN (exit 15:29), Algo 2 = INTRADAY (exit 15:15). Never mix. |
-| Balance | Shared broker balance: an open Algo 1 trade can leave too little for Algo 2 (skip, logged). |
+| Balance | Shared broker balance. **Algo 2 has priority** (LIVE): if Algo 1's open trade leaves too little balance for an Algo 2 signal, Algo 1 is exited at market and Algo 2 enters as soon as that SELL fills. |
 | Telegram / logs | Same channel and journal; Algo 2 messages start with "Algo 2". Logs kept 7 days. |
 | Manual EXIT | Positions tab EXIT routes a tracked algo contract to that algo's own exit. |
-| Restart | Positions are restored and managed; Algo 1 entries disarm, Algo 2 re-arms if it was ON. |
+| Defaults | Both algos **ON + LIVE**, fast orders ON (no PIN): `APP_DRY_RUN=false`, `APP_FAST_ORDERS=true`, `ALGO_AUTO_ARM=true`; Algo 2 ON + LIVE unless turned OFF on its tab. |
+| Restart | Positions are restored and managed; Algo 1 auto-arms (`ALGO_AUTO_ARM`), Algo 2 re-arms unless it was turned OFF. Telegram gets "Algo 2 ON - LIVE after server start" (or ARM FAILED). |
 | Server | AWS starts 09:00 and stops 16:00 Mon–Fri (skips NSE holidays). The stop does not square off. |
 
 ## Algo 1 — ORB (`🤖 Algo 1` tab)
@@ -416,9 +417,10 @@ reconcile and exit code; only the signal, levels and exits below differ.
 
 | Switch | Default | Notes |
 | --- | --- | --- |
-| ON / OFF | OFF | Own switch; never touches Algo 1. Saved in `data/algo2/group.json`; re-arms after restart if it was ON. |
+| ON / OFF | **ON** | Own switch. Saved in `data/algo2/group.json`; re-arms after restart unless turned OFF. |
 | PAPER / LIVE | **LIVE** | Own mode (Algo 1 has its own). Change only while OFF and flat. |
-| Accounts | Master | Master / Child ticks, change only while OFF and flat. |
+| Priority over Algo 1 | ON | `priority_over_algo1`, LIVE only; see "Algo 2: trade count". |
+| Accounts | `TRADING_DEFAULT_ACCOUNTS` | Master / Child ticks, change only while OFF and flat. |
 | Product | INTRADAY | Forced. Arm is refused if Algo 1 is also INTRADAY (Algo 1 stays MARGIN) so broker positions never mix. |
 | Each of the 14 conditions | ON | Settings → Conditions ON/OFF. All ENABLED conditions must pass. |
 | Data SL, T1 70% booking, stop after 1st SL | ON | Settings checkboxes. |
@@ -471,7 +473,13 @@ Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
 - Max **2 trades/day**, whether Algo 1 is ON or OFF. The 2nd only after the 1st is closed.
 - After a stop-loss exit (STOP, DATA_SL, broker SL, ₹ loss) **no more trades that day**.
   Target, cost-stop or 20-minute exits still allow the 2nd trade.
-- LIVE: if Algo 1 has used the margin, Algo 2 skips with "insufficient balance"; the
+- **Priority over Algo 1** (LIVE, `priority_over_algo1`, default ON): if Algo 1 holds a LIVE
+  position and Algo 2's sizing finds "insufficient balance", Algo 2 immediately exits Algo 1
+  (reason `ALGO2_PRIORITY`: cancel its broker SL, MARKET SELL, poll the SELL every 0.1 s),
+  and as soon as the SELL is TRADED re-sends the same signal (no breakout recheck, up to 5
+  tries while funds update). Typical total ~1-2 s (broker round-trips), not instant. If the
+  SELL is not filled within 6 s the Algo 2 entry is skipped and an error is sent.
+- Priority OFF / no Algo 1 position: short balance means "insufficient balance" skip; the
   skip does not use up a trade and the next 5-min candle can retry. PAPER: own ₹1L.
 
 ### Algo 2: notifications (quiet by design)
@@ -642,13 +650,13 @@ popup — so you never trade blind:
 
 | Switch | `true` | `false` |
 | ------ | ------ | ------- |
-| **`APP_DRY_RUN`** | Orders are validated & logged only — **no real trade** | Orders are **sent to Dhan for real** |
-| **`APP_FAST_ORDERS`** | **PIN skipped** — 1 click places the order (scalping) | Every order **requires the PIN** (safe) |
+| **`APP_DRY_RUN`** (default `false`) | Orders are validated & logged only — **no real trade** | Orders are **sent to Dhan for real** |
+| **`APP_FAST_ORDERS`** (default `true`) | **PIN skipped** — 1 click places the order (scalping) | Every order **requires the PIN** |
 
 Both can be toggled from the **Settings** tab without editing `.env` or restarting
 (a handy **FAST ON/OFF** + **DRY-RUN/LIVE** badge is always visible in the top bar).
-Toggles live in memory and reset to the `.env` defaults on restart — so a restart
-always returns to the safe configured state.
+Toggles live in memory and reset to the `.env` defaults on restart. Code defaults are
+LIVE + fast + `ALGO_AUTO_ARM=true`; set `APP_DRY_RUN=true` in `.env` for a paper setup.
 
 ### Logging (everything saved, auto-trimmed to 7 days)
 

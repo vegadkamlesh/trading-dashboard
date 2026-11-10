@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import time
 import unittest
@@ -156,6 +157,8 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(target.stop)
         self.group = Algo2Group(self.tmp.name)
         self.assertFalse(self.group.dry_run)   # Algo 2 defaults to LIVE
+        self.assertTrue(self.group.saved_enabled)   # ... and ON
+        self.assertTrue(self.group.cfg.priority_over_algo1)
         self.group.dry_run = True              # tests below must never reach the broker
         self.engine = self.group.items["master"]
         self.engine.cfg.protective_sl = False
@@ -328,6 +331,71 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.engine._is_dry())
         reloaded = Algo2Group(self.tmp.name)
         self.assertFalse(reloaded.dry_run)
+
+    def fake_algo1(self, status="TRADED", **pos_changes):
+        algo1 = MagicMock()
+        algo1._execution_lock = asyncio.Lock()
+        algo1._position = pos = self.position(dry_run=False, execution_state="open", **pos_changes)
+
+        async def exit_locked(p, reason):
+            p.exit_order_id, p.execution_state, p.exit_reason = "X1", "exit_pending", reason
+        algo1._exit_position_locked = AsyncMock(side_effect=exit_locked)
+        algo1._order_state = AsyncMock(return_value={"orderStatus": status})
+        algo1._reconcile_locked = AsyncMock()
+        return algo1, pos
+
+    async def test_priority_exits_live_algo1_when_algo2_needs_margin(self):
+        self.group.dry_run = False
+        algo1, pos = self.fake_algo1()
+        with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
+            self.assertTrue(await self.engine.free_margin_from_algo1("NIFTY"))
+        algo1._exit_position_locked.assert_awaited_once_with(pos, "ALGO2_PRIORITY")
+        self.client.place_order.assert_not_awaited()
+
+    async def test_priority_gives_up_when_algo1_exit_is_rejected(self):
+        self.group.dry_run = False
+        algo1, _ = self.fake_algo1(status="REJECTED")
+        with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
+            self.assertFalse(await self.engine.free_margin_from_algo1("NIFTY"))
+
+    async def test_priority_never_touches_algo1_in_paper_or_when_switched_off(self):
+        algo1, _ = self.fake_algo1()
+        with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
+            self.assertFalse(await self.engine.free_margin_from_algo1("NIFTY"))     # Algo 2 PAPER
+            self.group.dry_run = False
+            self.engine.cfg.priority_over_algo1 = False
+            self.assertFalse(await self.engine.free_margin_from_algo1("NIFTY"))
+            self.engine.cfg.priority_over_algo1 = True
+            algo1._position.dry_run = True                                          # Algo 1 paper trade
+            self.assertFalse(await self.engine.free_margin_from_algo1("NIFTY"))
+        algo1._exit_position_locked.assert_not_awaited()
+
+    async def test_dispatch_retries_entry_after_priority_exit(self):
+        self.engine.enabled = True
+        self.engine._position = None
+        calls = []
+
+        async def fake_enter(leg, side):
+            calls.append(leg.funds_retries)
+            if len(calls) == 1:
+                leg.status, leg.note = "skipped", "insufficient balance: Rs100 available"
+            else:
+                self.engine._position = self.position()
+
+        async def fake_prepare(leg, side):
+            leg.prepared_side, leg.security_id, leg.strike = side, 1, 23450.0
+        m = {"candle": {"high": 23510.0, "low": 23470.0}, "spot": 23515.0, "triggerUp": 23510.5,
+             "triggerDown": 23469.5, "checks": {"CALL": []}}
+        with patch.object(self.engine, "_enter", side_effect=fake_enter), \
+             patch.object(self.engine, "_prepare_contract", side_effect=fake_prepare), \
+             patch.object(self.engine, "free_margin_from_algo1", AsyncMock(return_value=True)) as free, \
+             patch.object(self.group.data, "chain_rows", return_value=[]), \
+             patch.object(self.engine, "_persist"), patch.object(self.group, "save_settings"):
+            await self.group._dispatch("NIFTY", "CALL", m)
+        free.assert_awaited_once_with("NIFTY")
+        self.assertEqual(calls, [0, 1])
+        self.assertIsNotNone(self.engine._position)
+        self.assertTrue(self.group.last_signal["consumed"])
 
     async def test_arm_refused_when_algo1_uses_intraday(self):
         algo1 = algo_module.engines.items["master"]
