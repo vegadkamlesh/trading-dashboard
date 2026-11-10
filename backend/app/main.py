@@ -96,7 +96,7 @@ async def trading_lifespan(app: FastAPI):
         from .routers.trading_accounts import apply_startup_defaults
         await apply_startup_defaults()
         await algo2_group.start()
-        logger.info("Algo 2 engine ready (OFF/Paper by default; controlled from the Algo 2 tab)")
+        logger.info("Algo 2 engine ready (OFF/Live by default; controlled from the Algo 2 tab)")
     try:
         yield
     finally:
