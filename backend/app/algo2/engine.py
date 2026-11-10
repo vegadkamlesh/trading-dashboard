@@ -78,7 +78,9 @@ SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
 PRIORITY_EXIT_SECONDS = 6.0     # max wait for Algo 1's SELL fill before giving up the Algo 2 entry
 PRIORITY_POLL_SECONDS = 0.1
+PRIORITY_EVENT_WAIT = 0.25      # order-stream alert normally wakes the fill check well before this
 PRIORITY_ENTRY_TRIES = 5        # broker funds can lag the SELL fill by a few hundred ms
+_BACKGROUND: set = set()
 
 
 def _default_conditions() -> Dict[str, bool]:
@@ -323,22 +325,63 @@ class Algo2Engine(AlgoEngine):
             return None
         return pos
 
+    async def _convert_algo1_stop_to_market(self, algo1: Any, pos: Position) -> bool:
+        """One broker call: turn Algo 1's parked SL-M SELL into a MARKET SELL.
+
+        Same order, so there is never a second SELL (no cancel/confirm/re-read/new-order
+        round trips). Any failure restores the protective state and the caller falls back
+        to the normal safe exit, which re-verifies that order first."""
+        oid = pos.protective_order_id
+        if (not oid or str(oid).startswith("DRY-") or pos.exit_order_id or pos.exit_correlation_id
+                or pos.protective_cancel_requested or pos.partial_exit or pos.execution_state != "open"):
+            return False
+        saved = (pos.protective_order_id, pos.protective_correlation_id, pos.exit_reason)
+        pos.exit_reason, pos.execution_state, pos.exit_order_id = "ALGO2_PRIORITY", "exit_pending", str(oid)
+        pos.protective_order_id = pos.protective_correlation_id = None
+        algo1._persist()
+        try:
+            await base.get_dhan_client().modify_order(str(oid), {
+                "orderType": "MARKET", "legName": "", "quantity": int(pos.quantity), "price": 0,
+                "disclosedQuantity": 0, "triggerPrice": 0, "validity": "DAY"})
+            return True
+        except DhanAPIError as exc:
+            pos.protective_order_id, pos.protective_correlation_id, pos.exit_reason = saved
+            pos.execution_state, pos.exit_order_id = "open", None
+            algo1._persist()
+            self._log(f"PRIORITY: fast SL->MARKET modify failed ({exc.error_message}); using safe exit",
+                      level="warn", index=pos.index_key)
+            return False
+
+    async def _await_order_change(self, wait: float) -> None:
+        waiter = getattr(base.get_dhan_client(), "wait_order_event", None)
+        if asyncio.iscoroutinefunction(waiter):
+            await waiter(wait)
+        else:
+            await asyncio.sleep(PRIORITY_POLL_SECONDS)
+
     async def free_margin_from_algo1(self, key: str) -> bool:
         """Exit Algo 1 now; True once its SELL is filled (funds free) or it is already flat."""
         pos = self._algo1_blocking_position()
         if pos is None:
             return False
         algo1 = base.engines.items[self.account_id]
+        client = base.get_dhan_client()
+        clear = getattr(client, "clear_order_event", None)
         t0 = time.perf_counter()
         self._log(f"PRIORITY: {key} signal needs the margin held by Algo 1 ({pos.index_key} {pos.option_type} "
                   f"{int(pos.strike)} x{pos.quantity}) -> exiting Algo 1 now", level="warn", index=key)
         algo1._log("Exit requested by Algo 2 priority (Algo 2 signal needs the margin)", level="warn")
-        filled = False
+        filled, fast, sent_ms = False, False, None
         async with algo1._execution_lock:
             deadline = time.monotonic() + PRIORITY_EXIT_SECONDS
             while time.monotonic() < deadline and algo1._position is pos:
+                if callable(clear):
+                    clear()
                 if not (pos.exit_order_id or pos.exit_correlation_id):
-                    await algo1._exit_position_locked(pos, "ALGO2_PRIORITY")
+                    fast = await self._convert_algo1_stop_to_market(algo1, pos)
+                    if not fast:
+                        await algo1._exit_position_locked(pos, "ALGO2_PRIORITY")
+                    sent_ms = (time.perf_counter() - t0) * 1000
                     if algo1._position is not pos:
                         break
                     if not (pos.exit_order_id or pos.exit_correlation_id):
@@ -353,20 +396,34 @@ class Algo2Engine(AlgoEngine):
                     filled = True
                     break
                 if status in TERMINAL_ORDERS:
+                    if fast and pos.exit_order_id:
+                        # Modified stop died without a fill: give Algo 1's normal exit a clean retry.
+                        pos.exit_order_id, pos.execution_state, fast = None, "open", False
+                        continue
                     break
-                await asyncio.sleep(PRIORITY_POLL_SECONDS)
+                await self._await_order_change(PRIORITY_EVENT_WAIT)
             filled = filled or algo1._position is not pos
-            try:
-                await algo1._reconcile_locked()
-            except Exception:  # noqa: BLE001
-                logger.exception("account=%s Algo 1 reconcile after priority exit failed", self.account_id)
+        # Algo 1's books are settled after Algo 2 is in, off the critical path.
+        task = asyncio.create_task(self._reconcile_algo1_later(algo1), name=f"{self.account_id}-algo1-after-priority")
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
         ms = (time.perf_counter() - t0) * 1000
         if not filled:
             self._log(f"PRIORITY: Algo 1 exit not filled within {PRIORITY_EXIT_SECONDS:g}s - Algo 2 {key} entry "
                       f"skipped. Check Dhan.", level="error", index=key)
             return False
-        self._log(f"PRIORITY: Algo 1 exit filled in {ms:.0f} ms -> entering Algo 2 now", level="success", index=key)
+        how = "SL order modified to MARKET" if fast else "safe exit (cancel SL + MARKET SELL)"
+        self._log(f"PRIORITY: Algo 1 exit filled in {ms:.0f} ms ({how}; sent at {sent_ms or 0:.0f} ms) "
+                  f"-> entering Algo 2 now", level="success", index=key)
         return True
+
+    async def _reconcile_algo1_later(self, algo1: Any) -> None:
+        try:
+            with account_scope(self.account_id):
+                async with algo1._execution_lock:
+                    await algo1._reconcile_locked()
+        except Exception:  # noqa: BLE001
+            logger.exception("account=%s Algo 1 reconcile after priority exit failed", self.account_id)
 
     # ------------------------------------------------------- management
     def _t1_lots(self, pos: Algo2Position) -> int:
@@ -1160,7 +1217,7 @@ class Algo2Group:
                                 await engine._enter(local, side)
                                 if engine._position is not None or "insufficient balance" not in (local.note or ""):
                                     break
-                                await asyncio.sleep(PRIORITY_POLL_SECONDS * 2)
+                                await asyncio.sleep(PRIORITY_POLL_SECONDS)
                         if engine._position is not None or local.entry_attempts > 0:
                             consumed = True
                         elif local.note:

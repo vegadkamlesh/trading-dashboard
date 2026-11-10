@@ -358,6 +358,40 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
             self.assertFalse(await self.engine.free_margin_from_algo1("NIFTY"))
 
+    async def test_priority_fast_path_modifies_algo1_stop_to_market_in_one_call(self):
+        self.group.dry_run = False
+        algo1, pos = self.fake_algo1(protective_order_id="SL1", protective_correlation_id="C1")
+        self.client.modify_order = AsyncMock(return_value={"orderStatus": "TRANSIT"})
+        self.client.wait_order_event = AsyncMock(return_value=True)
+        algo1._order_state = AsyncMock(side_effect=[{"orderStatus": "PENDING"}, {"orderStatus": "TRADED"}])
+        with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
+            self.assertTrue(await self.engine.free_margin_from_algo1("NIFTY"))
+            await asyncio.sleep(0)
+        self.client.modify_order.assert_awaited_once()
+        oid, payload = self.client.modify_order.await_args.args
+        self.assertEqual((oid, payload["orderType"], payload["quantity"]), ("SL1", "MARKET", pos.quantity))
+        algo1._exit_position_locked.assert_not_awaited()      # no cancel + new SELL round trips
+        self.client.place_order.assert_not_awaited()
+        self.client.wait_order_event.assert_awaited()          # woken by the order stream, not a fixed sleep
+        self.assertEqual((pos.exit_order_id, pos.exit_reason, pos.protective_order_id),
+                         ("SL1", "ALGO2_PRIORITY", None))
+        algo1._reconcile_locked.assert_awaited()               # done in the background
+
+    async def test_priority_fast_path_failure_restores_stop_and_uses_safe_exit(self):
+        self.group.dry_run = False
+        algo1, pos = self.fake_algo1(protective_order_id="SL1", protective_correlation_id="C1")
+        seen = {}
+
+        async def exit_locked(p, reason):
+            seen["protective"] = p.protective_order_id
+            p.exit_order_id, p.execution_state, p.exit_reason = "X1", "exit_pending", reason
+        algo1._exit_position_locked = AsyncMock(side_effect=exit_locked)
+        self.client.modify_order = AsyncMock(side_effect=algo_module.DhanAPIError(400, "DH-906", "cannot modify"))
+        with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
+            self.assertTrue(await self.engine.free_margin_from_algo1("NIFTY"))
+        self.assertEqual(seen["protective"], "SL1")            # safe exit still sees (and cancels) the stop
+        algo1._exit_position_locked.assert_awaited_once_with(pos, "ALGO2_PRIORITY")
+
     async def test_priority_never_touches_algo1_in_paper_or_when_switched_off(self):
         algo1, _ = self.fake_algo1()
         with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):

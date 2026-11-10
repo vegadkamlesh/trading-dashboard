@@ -151,6 +151,7 @@ class DhanClient:
         self._read_errors: Dict[str, str] = {}
         self._live_tasks: list[asyncio.Task] = []
         self._refresh_event = asyncio.Event()
+        self._order_event = asyncio.Event()
         self._order_connected = False
         self._order_error: Optional[str] = None
         self._last_order_event: Optional[float] = None
@@ -192,6 +193,7 @@ class DhanClient:
         self._last_order_event = time.time()
         self._read_cache.clear()
         self._refresh_event.set()
+        self._order_event.set()
         logger.info("account=%s external_order_event status=%s; refreshing broker books",
                     self.account_id, data.get("Status"), extra={
                         "telegram_event": "broker_update", "telegram_account": self.account_id,
@@ -792,6 +794,23 @@ class DhanClient:
         """Cancel a regular (non-super) order by id."""
         self._read_cache.clear()
         return await self._request("DELETE", f"/orders/{order_id}")
+
+    async def modify_order(self, order_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Modify a pending regular order (price, quantity, order type, validity)."""
+        self._read_cache.clear()
+        return await self._request("PUT", f"/orders/{order_id}", json={**payload, "orderId": str(order_id)})
+
+    async def wait_order_event(self, timeout: float) -> bool:
+        """Wait for the next order-stream alert; False on timeout. Caller clears first via
+        `clear_order_event()` before its own REST check so no alert is missed."""
+        try:
+            await asyncio.wait_for(self._order_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def clear_order_event(self) -> None:
+        self._order_event.clear()
 
     async def get_super_orders(self, *, fresh: bool = False) -> List[Dict[str, Any]]:
         return await self._cached_read("/super/orders", fresh=fresh)

@@ -475,10 +475,18 @@ Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
   Target, cost-stop or 20-minute exits still allow the 2nd trade.
 - **Priority over Algo 1** (LIVE, `priority_over_algo1`, default ON): if Algo 1 holds a LIVE
   position and Algo 2's sizing finds "insufficient balance", Algo 2 immediately exits Algo 1
-  (reason `ALGO2_PRIORITY`: cancel its broker SL, MARKET SELL, poll the SELL every 0.1 s),
-  and as soon as the SELL is TRADED re-sends the same signal (no breakout recheck, up to 5
-  tries while funds update). Typical total ~1-2 s (broker round-trips), not instant. If the
-  SELL is not filled within 6 s the Algo 2 entry is skipped and an error is sent.
+  (reason `ALGO2_PRIORITY`) and, as soon as that SELL is TRADED, re-sends the same signal
+  (no breakout recheck, up to 5 tries 0.1 s apart while funds update).
+  - **Fast path:** Algo 1's parked broker SL-M SELL is *modified* to MARKET in one call
+    (same order, so no double SELL); the fill is detected from the Dhan order-update
+    stream (REST confirm, 0.25 s fallback); Algo 1's reconcile runs afterwards in the background.
+  - **Fallback** (no parked SL / modify rejected): normal safe exit — cancel + confirm SL,
+    re-read holdings, MARKET SELL.
+  - **Speed:** about 5 broker round trips (funds check, modify, fill confirm, Algo 2
+    checks, BUY). Expected ~0.5–1 s; not guaranteed under a fraction of a second, since
+    every step waits for Dhan's confirmation. The fallback adds ~3 round trips. The Telegram log
+    shows the measured ms ("Algo 1 exit filled in N ms", "+N ms since signal").
+  - If the SELL is not filled within 6 s the Algo 2 entry is skipped and an error is sent.
 - Priority OFF / no Algo 1 position: short balance means "insufficient balance" skip; the
   skip does not use up a trade and the next 5-min candle can retry. PAPER: own ₹1L.
 
