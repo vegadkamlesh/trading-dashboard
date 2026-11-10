@@ -422,7 +422,10 @@ reconcile and exit code; only the signal, levels and exits below differ.
 | Priority over Algo 1 | ON | `priority_over_algo1`, LIVE only; see "Algo 2: trade count". |
 | Accounts | `TRADING_DEFAULT_ACCOUNTS` | Master / Child ticks, change only while OFF and flat. |
 | Product | INTRADAY | Forced. Arm is refused if Algo 1 is also INTRADAY (Algo 1 stays MARGIN) so broker positions never mix. |
-| Each of the 14 conditions | ON | Settings → Conditions ON/OFF. All ENABLED conditions must pass. |
+| 4 gates (News, Trade window, Heavyweight divergence, VIX) | always ON | Cannot be switched off. |
+| Each of the 10 score conditions | ON | Settings → ON/OFF. An OFF condition leaves the score count. |
+| Min score (`min_score`) | **6** | Settings → "Min score to trade (of 10)", 0–10. |
+| OI velocity spike / VWAP band | **10% / 1.0 sd** | `oi_velocity_spike` / `vwap_band_sd`. |
 | Data SL, T1 70% booking, stop after 1st SL | ON | Settings checkboxes. |
 | 0.75% capital SL cap | OFF | `capital_sl_cap` / `max_stop_loss_pct`. |
 | 5-min report | 5 | `status_report_minutes`; 0 = off. |
@@ -433,24 +436,28 @@ reconcile and exit code; only the signal, levels and exits below differ.
    no entry during a news freeze (event ±15 min).
 2. CALL when spot breaks the last closed 5-min candle **high + buffer** (NIFTY 0.5 /
    SENSEX 1.5 pts); PUT when it breaks **low − buffer**. Each candle/side is tried once.
-3. Every enabled condition must pass (PUT rules mirror CALL):
+3. **Gates + score** (PUT rules mirror CALL): all 🔒 gates must pass, and at least
+   `min_score` (default **6**) of the ON 🎯 score conditions must pass. If fewer score
+   conditions are ON than `min_score`, all ON ones must pass.
 
-| # | Condition | CALL passes when |
-| --- | --- | --- |
-| 1 | News freeze | no timed event within ±15 min |
-| 2 | Trade window | inside a window above |
-| 3 | PCR filter | PCR outside 0.85–1.10 (chop band) |
-| 4 | Net delta | rising vs 5 min ago (PUT: falling) |
-| 5 | Net GEX | negative (expansion zone) |
-| 6 | OI velocity | PE OI +30% in 5 min (PUT: CE OI) |
-| 7 | OI unwinding | CE OI falling (PUT: PE OI) |
-| 8 | HSMI | weighted heavyweight move > 0 (PUT: < 0) |
-| 9 | Trio sync | RELIANCE, HDFCBANK, ICICIBANK all up (PUT: all down) |
-| 10 | Heavyweight divergence | ≤ 50% of weight moving against |
-| 11 | VWAP band | futures above VWAP + 1.5 sd (PUT: below − 1.5 sd) |
-| 12 | Market profile | futures above VAH (PUT: below VAL) |
-| 13 | Basis | basis ≥ 0, no discount divergence (PUT: basis not rising) |
-| 14 | VIX | VIX move < +3% (PUT: > −3%) |
+| # | Condition | Type | CALL passes when |
+| --- | --- | --- | --- |
+| 1 | News freeze | 🔒 gate | no timed event within ±15 min |
+| 2 | Trade window | 🔒 gate | inside a window above |
+| 3 | PCR filter | 🎯 score | PCR outside 0.85–1.10 (chop band) |
+| 4 | Net delta | 🎯 score | rising vs 5 min ago (PUT: falling) |
+| 5 | Net GEX | 🎯 score | negative (expansion zone) |
+| 6 | OI velocity | 🎯 score | PE OI +10% in 5 min (PUT: CE OI) |
+| 7 | OI unwinding | 🎯 score | CE OI falling (PUT: PE OI) |
+| 8 | HSMI | 🎯 score | weighted heavyweight move > 0 (PUT: < 0) |
+| 9 | Trio sync | 🎯 score | RELIANCE, HDFCBANK, ICICIBANK all up (PUT: all down) |
+| 10 | Heavyweight divergence | 🔒 gate | ≤ 50% of weight moving against |
+| 11 | VWAP band | 🎯 score | futures above VWAP + 1.0 sd (PUT: below − 1.0 sd) |
+| 12 | Market profile | 🎯 score | futures above VAH (PUT: below VAL) |
+| 13 | Basis | 🎯 score | basis ≥ 0, no discount divergence (PUT: basis not rising) |
+| 14 | VIX | 🔒 gate | VIX move < +3% (PUT: > −3%) |
+
+Saved configs from before this rule set are moved once to min score 6, OI 10%, VWAP 1.0 sd.
 
 4. Strike: ITM with |delta| closest to 0.70. Size: max affordable (90% of balance).
 
@@ -499,6 +506,19 @@ Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
 - **"Aage kya hoga"** on the tab refreshes only at the 5-min report or instantly on
   entry/exit, not every second. Nothing else is sent in between.
 
+### Algo 2: permanent research log (never deleted)
+
+Saved under `data/algo2/history/YYYY-MM-DD/` (append-only JSONL, no retention/pruning;
+the 7-day journal limit does not apply):
+
+| File | Contents |
+| --- | --- |
+| `reports.jsonl` | every 5-min report text + per-index metrics, gates, score and checks |
+| `metrics.jsonl` | one row per index per minute (spot, PCR, delta, GEX, OI velocity, HSMI, VWAP, profile, basis, VIX, checks) |
+| `breakouts.jsonl` | every breakout, taken or skipped, with blockers/score; plus an `outcome` row 20 min later (move, max favourable/adverse pts, 2R target or candle stop hit first) |
+
+Use it to tune `min_score`, thresholds or condition choice later.
+
 ### Algo 2: data, events and limits
 
 - Master Data API only. Option chain is reused from the shared chain engine (no extra
@@ -507,8 +527,8 @@ Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
   (index has no volume). HSMI/trio/velocity need ~5 min warm-up after ON.
 - Events: `data/algo2/events_calendar.json` (seeded RBI policy / Budget; add/remove on
   the tab). NSE heavyweight corporate events are fetched daily; date-only, shown, not blocking.
-- No historical backtest is possible (Dhan has no historical chain greeks/OI). With all
-  14 conditions ON, signals are rare.
+- No historical backtest is possible (Dhan has no historical chain greeks/OI); the
+  permanent research log above builds that dataset going forward.
 - Tests: `python -m unittest tests.test_algo2` (from `backend`).
 
 ## Manual orders, sync and checks

@@ -8,7 +8,8 @@ import type { AlgoEvent, AlgoPosition, AlgoTrade } from "../api/types";
 type Side = "CALL" | "PUT";
 type Account = "master" | "child";
 
-interface Check { key: string; label: string; enabled: boolean; pass: boolean; value: string }
+interface Check { key: string; label: string; enabled: boolean; pass: boolean; value: string; gate?: boolean }
+interface Score { gatesOk: boolean; gatesFailed: string[]; passed: number; total: number; need: number; ready: boolean }
 
 interface Metrics {
   index: string; name: string; spot: number | null;
@@ -21,7 +22,7 @@ interface Metrics {
   profile: { poc: number; vah: number; val: number } | null;
   futures: number | null; basis: number | null; basisPrev: number | null; vixMovePct: number | null;
   chainRows: number; candles: number; futCandles: number;
-  checks: Record<Side, Check[]>; allPass: Record<Side, boolean>;
+  checks: Record<Side, Check[]>; allPass: Record<Side, boolean>; score?: Record<Side, Score>;
 }
 
 interface NewsEvent { id: string; date: string; time?: string | null; name: string; source?: string; impact?: string }
@@ -41,7 +42,7 @@ interface AccountState {
 type Config = Record<string, unknown> & {
   indices: string[]; conditions: Record<string, boolean>; trade_windows: string; max_trades: number;
   entry_cutoff: string; exit_time: string; max_stop_loss_pct: number; max_hold_minutes: number;
-  oi_velocity_spike: number; t1_pct: number; target_delta: number; event_window_minutes: number;
+  oi_velocity_spike: number; min_score: number; vwap_band_sd: number; t1_pct: number; target_delta: number; event_window_minutes: number;
   pcr_chop_low: number; pcr_chop_high: number; vix_spike_pct: number; data_sl: boolean; partial_booking: boolean;
   capital_sl_cap: boolean; stop_after_sl: boolean; priority_over_algo1: boolean; status_report_minutes: number; protective_sl_mult: number;
   entry_buffer: Record<string, number>;
@@ -49,7 +50,7 @@ type Config = Record<string, unknown> & {
 
 interface Algo2Status {
   algo: string; enabled: boolean; dryRun: boolean; entryAccounts: Account[]; serverTime: string; phase: string;
-  config: Config; conditionCatalog: Array<{ key: string; label: string }>;
+  config: Config; conditionCatalog: Array<{ key: string; label: string; gate?: boolean }>;
   metrics: Record<string, Metrics>;
   news: { freezeActive: boolean; freezeEvent: string | null; windowMinutes: number; today: NewsEvent[];
     upcoming: NewsEvent[]; nseError: string | null };
@@ -278,6 +279,10 @@ function IndexPanel({ m, st, busy, call }: {
   const toggle = (key: string, value: boolean) =>
     call("/api/algo2/config", { conditions: { ...st.config.conditions, [key]: value } }, `${key} ${value ? "ON" : "OFF"}`);
   const sideCls = (s: Side) => (m.allPass[s] ? "text-emerald-300" : "text-slate-400");
+  const scoreText = (s: Side) => {
+    const sc = m.score?.[s];
+    return sc ? `${sc.gatesOk ? "gates ✔" : "gate ✘"} · score ${sc.passed}/${sc.total} (need ${sc.need})` : "";
+  };
   return (
     <div className="card p-3">
       <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
@@ -305,16 +310,17 @@ function IndexPanel({ m, st, busy, call }: {
       <table className="w-full text-xs">
         <thead className="text-slate-500">
           <tr><th className="text-left">On</th><th className="text-left">Condition</th>
-            <th className={`text-left ${sideCls("CALL")}`}>CALL {m.allPass.CALL ? "✅" : ""}</th>
-            <th className={`text-left ${sideCls("PUT")}`}>PUT {m.allPass.PUT ? "✅" : ""}</th></tr>
+            <th className={`text-left ${sideCls("CALL")}`}>CALL {m.allPass.CALL ? "✅" : ""} <span className="font-normal">{scoreText("CALL")}</span></th>
+            <th className={`text-left ${sideCls("PUT")}`}>PUT {m.allPass.PUT ? "✅" : ""} <span className="font-normal">{scoreText("PUT")}</span></th></tr>
         </thead>
         <tbody>
           {m.checks.CALL.map((c, i) => {
             const p = m.checks.PUT[i];
             return (
               <tr key={c.key} className={`border-t border-slate-800 ${c.enabled ? "" : "opacity-40"}`}>
-                <td><input type="checkbox" disabled={busy} checked={c.enabled} onChange={(e) => toggle(c.key, e.target.checked)} /></td>
-                <td className="py-0.5">{c.label}</td>
+                <td>{c.gate ? <span title="Gate - always required">🔒</span>
+                  : <input type="checkbox" disabled={busy} checked={c.enabled} onChange={(e) => toggle(c.key, e.target.checked)} />}</td>
+                <td className="py-0.5">{c.gate ? "🔒 " : "🎯 "}{c.label}</td>
                 <td className={c.pass ? "text-emerald-300" : "text-rose-300"}>{c.pass ? "✔" : "✘"} <span className="text-slate-500">{c.value}</span></td>
                 <td className={p?.pass ? "text-emerald-300" : "text-rose-300"}>{p?.pass ? "✔" : "✘"} <span className="text-slate-500">{p?.value}</span></td>
               </tr>
@@ -322,7 +328,7 @@ function IndexPanel({ m, st, busy, call }: {
           })}
         </tbody>
       </table>
-      <p className="mt-1 text-[11px] text-slate-500">Condition switches apply to both indices. All ENABLED conditions must pass for entry.</p>
+      <p className="mt-1 text-[11px] text-slate-500">🔒 Gates must always pass. 🎯 Score: at least {st.config.min_score} of the ON score conditions must pass (switches apply to both indices).</p>
     </div>
   );
 }
@@ -400,7 +406,9 @@ const NUM_FIELDS: Array<[string, string, number]> = [
   ["max_hold_minutes", "Hold limit (min)", 1],
   ["status_report_minutes", "Status report every (min, 0 = off)", 1],
   ["max_stop_loss_pct", "Capital SL cap % (only if cap ON)", 0.05],
+  ["min_score", "Min score to trade (of 10)", 1],
   ["oi_velocity_spike", "OI velocity spike %", 1],
+  ["vwap_band_sd", "VWAP band (std dev)", 0.1],
   ["t1_pct", "T1 booking %", 5],
   ["target_delta", "Target delta", 0.05],
   ["event_window_minutes", "Event window (min)", 1],
@@ -431,9 +439,13 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
   return (
     <details className="card p-3" open>
       <summary className="cursor-pointer text-sm font-semibold">Algo 2 settings (ON/OFF switches + values)</summary>
-      <div className="mt-2 text-xs font-semibold text-slate-300">Entry conditions — ON/OFF (all ON ones must pass)</div>
+      <div className="mt-2 text-xs font-semibold text-slate-300">
+        Entry: 🔒 4 gates always pass + 🎯 at least {st.config.min_score} score conditions (ON ones) pass
+      </div>
       <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2 lg:grid-cols-3">
-        {st.conditionCatalog.map((c) => (
+        {st.conditionCatalog.map((c) => c.gate ? (
+          <span key={c.key} className="flex items-center gap-2 text-xs">🔒 {c.label} <span className="text-slate-500">(gate - always)</span></span>
+        ) : (
           <label key={c.key} className="flex items-center gap-2 text-xs">
             <input type="checkbox" disabled={busy} checked={st.config.conditions[c.key] !== false}
               onChange={(e) => call("/api/algo2/config", { conditions: { ...st.config.conditions, [c.key]: e.target.checked } },

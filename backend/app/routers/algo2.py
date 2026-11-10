@@ -53,6 +53,7 @@ class ConfigPatch(BaseModel):
     status_report_minutes: Optional[int] = None
     max_hold_minutes: Optional[int] = None
     oi_velocity_spike: Optional[float] = None
+    min_score: Optional[int] = None
     data_sl: Optional[bool] = None
     data_sl_gap_pct: Optional[float] = None
     event_window_minutes: Optional[int] = None

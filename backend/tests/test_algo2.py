@@ -261,9 +261,9 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.engine.enabled = True
         self.group.metrics["NIFTY"] = {
             "spot": 23500.0, "triggerUp": 23512.5, "triggerDown": 23480.0,
-            "checks": {"CALL": [{"key": "news", "enabled": True, "pass": True},
+            "checks": {"CALL": [{"key": "news", "gate": True, "enabled": True, "pass": True},
                                 {"key": "gex_negative", "enabled": True, "pass": False}],
-                       "PUT": [{"key": "news", "enabled": True, "pass": True}]}}
+                       "PUT": [{"key": "news", "gate": True, "enabled": True, "pass": True}]}}
         logs = []
         with patch.object(self.engine, "_log", side_effect=lambda msg, **kw: logs.append(msg)), \
                 patch.object(self.group, "flat_phase", return_value="waiting_window"):
@@ -274,10 +274,16 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         reports = [m for m in logs if m.startswith("5-min status")]
         self.assertEqual(len(reports), 1)
         self.assertIn("CALL above 23,512.5", reports[0])
-        self.assertIn("fail: Net GEX negative", reports[0])
-        self.assertIn("PUT 1/1 OK - READY", reports[0])
+        self.assertIn("CALL gates OK, score 0/1 (need 1)", reports[0])
+        self.assertIn("PUT gates OK, score 0/0 (need 0) - READY", reports[0])
         self.assertEqual(len(self.group.reports), 1)
         self.assertEqual(len(logs), 1)          # nothing else logged between reports
+        day = f"{self.tmp.name}/history/2026-11-11/reports.jsonl"
+        with open(day, encoding="utf-8") as fh:
+            saved = [__import__("json").loads(line) for line in fh]
+        self.assertEqual(len(saved), 1)
+        self.assertIn("5-min status", saved[0]["text"])
+        self.assertIn("NIFTY", saved[0]["indices"])
 
     async def test_blocked_breakout_goes_into_next_report_not_instant(self):
         self.engine.enabled = True
@@ -313,12 +319,66 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_condition_toggles_gate_entries(self):
         m = {"checks": {"CALL": [
-            {"key": "news", "enabled": True, "pass": True},
+            {"key": "news", "gate": True, "enabled": True, "pass": True},
             {"key": "gex_negative", "enabled": True, "pass": False},
         ]}}
-        self.assertEqual(Algo2Group.entry_blockers(m, "CALL"), ["gex_negative"])
+        self.assertEqual(Algo2Group.entry_blockers(m, "CALL"), ["score 0/1 < 1"])
         m["checks"]["CALL"][1]["enabled"] = False
         self.assertEqual(Algo2Group.entry_blockers(m, "CALL"), [])
+
+    async def test_gates_always_required_and_score_threshold(self):
+        gates = [{"key": k, "gate": True, "enabled": True, "pass": True} for k in sorted(engine_module.GATE_CONDITIONS)]
+        score_keys = [k for k, _ in engine_module.CONDITIONS if k not in engine_module.GATE_CONDITIONS]
+        self.assertEqual(len(score_keys), 10)
+        scored = [{"key": k, "enabled": True, "pass": i < 6} for i, k in enumerate(score_keys)]
+        m = {"checks": {"CALL": gates + scored}}
+        self.assertEqual(Algo2Group.entry_blockers(m, "CALL", 6), [])
+        self.assertEqual(Algo2Group.entry_blockers(m, "CALL", 7), ["score 6/10 < 7"])
+        scored[5]["pass"] = False
+        self.assertEqual(Algo2Group.entry_blockers(m, "CALL", 6), ["score 5/10 < 6"])
+        for c in scored:
+            c["pass"] = True
+        gates[0]["pass"] = False
+        self.assertEqual(Algo2Group.entry_blockers(m, "CALL", 6), [gates[0]["key"]])
+
+    async def test_new_defaults_and_min_score_setting(self):
+        cfg = self.engine.cfg
+        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (6, 10.0, 1.0))
+        self.engine.set_config({"min_score": 8, "conditions": {"news": False, "pcr_filter": False}})
+        self.assertEqual(self.engine.cfg.min_score, 8)
+        self.assertTrue(self.engine.cfg.conditions["news"])         # gates cannot be switched off
+        self.assertFalse(self.engine.cfg.conditions["pcr_filter"])
+        for bad in (11, -1, 2.5):
+            with self.assertRaises(HTTPException):
+                self.engine.set_config({"min_score": bad})
+
+    async def test_old_saved_config_migrates_to_v2(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "oi_velocity_spike": 30.0, "vwap_band_sd": 1.5}
+        saved.pop("config_version")
+        saved.pop("min_score")
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist") as persist:
+            self.engine._restore()
+        self.assertEqual((self.engine.cfg.oi_velocity_spike, self.engine.cfg.vwap_band_sd,
+                          self.engine.cfg.min_score), (10.0, 1.0, 6))
+        persist.assert_called()
+
+    async def test_breakout_history_records_skip_and_outcome(self):
+        hist = self.group.history
+        start = datetime(2026, 11, 11, 10, 0, 0)
+        m = {"spot": 23520.0, "candle": {"t": 1.0, "high": 23515.0, "low": 23500.0},
+             "checks": {"CALL": [], "PUT": []}}
+        hist.breakout(start, "NIFTY", "CALL", m, taken=False, blockers=["score 3/10 < 6"])
+        hist.breakout(start, "NIFTY", "CALL", m, taken=False, blockers=["score 3/10 < 6"])
+        hist.on_tick(start.replace(minute=5), {"NIFTY": {"spot": 23561.0, "checks": {}}})
+        hist.on_tick(start.replace(minute=21), {"NIFTY": {"spot": 23530.0, "checks": {}}})
+        import json
+        with open(f"{self.tmp.name}/history/2026-11-11/breakouts.jsonl", encoding="utf-8") as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertEqual([r["type"] for r in rows], ["breakout", "outcome"])
+        self.assertEqual(rows[1]["firstHit"], "target_2R")
+        self.assertEqual(rows[1]["maxFavourablePts"], 41.0)
+        self.assertTrue(__import__("os").path.exists(f"{self.tmp.name}/history/2026-11-11/metrics.jsonl"))
 
     async def test_paper_mode_is_separate_and_needs_flat_off(self):
         self.assertTrue(self.group.dry_run)

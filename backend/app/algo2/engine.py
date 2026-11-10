@@ -73,6 +73,8 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("basis", "Futures basis confirms (no discount divergence)"),
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
+GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required
+CONFIG_VERSION = 2   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
 SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
@@ -106,7 +108,9 @@ class Algo2Config(AlgoConfig):
     priority_over_algo1: bool = True  # LIVE: exit Algo 1's position when its margin blocks an Algo 2 entry
     status_report_minutes: int = 5
     max_hold_minutes: int = 20
-    oi_velocity_spike: float = 30.0
+    oi_velocity_spike: float = 10.0
+    min_score: int = 6                # entry needs every gate + at least this many score conditions
+    config_version: int = 2
     data_sl: bool = True
     data_sl_gap_pct: float = 10.0
     event_window_minutes: int = 15
@@ -117,7 +121,7 @@ class Algo2Config(AlgoConfig):
     pcr_chop_high: float = 1.10
     vix_spike_pct: float = 3.0
     oi_strikes: int = 5
-    vwap_band_sd: float = 1.5
+    vwap_band_sd: float = 1.0
     profile_bin: Dict[str, float] = field(default_factory=lambda: {"NIFTY": 5.0, "SENSEX": 10.0})
     nifty_weights: Dict[str, float] = field(default_factory=lambda: {
         "RELIANCE": 0.101, "HDFCBANK": 0.062, "BHARTIARTL": 0.060,
@@ -234,10 +238,24 @@ class Algo2Engine(AlgoEngine):
         return await super().arm()
 
     # ----------------------------------------------------------- config
+    def _restore(self) -> None:
+        saved = (self._store.load_state() or {}).get("config") or {}
+        super()._restore()
+        if saved and int(saved.get("config_version") or 1) < CONFIG_VERSION:
+            # One-time move to the gate + score rules; later operator edits are kept.
+            self.cfg.oi_velocity_spike, self.cfg.vwap_band_sd = 10.0, 1.0
+            self.cfg.min_score, self.cfg.config_version = 6, CONFIG_VERSION
+            self.cfg.conditions = {**_default_conditions(), **(self.cfg.conditions or {}),
+                                   **{k: True for k in GATE_CONDITIONS}}
+            self._persist()
+
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         patch = dict(patch or {})
         patch["product_type"] = "INTRADAY"
         patch["target_only"] = False
+        patch["config_version"] = CONFIG_VERSION
+        if isinstance(patch.get("conditions"), dict):
+            patch["conditions"] = {**patch["conditions"], **{k: True for k in GATE_CONDITIONS}}
         merged = {**asdict(self.cfg), **{k: v for k, v in patch.items() if v is not None}}
         validate_algo2_config(merged)
         return super().set_config(patch)
@@ -629,6 +647,10 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
                             ("status_report_minutes", 0, 60)):
         if not isinstance(cfg.get(name), int) or not low <= cfg[name] <= high:
             raise HTTPException(400, f"{name} must be an integer between {low} and {high}")
+    score_total = len(CONDITIONS) - len(GATE_CONDITIONS)
+    if not isinstance(cfg.get("min_score"), int) or isinstance(cfg.get("min_score"), bool) \
+            or not 0 <= cfg["min_score"] <= score_total:
+        raise HTTPException(400, f"min_score must be an integer between 0 and {score_total}")
     if not isinstance(cfg.get("conditions"), dict) or any(not isinstance(v, bool) for v in cfg["conditions"].values()):
         raise HTTPException(400, "conditions must map condition keys to true/false")
     for name in ("entry_buffer", "profile_bin", "nifty_weights", "sensex_weights"):
@@ -644,6 +666,101 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         parse_windows(cfg.get("trade_windows") or "")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
+#  Permanent research log (never pruned): history/YYYY-MM-DD/*.jsonl
+# --------------------------------------------------------------------------- #
+class Algo2History:
+    """Append-only daily cache of Algo 2 data for future rule tuning.
+
+    reports.jsonl   - every 5-min situation report with per-index metrics
+    metrics.jsonl   - one metrics row per index per minute
+    breakouts.jsonl - every breakout (taken or skipped) with gates/score, plus a
+                      follow-up "outcome" row 20 min later (move, MFE/MAE, 2R/stop hit first)
+    """
+
+    OUTCOME_MINUTES = 20
+
+    def __init__(self, directory: str) -> None:
+        self.dir = directory
+        self._last_minute: Dict[str, str] = {}
+        self._seen: Dict[Tuple[str, float, str], bool] = {}
+        self._pending: List[Dict[str, Any]] = []
+
+    def append(self, now: datetime, name: str, row: Dict[str, Any]) -> None:
+        try:
+            folder = os.path.join(self.dir, now.date().isoformat())
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, f"{name}.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+        except (OSError, TypeError, ValueError):
+            logger.warning("Algo 2 history write failed (%s)", name, exc_info=True)
+
+    @staticmethod
+    def metrics_row(m: Dict[str, Any]) -> Dict[str, Any]:
+        def checks(side: str) -> Dict[str, Any]:
+            return {c["key"]: {"pass": c["pass"], "on": c["enabled"], "v": c.get("value")}
+                    for c in (m.get("checks") or {}).get(side, [])}
+        return {**{k: m.get(k) for k in ("spot", "candle", "triggerUp", "triggerDown", "breakout", "netDelta",
+                                         "netDeltaPrev", "netGex", "pcr", "oiVelocity", "hsmi", "heavyweights",
+                                         "vwap", "profile", "futures", "basis", "vixMovePct", "chainRows")},
+                "score": m.get("score"), "checks": {s: checks(s) for s in ("CALL", "PUT")}}
+
+    def breakout(self, now: datetime, key: str, side: str, m: Dict[str, Any], taken: bool,
+                 blockers: List[str]) -> None:
+        bar = float((m.get("candle") or {}).get("t") or 0)
+        ident = (key, bar, side)
+        if ident in self._seen and (not taken or self._seen[ident]):
+            return
+        self._seen[ident] = taken
+        if len(self._seen) > 500:
+            self._seen = dict(list(self._seen.items())[-200:])
+        candle, spot = m.get("candle") or {}, m.get("spot")
+        self.append(now, "breakouts", {"type": "breakout", "time": now.isoformat(timespec="seconds"),
+                                       "index": key, "side": side, "taken": taken, "blockers": blockers,
+                                       **self.metrics_row(m)})
+        if not spot or not candle or any(p["id"] == ident for p in self._pending):
+            return
+        stop = float(candle["low"] if side == "CALL" else candle["high"])
+        risk = abs(float(spot) - stop) or None
+        sign = 1 if side == "CALL" else -1
+        self._pending.append({"id": ident, "index": key, "side": side, "taken": taken, "start": now,
+                              "entry": float(spot), "stop": stop,
+                              "target": float(spot) + sign * 2 * risk if risk else None,
+                              "best": 0.0, "worst": 0.0, "first": None})
+
+    def on_tick(self, now: datetime, metrics: Dict[str, Dict[str, Any]]) -> None:
+        minute = now.strftime("%Y-%m-%d %H:%M")
+        for key, m in metrics.items():
+            if self._last_minute.get(key) != minute:
+                self._last_minute[key] = minute
+                self.append(now, "metrics", {"time": now.isoformat(timespec="seconds"), "index": key,
+                                             **self.metrics_row(m)})
+        keep = []
+        for p in self._pending:
+            spot = (metrics.get(p["index"]) or {}).get("spot")
+            move = None
+            if spot:
+                move = (float(spot) - p["entry"]) * (1 if p["side"] == "CALL" else -1)
+                p["best"], p["worst"] = max(p["best"], move), min(p["worst"], move)
+                if p["first"] is None:
+                    if (p["side"] == "CALL" and spot <= p["stop"]) or (p["side"] == "PUT" and spot >= p["stop"]):
+                        p["first"] = "stop"
+                    elif p["target"] is not None and ((p["side"] == "CALL" and spot >= p["target"])
+                                                      or (p["side"] == "PUT" and spot <= p["target"])):
+                        p["first"] = "target_2R"
+            if (now - p["start"]).total_seconds() < self.OUTCOME_MINUTES * 60:
+                keep.append(p)
+                continue
+            self.append(p["start"], "breakouts", {
+                "type": "outcome", "time": now.isoformat(timespec="seconds"), "index": p["index"],
+                "side": p["side"], "taken": p["taken"], "breakoutTime": p["start"].isoformat(timespec="seconds"),
+                "entrySpot": p["entry"], "stopSpot": p["stop"], "targetSpot": p["target"],
+                "lastSpot": spot, "movePts": round(move, 2) if move is not None else None,
+                "maxFavourablePts": round(p["best"], 2), "maxAdversePts": round(p["worst"], 2),
+                "firstHit": p["first"] or "none"})
+        self._pending = keep
 
 
 # --------------------------------------------------------------------------- #
@@ -676,6 +793,7 @@ class Algo2Group:
         self._last_report_slot: Optional[str] = None
         self._blocked_logged: Dict[str, Tuple[float, str]] = {}
         self._blocked_recent: List[str] = []
+        self.history = Algo2History(os.path.join(directory, "history"))
         # "What happens next" is refreshed only on the 5-min slot or on entry/exit, never every second.
         self.snapshot: Dict[str, Any] = {"time": None, "lines": []}
         self._snapshot_holding: Optional[bool] = None
@@ -907,8 +1025,8 @@ class Algo2Group:
             return f"News freeze: {self.news.is_news_freeze_active(now)[1]} - no entries until it clears."
         if phase == "waiting_window":
             return f"No trade at this time ({self.cfg.trade_windows}); {self._next_window_text(minute)}."
-        return ("Scanning: entry when spot breaks the last 5-min candle and every enabled condition passes; "
-                f"{self._next_window_text(minute)}.")
+        return ("Scanning: entry when spot breaks the last 5-min candle, all 4 gates pass and the score is at least "
+                f"{self.cfg.min_score}/10; {self._next_window_text(minute)}.")
 
     def _index_line(self, key: str) -> Optional[str]:
         m = self.metrics.get(key)
@@ -919,11 +1037,11 @@ class Algo2Group:
         if m.get("triggerUp") is not None:
             parts.append(f"CALL above {m['triggerUp']:,.1f} / PUT below {m['triggerDown']:,.1f}")
         for side in ("CALL", "PUT"):
-            enabled = [c for c in m["checks"][side] if c["enabled"]]
-            failed = [labels.get(c["key"], c["key"]).split(" (")[0] for c in enabled if not c["pass"]]
-            parts.append(f"{side} {len(enabled) - len(failed)}/{len(enabled)} OK"
-                         + (f" (fail: {', '.join(failed[:4])}{' +' + str(len(failed) - 4) if len(failed) > 4 else ''})"
-                            if failed else " - READY"))
+            s = self.score_summary(m["checks"][side], self.cfg.min_score)
+            gates = ("gates OK" if s["gatesOk"] else "gate fail: "
+                     + ", ".join(labels.get(g, g).split(" (")[0] for g in s["gatesFailed"]))
+            parts.append(f"{side} {gates}, score {s['passed']}/{s['total']} (need {s['need']})"
+                         + (" - READY" if s["ready"] else ""))
         return " | ".join(parts)
 
     def next_actions(self) -> List[str]:
@@ -976,6 +1094,9 @@ class Algo2Group:
         self._blocked_recent = []
         self.reports.append({"time": now.strftime("%H:%M"), "text": text})
         self.reports = self.reports[-80:]
+        self.history.append(now, "reports", {
+            "time": now.isoformat(timespec="seconds"), "mode": "PAPER" if self.dry_run else "LIVE", "text": text,
+            "indices": {k: self.history.metrics_row(m) for k, m in self.metrics.items()}})
         self.master._log(text, level="info")
         self._take_snapshot(now)
 
@@ -989,6 +1110,7 @@ class Algo2Group:
         more = f" +{len(blockers) - 4}" if len(blockers) > 4 else ""
         self._blocked_recent.append(f"{key} {side} @ {m.get('spot') or 0:,.1f} (fail: {failing}{more})")
         self._blocked_recent = self._blocked_recent[-6:]
+        self.history.breakout(now_ist(), key, side, m, taken=False, blockers=blockers)
 
     def _data_needed(self, now: datetime) -> bool:
         sess = session_for(now)
@@ -1024,6 +1146,7 @@ class Algo2Group:
             await self.data.refresh_candles(key, now)
             self.data.sample_chain(key, self.data.spot(key), self.cfg.oi_strikes)
             self.metrics[key] = self.compute_metrics(key, now)
+        self.history.on_tick(now, self.metrics)
         self._notify_updates(now)
         if self.has_position() or not self.enabled or self._dispatching:
             return
@@ -1039,7 +1162,7 @@ class Algo2Group:
             bar = float((m.get("candle") or {}).get("t") or 0)
             if self._attempted.get(key) == (bar, side):
                 continue
-            blockers = self.entry_blockers(m, side)
+            blockers = self.entry_blockers(m, side, self.cfg.min_score)
             if blockers:
                 self._note_blocked(key, side, bar, blockers, m)
                 continue
@@ -1048,9 +1171,14 @@ class Algo2Group:
             return
 
     @staticmethod
-    def entry_blockers(m: Dict[str, Any], side: str) -> List[str]:
-        """Keys of ENABLED conditions that fail for ``side`` (empty = entry allowed)."""
-        return [c["key"] for c in (m.get("checks") or {}).get(side, []) if c["enabled"] and not c["pass"]]
+    def entry_blockers(m: Dict[str, Any], side: str, min_score: Optional[int] = None) -> List[str]:
+        """Why ``side`` cannot enter: failed gates, then a score shortfall (empty = entry allowed)."""
+        checks = (m.get("checks") or {}).get(side, [])
+        s = Algo2Group.score_summary(checks, len(checks) if min_score is None else min_score)
+        out = list(s["gatesFailed"])
+        if s["passed"] < s["need"]:
+            out.append(f"score {s['passed']}/{s['total']} < {s['need']}")
+        return out
 
     # ---------------------------------------------------------- metrics
     def vwap_spot(self, key: str) -> Optional[float]:
@@ -1099,8 +1227,9 @@ class Algo2Group:
         in_window = self.in_window(minute) and minute < self.master._cutoff_min(now)
 
         def check(name: str, ok: Optional[bool], value: str) -> Dict[str, Any]:
-            return {"key": name, "label": dict(CONDITIONS)[name], "enabled": bool(cfg.conditions.get(name, True)),
-                    "pass": bool(ok), "value": value}
+            gate = name in GATE_CONDITIONS
+            return {"key": name, "label": dict(CONDITIONS)[name], "gate": gate,
+                    "enabled": gate or bool(cfg.conditions.get(name, True)), "pass": bool(ok), "value": value}
 
         def fmt(v: Optional[float], digits: int = 2, suffix: str = "") -> str:
             return "n/a" if v is None else f"{v:,.{digits}f}{suffix}"
@@ -1146,6 +1275,7 @@ class Algo2Group:
                                                        else vix_move > -cfg.vix_spike_pct),
                       fmt(vix_move, 2, "%")),
             ]
+        score = {s: self.score_summary(checks[s], cfg.min_score) for s in checks}
         return {
             "index": key, "name": inst.name if inst else key, "spot": spot,
             "candle": candle, "triggerUp": trigger_up, "triggerDown": trigger_down, "breakout": breakout,
@@ -1153,9 +1283,20 @@ class Algo2Group:
             "oiVelocity": vel, "hsmi": hsmi, "heavyweights": changes, "vwap": vwap, "profile": profile,
             "futures": fut_ltp, "basis": basis, "basisPrev": basis_prev, "vixMovePct": vix_move,
             "chainRows": len(rows), "candles": len(spot_candles), "futCandles": len(fut_candles),
-            "checks": checks,
-            "allPass": {s: all(c["pass"] for c in checks[s] if c["enabled"]) for s in checks},
+            "checks": checks, "score": score,
+            "allPass": {s: score[s]["ready"] for s in checks},
         }
+
+    @staticmethod
+    def score_summary(checks: List[Dict[str, Any]], min_score: int) -> Dict[str, Any]:
+        gates = [c for c in checks if c.get("gate")]
+        scored = [c for c in checks if not c.get("gate") and c["enabled"]]
+        passed = sum(1 for c in scored if c["pass"])
+        need = min(int(min_score), len(scored))
+        gates_ok = all(c["pass"] for c in gates)
+        return {"gatesOk": gates_ok, "gatesFailed": [c["key"] for c in gates if not c["pass"]],
+                "passed": passed, "total": len(scored), "need": need,
+                "ready": gates_ok and passed >= need}
 
     # --------------------------------------------------------- dispatch
     async def dispatch(self, key: str, side: str, m: Dict[str, Any]) -> None:
@@ -1187,10 +1328,13 @@ class Algo2Group:
             return
         today = now_ist().date().isoformat()
         trade_no = self.signals_used(today) + 1
-        passed = ", ".join(c["key"] for c in m["checks"][side] if c["enabled"])
+        s = self.score_summary(m["checks"][side], self.cfg.min_score)
+        passed = ", ".join(c["key"] for c in m["checks"][side] if c["enabled"] and c["pass"] and not c.get("gate"))
+        self.history.breakout(now_ist(), key, side, m, taken=True, blockers=[])
         master._log(f"SIGNAL {key} {side} (trade {trade_no}/{self.cfg.max_trades}): spot {spot:,.1f} broke 5-min "
                     f"candle {'high' if side == 'CALL' else 'low'} {leg.or_high if side == 'CALL' else leg.or_low:,.1f}; "
-                    f"T1 wall {wall_strike or '1:2 R:R'}; conditions OK [{passed}] -> "
+                    f"T1 wall {wall_strike or '1:2 R:R'}; gates OK, score {s['passed']}/{s['total']} "
+                    f"(need {s['need']}) [{passed}] -> "
                     f"{','.join(self.entry_accounts)}", level="success", index=key)
         signal = asdict(leg)
         consumed = False
@@ -1262,7 +1406,7 @@ class Algo2Group:
             "phase": self.master.phase if self.master.enabled or self.master._position else (
                 self.flat_phase() if self.enabled else "off"),
             "config": asdict(self.cfg),
-            "conditionCatalog": [{"key": k, "label": label} for k, label in CONDITIONS],
+            "conditionCatalog": [{"key": k, "label": label, "gate": k in GATE_CONDITIONS} for k, label in CONDITIONS],
             "metrics": self.metrics,
             "news": self.news.status(now),
             "data": self.data.status(),
