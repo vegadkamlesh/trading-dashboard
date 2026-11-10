@@ -48,6 +48,9 @@ class ConfigPatch(BaseModel):
     trade_windows: Optional[str] = None
     entry_buffer: Optional[Dict[str, float]] = None
     max_stop_loss_pct: Optional[float] = None
+    capital_sl_cap: Optional[bool] = None
+    stop_after_sl: Optional[bool] = None
+    status_report_minutes: Optional[int] = None
     max_hold_minutes: Optional[int] = None
     oi_velocity_spike: Optional[float] = None
     data_sl: Optional[bool] = None

@@ -409,11 +409,18 @@ The old ORB algo is now labelled **Algo 1** (unchanged). **Algo 2** lives in
   same-side OI unwinding, HSMI sign, RELIANCE+HDFCBANK+ICICIBANK sync, heavyweight
   divergence, futures beyond VWAP ±1.5σ band, futures beyond VAH/VAL, basis, VIX.
   PUT rules mirror CALL rules.
-- **Exits:** stop = breakout candle low/high, capped at 0.75% of balance
-  (÷ delta × qty). T1 = highest-OI wall if ≥ 2R away, else 2R: book 70% (1 lot =
+- **Exits:** stop = breakout candle low/high on spot (optional capital cap, default
+  OFF: `capital_sl_cap` / `max_stop_loss_pct`). Broker safety SL at 2x the stop
+  distance. T1 = highest-OI wall if ≥ 2R away, else 2R: book 70% (1 lot =
   full exit), stop → cost, remainder trails VWAP / T2 = max(2R, T1 + R). Data SL:
   same-side OI velocity leads the opposite side by ≥ 10 pp. 20-minute rule: if T1 is
   not reached in 20 min, exit at market. Sizing: max affordable (as Algo 1).
+  Max 2 trades/day; after a stop-loss exit (STOP, DATA_SL, broker SL, ₹ loss) no
+  more trades that day (`stop_after_sl`, default ON).
+- **Updates:** "next actions" on the tab; phase changes (window closed, news freeze,
+  SL stop) and a 5-min situation report (spot, CALL/PUT triggers, conditions passing,
+  failing ones, open position) go to the journal and Telegram; a breakout blocked by
+  conditions is logged once per 5-min bar.
 - **Data:** Master Data API only. Option chain is reused from the shared chain engine
   (no extra chain calls); `/marketfeed/ohlc` every 5 s (VIX, index, 6 heavyweights,
   nearest futures); 5-min candles once per closed bar. VWAP / market profile use

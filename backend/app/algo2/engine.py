@@ -73,6 +73,8 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
+SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
+GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
 
 
 def _default_conditions() -> Dict[str, bool]:
@@ -93,6 +95,9 @@ class Algo2Config(AlgoConfig):
     trade_windows: str = "09:45-11:15,13:30-15:00"
     entry_buffer: Dict[str, float] = field(default_factory=lambda: {"NIFTY": 0.5, "SENSEX": 1.5})
     max_stop_loss_pct: float = 0.75
+    capital_sl_cap: bool = False      # operator choice: SL = breakout candle low/high only
+    stop_after_sl: bool = True        # no more entries today once a trade exits on a stop
+    status_report_minutes: int = 5
     max_hold_minutes: int = 20
     oi_velocity_spike: float = 30.0
     data_sl: bool = True
@@ -181,7 +186,8 @@ class Algo2Engine(AlgoEngine):
 
     async def _tick_supervisor_locked(self) -> None:
         await super()._tick_supervisor_locked()
-        if self._position is None and self.enabled and self.phase in {"watching", "building_or", "day_done"}:
+        if self._position is None and self.enabled and self.phase in {
+                "watching", "building_or", "day_done", *GROUP_PHASES}:
             self.phase = self._group_ref.flat_phase()
 
     def _phase_label(self) -> str:
@@ -190,6 +196,8 @@ class Algo2Engine(AlgoEngine):
             "waiting_window": "Outside the trade windows - waiting",
             "news_freeze": "News/event freeze active - no entries",
             "trades_done": "Max trades for today done",
+            "sl_stop": "Stop-loss hit today - no more entries today",
+            "market_closed": "Market closed",
             "in_trade": "In a trade - managing stop, T1, data SL and 20-minute rule",
         }.get(self.phase) or super()._phase_label()
 
@@ -197,7 +205,7 @@ class Algo2Engine(AlgoEngine):
         p = self._position
         if p is None or p.execution_state in {"entry_pending", "exit_pending"}:
             if p is None and self.enabled:
-                return [self._group_ref.next_action_text()]
+                return self._group_ref.next_actions()
             return super()._next_actions()
         sign = "above" if p.option_type == "CALL" else "below"
         out = [f"Stop {p.stop_spot:,.1f} | {'T2' if p.t1_done else 'T1'} {p.target_spot:,.1f} ({sign} entry)."]
@@ -280,7 +288,7 @@ class Algo2Engine(AlgoEngine):
         dist = abs(spot - candle_stop)
         delta = self._delta_for(leg, direction) or self.cfg.target_delta
         qty, balance = int(sizing.get("quantity") or 0), float(sizing.get("balance") or 0)
-        if qty > 0 and balance > 0 and delta > 0:
+        if self.cfg.capital_sl_cap and qty > 0 and balance > 0 and delta > 0:
             cap = balance * self.cfg.max_stop_loss_pct / 100.0 / (delta * qty)
             if cap < dist:
                 self._log(f"{leg.index_key}: candle stop {dist:,.1f} pts capped to {cap:,.1f} pts "
@@ -496,7 +504,11 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         positive(name, upper)
     if cfg["pcr_chop_low"] >= cfg["pcr_chop_high"]:
         raise HTTPException(400, "pcr_chop_low must be below pcr_chop_high")
-    for name, low, high in (("max_hold_minutes", 0, 375), ("event_window_minutes", 0, 240), ("oi_strikes", 1, 40)):
+    for name in ("capital_sl_cap", "stop_after_sl", "data_sl", "partial_booking"):
+        if not isinstance(cfg.get(name), bool):
+            raise HTTPException(400, f"{name} must be true/false")
+    for name, low, high in (("max_hold_minutes", 0, 375), ("event_window_minutes", 0, 240), ("oi_strikes", 1, 40),
+                            ("status_report_minutes", 0, 60)):
         if not isinstance(cfg.get(name), int) or not low <= cfg[name] <= high:
             raise HTTPException(400, f"{name} must be an integer between {low} and {high}")
     if not isinstance(cfg.get("conditions"), dict) or any(not isinstance(v, bool) for v in cfg["conditions"].values()):
@@ -541,6 +553,10 @@ class Algo2Group:
         self._running = False
         self._dispatching = False
         self.loop_error: Optional[str] = None
+        self.reports: List[Dict[str, str]] = []
+        self._last_report_slot: Optional[str] = None
+        self._last_phase: Optional[str] = None
+        self._blocked_logged: Dict[str, Tuple[float, str]] = {}
 
     # ------------------------------------------------------- persistence
     def _load_settings(self) -> None:
@@ -709,6 +725,11 @@ class Algo2Group:
     def flat_phase(self) -> str:
         now = now_ist()
         minute = now.hour * 60 + now.minute
+        sess = session_for(now)
+        if not sess.trading_day or not sess.open_min <= minute < sess.close_min:
+            return "market_closed"
+        if self.sl_hit_today(now.date().isoformat()):
+            return "sl_stop"
         if self.signals_used(now.date().isoformat()) >= self.cfg.max_trades:
             return "trades_done"
         if self.news.is_news_freeze_active(now)[0]:
@@ -717,15 +738,108 @@ class Algo2Group:
             return "waiting_window"
         return "scanning"
 
+    def sl_hit_today(self, today: str) -> Optional[str]:
+        """Text of today's first stop-loss exit when ``stop_after_sl`` is on, else None."""
+        if not self.cfg.stop_after_sl:
+            return None
+        for engine in self.items.values():
+            for t in engine._today_trades:
+                if str(t.get("exitReason")) in SL_REASONS and str(t.get("date") or today) == today:
+                    return (f"{t.get('index')} {t.get('direction')} exited {t.get('exitReason')} at "
+                            f"{t.get('exitTime')}")
+        return None
+
+    def _next_window_text(self, minute: int) -> str:
+        cutoff = self.master._cutoff_min(now_ist())
+        for start, end in self._windows():
+            if minute < start and start < cutoff:
+                return f"next window opens {start // 60:02d}:{start % 60:02d}"
+            if start <= minute < min(end, cutoff):
+                return f"window open till {min(end, cutoff) // 60:02d}:{min(end, cutoff) % 60:02d}"
+        return "no more trade windows today"
+
     def next_action_text(self) -> str:
+        now = now_ist()
         phase = self.flat_phase()
-        if phase == "scanning":
-            return "Scanning NIFTY + SENSEX: entry when spot breaks the last 5-min candle and every enabled condition passes."
-        if phase == "news_freeze":
-            return f"News freeze: {self.news.is_news_freeze_active(now_ist())[1]}"
+        minute = now.hour * 60 + now.minute
+        if phase == "market_closed":
+            return "Market closed - scanning resumes in the first trade window of the next trading day."
+        if phase == "sl_stop":
+            return f"Stop-loss hit today ({self.sl_hit_today(now.date().isoformat())}) - no more trades today."
         if phase == "trades_done":
-            return f"{self.cfg.max_trades} trade(s) done today."
-        return f"Waiting for a trade window ({self.cfg.trade_windows})."
+            return f"{self.cfg.max_trades} trade(s) done today - no more entries."
+        if phase == "news_freeze":
+            return f"News freeze: {self.news.is_news_freeze_active(now)[1]} - no entries until it clears."
+        if phase == "waiting_window":
+            return f"No trade at this time ({self.cfg.trade_windows}); {self._next_window_text(minute)}."
+        return ("Scanning: entry when spot breaks the last 5-min candle and every enabled condition passes; "
+                f"{self._next_window_text(minute)}.")
+
+    def _index_line(self, key: str) -> Optional[str]:
+        m = self.metrics.get(key)
+        if not m:
+            return None
+        labels = dict(CONDITIONS)
+        parts = [f"{key} {m['spot']:,.1f}" if m.get("spot") else key]
+        if m.get("triggerUp") is not None:
+            parts.append(f"CALL above {m['triggerUp']:,.1f} / PUT below {m['triggerDown']:,.1f}")
+        for side in ("CALL", "PUT"):
+            enabled = [c for c in m["checks"][side] if c["enabled"]]
+            failed = [labels.get(c["key"], c["key"]).split(" (")[0] for c in enabled if not c["pass"]]
+            parts.append(f"{side} {len(enabled) - len(failed)}/{len(enabled)} OK"
+                         + (f" (fail: {', '.join(failed[:4])}{' +' + str(len(failed) - 4) if len(failed) > 4 else ''})"
+                            if failed else " - READY"))
+        return " | ".join(parts)
+
+    def next_actions(self) -> List[str]:
+        out = [self.next_action_text()]
+        if self.flat_phase() not in ("market_closed",):
+            out += [line for line in (self._index_line(k) for k in self.cfg.indices) if line]
+        return out
+
+    def _situation_text(self) -> str:
+        lines = [f"5-min status ({'PAPER' if self.dry_run else 'LIVE'}): {self.next_action_text()}"]
+        for account, engine in self.items.items():
+            p = engine._position
+            if p is not None:
+                lines.append(f"{account}: holding {p.index_key} {int(p.strike)} {'CE' if p.option_type == 'CALL' else 'PE'}"
+                             f" x{p.quantity} entry {p.entry_premium} ltp {p.premium} SL {p.stop_spot:,.1f} "
+                             f"{'T2' if getattr(p, 't1_done', False) else 'T1'} {p.target_spot:,.1f}")
+        lines += [line for line in (self._index_line(k) for k in self.cfg.indices) if line]
+        return " || ".join(lines)
+
+    def _notify_updates(self, now: datetime) -> None:
+        """Phase changes immediately, plus a situation report every N minutes (journal + Telegram)."""
+        if not self.enabled and not self.has_position():
+            self._last_phase = None
+            return
+        phase = "in_trade" if self.has_position() else self.flat_phase()
+        if phase != self._last_phase:
+            if self._last_phase is not None and phase != "in_trade":
+                self.master._log(f"Algo 2 status change: {self.next_action_text()}", level="info")
+            self._last_phase = phase
+        every = int(self.cfg.status_report_minutes or 0)
+        if every <= 0 or now.minute % every:
+            return
+        slot = now.strftime("%Y-%m-%d %H:%M")
+        if slot == self._last_report_slot:
+            return
+        self._last_report_slot = slot
+        text = self._situation_text()
+        self.reports.append({"time": now.strftime("%H:%M"), "text": text})
+        self.reports = self.reports[-80:]
+        self.master._log(text, level="info")
+
+    def _note_blocked(self, key: str, side: str, bar: float, blockers: List[str], m: Dict[str, Any]) -> None:
+        if self._blocked_logged.get(key) == (bar, side):
+            return
+        self._blocked_logged[key] = (bar, side)
+        labels = dict(CONDITIONS)
+        trigger = m.get("triggerUp") if side == "CALL" else m.get("triggerDown")
+        self.master._log(
+            f"{key} {side} breakout (spot {m.get('spot') or 0:,.1f} {'>' if side == 'CALL' else '<'} {trigger or 0:,.1f}) "
+            f"NOT traded - failing: {', '.join(labels.get(b, b).split(' (')[0] for b in blockers)}",
+            level="info", index=key)
 
     def _data_needed(self, now: datetime) -> bool:
         sess = session_for(now)
@@ -761,9 +875,12 @@ class Algo2Group:
             await self.data.refresh_candles(key, now)
             self.data.sample_chain(key, self.data.spot(key), self.cfg.oi_strikes)
             self.metrics[key] = self.compute_metrics(key, now)
+        self._notify_updates(now)
         if self.has_position() or not self.enabled or self._dispatching:
             return
         if self.signals_used(today.isoformat()) >= self.cfg.max_trades:
+            return
+        if self.sl_hit_today(today.isoformat()):
             return
         for key in indices:
             m = self.metrics.get(key) or {}
@@ -773,7 +890,9 @@ class Algo2Group:
             bar = float((m.get("candle") or {}).get("t") or 0)
             if self._attempted.get(key) == (bar, side):
                 continue
-            if self.entry_blockers(m, side):
+            blockers = self.entry_blockers(m, side)
+            if blockers:
+                self._note_blocked(key, side, bar, blockers, m)
                 continue
             self._attempted[key] = (bar, side)
             await self.dispatch(key, side, m)
@@ -990,6 +1109,9 @@ class Algo2Group:
             "signals": {"day": self.signal_day, "count": self.signals_used(now.date().isoformat()),
                         "max": self.cfg.max_trades, "last": self.last_signal},
             "loopError": self.loop_error,
+            "nextActions": self.next_actions(),
+            "reports": list(reversed(self.reports[-30:])),
+            "slStop": self.sl_hit_today(now.date().isoformat()),
             "accounts": accounts,
         }
 

@@ -43,6 +43,7 @@ type Config = Record<string, unknown> & {
   entry_cutoff: string; exit_time: string; max_stop_loss_pct: number; max_hold_minutes: number;
   oi_velocity_spike: number; t1_pct: number; target_delta: number; event_window_minutes: number;
   pcr_chop_low: number; pcr_chop_high: number; vix_spike_pct: number; data_sl: boolean; partial_booking: boolean;
+  capital_sl_cap: boolean; stop_after_sl: boolean; status_report_minutes: number; protective_sl_mult: number;
   entry_buffer: Record<string, number>;
 };
 
@@ -56,6 +57,9 @@ interface Algo2Status {
     quoteAgeSeconds: number | null; quoteError: string | null; candleError: string | null; apiCalls: Record<string, number> };
   signals: { day: string | null; count: number; max: number; last: Record<string, unknown> | null };
   loopError: string | null;
+  nextActions: string[];
+  reports: Array<{ time: string; text: string }>;
+  slStop: string | null;
   accounts: Record<Account, AccountState>;
 }
 
@@ -121,6 +125,17 @@ export function Algo2Page() {
 
       <ControlBar st={st} busy={busy} anyOpen={anyOpen} call={call} />
 
+      {st.slStop && <div role="alert" className="rounded border border-rose-700 bg-rose-950/40 p-2 text-sm text-rose-200">
+        🛑 Stop-loss hit today ({st.slStop}) — Algo 2 takes no more trades today.
+      </div>}
+      <div className="card p-3">
+        <div className="mb-1 text-sm font-semibold">🔮 Aage kya hoga (live, every second)</div>
+        <ul className="list-disc space-y-0.5 pl-5 text-xs text-slate-300">
+          {(st.nextActions || []).map((x, i) => <li key={i} className={i === 0 ? "font-semibold text-sky-200" : "font-mono"}>{x}</li>)}
+        </ul>
+        {!st.enabled && <p className="mt-1 text-[11px] text-amber-300">Algo 2 is OFF — turn it ON to scan and get reports/Telegram updates.</p>}
+      </div>
+
       {st.loopError && <div role="alert" className="rounded border border-amber-700 p-2 text-xs text-amber-200">Signal loop: {st.loopError}</div>}
       {(st.data.quoteError || st.data.candleError || st.data.futuresError) && (
         <div className="rounded border border-amber-800 p-2 text-xs text-amber-200">
@@ -142,6 +157,8 @@ export function Algo2Page() {
           : <div key={key} className="card p-3 text-sm text-slate-400">{key}: waiting for first data cycle (market hours, Algo 2 ON)…</div>)}
       </div>
 
+      <ReportsPanel st={st} />
+      <ExitRulesCard st={st} />
       <NewsPanel st={st} busy={busy} call={call} />
       <TradesPanel st={st} />
       <SettingsCard st={st} busy={busy} call={call} />
@@ -376,8 +393,9 @@ function TradesPanel({ st }: { st: Algo2Status }) {
 
 const NUM_FIELDS: Array<[string, string, number]> = [
   ["max_trades", "Max signals / day", 1],
-  ["max_stop_loss_pct", "Max SL % of capital", 0.05],
   ["max_hold_minutes", "Hold limit (min)", 1],
+  ["status_report_minutes", "Status report every (min, 0 = off)", 1],
+  ["max_stop_loss_pct", "Capital SL cap % (only if cap ON)", 0.05],
   ["oi_velocity_spike", "OI velocity spike %", 1],
   ["t1_pct", "T1 booking %", 5],
   ["target_delta", "Target delta", 0.05],
@@ -399,7 +417,7 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
     }
     void call("/api/algo2/config", patch, "Algo 2 settings saved").then(() => setDraft({}));
   };
-  const flag = (k: "data_sl" | "partial_booking", label: string) => (
+  const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl", label: string) => (
     <label className="flex items-center gap-1 text-xs">
       <input type="checkbox" disabled={busy} checked={!!st.config[k]}
         onChange={(e) => call("/api/algo2/config", { [k]: e.target.checked }, `${label} ${e.target.checked ? "ON" : "OFF"}`)} />
@@ -407,8 +425,27 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
     </label>
   );
   return (
-    <details className="card p-3">
-      <summary className="cursor-pointer text-sm font-semibold">Algo 2 settings</summary>
+    <details className="card p-3" open>
+      <summary className="cursor-pointer text-sm font-semibold">Algo 2 settings (ON/OFF switches + values)</summary>
+      <div className="mt-2 text-xs font-semibold text-slate-300">Entry conditions — ON/OFF (all ON ones must pass)</div>
+      <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2 lg:grid-cols-3">
+        {st.conditionCatalog.map((c) => (
+          <label key={c.key} className="flex items-center gap-2 text-xs">
+            <input type="checkbox" disabled={busy} checked={st.config.conditions[c.key] !== false}
+              onChange={(e) => call("/api/algo2/config", { conditions: { ...st.config.conditions, [c.key]: e.target.checked } },
+                `${c.label}: ${e.target.checked ? "ON" : "OFF"}`)} />
+            <span className={st.config.conditions[c.key] === false ? "text-slate-500 line-through" : ""}>{c.label}</span>
+          </label>
+        ))}
+      </div>
+      <div className="mt-3 text-xs font-semibold text-slate-300">Exit / risk switches</div>
+      <div className="mt-1 flex flex-wrap items-center gap-4">
+        {flag("stop_after_sl", "1st SL hit → no more trades today")}
+        {flag("data_sl", "Data SL (OI trap exit)")}
+        {flag("partial_booking", "T1 partial booking (70%)")}
+        {flag("capital_sl_cap", "Cap candle SL at capital %")}
+      </div>
+      <div className="mt-3 text-xs font-semibold text-slate-300">Values</div>
       <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
         {[["indices", "Indices"], ["trade_windows", "Trade windows"], ["entry_cutoff", "Entry cutoff"], ["exit_time", "Exit time"]].map(([k, label]) => (
           <label key={k} className="text-xs">{label}
@@ -424,12 +461,47 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
         ))}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-3">
-        {flag("data_sl", "Data SL (OI trap exit)")}
-        {flag("partial_booking", "T1 partial booking")}
-        <button className="btn-buy ml-auto" disabled={busy || Object.keys(draft).length === 0} onClick={save}>Save</button>
+        <button className="btn-buy ml-auto" disabled={busy || Object.keys(draft).length === 0} onClick={save}>Save values</button>
       </div>
       <p className="mt-1 text-[11px] text-slate-500">Settings change only while no Algo 2 position is open. Entry buffer: NIFTY {st.config.entry_buffer?.NIFTY} / SENSEX {st.config.entry_buffer?.SENSEX} pts.</p>
     </details>
+  );
+}
+
+function ReportsPanel({ st }: { st: Algo2Status }) {
+  return (
+    <div className="card p-3">
+      <div className="mb-1 text-sm font-semibold">🕔 Har {st.config.status_report_minutes || 5} min ka situation report (Telegram pe bhi)</div>
+      {(st.reports || []).length === 0
+        ? <p className="text-xs text-slate-500">No report yet — reports start during market hours once Algo 2 is ON.</p>
+        : <div className="max-h-64 overflow-auto font-mono text-[11px]">
+          {st.reports.map((r, i) => (
+            <div key={i} className="border-t border-slate-800 py-1">
+              <span className="text-sky-300">{r.time}</span>{" "}
+              {r.text.split(" || ").map((part, j) => <div key={j} className={j ? "pl-4 text-slate-400" : "inline text-slate-200"}>{part}</div>)}
+            </div>
+          ))}
+        </div>}
+    </div>
+  );
+}
+
+function ExitRulesCard({ st }: { st: Algo2Status }) {
+  const c = st.config;
+  const rules = [
+    `Stop-loss: breakout 5-min candle LOW (CALL) / HIGH (PUT) on spot${c.capital_sl_cap ? `, capped at ${c.max_stop_loss_pct}% of capital` : " — no capital cap"}.`,
+    `Broker safety SL order: placed at ${c.protective_sl_mult}× the stop distance (backup if the app/server fails).`,
+    `Data SL: ${c.data_sl ? "ON" : "OFF"} — exit early if same-side OI velocity overtakes the other side (institutional trap).`,
+    `T1: highest-OI wall if ≥ 2R away, else 2R. ${c.partial_booking ? `Book ${c.t1_pct}% there (1 lot = full exit), stop moves to cost, rest trails VWAP / T2.` : "Full exit at T1."}`,
+    `${c.max_hold_minutes}-minute rule: T1 not reached in ${c.max_hold_minutes} min → exit (theta).`,
+    `Time exit: ${c.exit_time} (before Dhan INTRADAY auto square-off). New entries till ${c.entry_cutoff}, windows ${c.trade_windows}.`,
+    `Trades: max ${c.max_trades}/day, next only after the previous one closes${c.stop_after_sl ? "; after any stop-loss exit no more trades today" : ""}.`,
+  ];
+  return (
+    <div className="card p-3">
+      <div className="mb-1 text-sm font-semibold">🛡️ SL / exit rules (current values)</div>
+      <ol className="list-decimal space-y-0.5 pl-5 text-xs text-slate-300">{rules.map((r, i) => <li key={i}>{r}</li>)}</ol>
+    </div>
   );
 }
 

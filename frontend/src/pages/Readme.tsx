@@ -186,7 +186,8 @@ export function Readme() {
           <li>Purana ORB ab <b>Algo 1</b> hai (koi change nahi). Algo 2 ka apna tab, apna ON/OFF, apna PAPER/LIVE aur apne Master/Child ticks hain. Default: OFF + PAPER. Paper↔Live sirf OFF aur flat hone par.</li>
           <li>Algo 2 sirf <b>INTRADAY</b> product use karta hai; Algo 1 MARGIN pe rehna chahiye, warna Algo 2 ARM nahi hoga. 15:15 pe exit.</li>
           <li>Entry: last closed 5-min candle ka high + buffer (CALL) / low − buffer (PUT) toota, aur har ON condition pass. Strike: ITM, delta ~0.70. 14 conditions ke alag switch tab mein hain.</li>
-          <li>Exit: SL = candle low/high (max 0.75% capital). T1 = OI wall ya 2R pe 70% booking, SL cost pe, baaki VWAP/T2. OI trap pe Data SL. 20 min mein T1 nahi aaya to exit.</li>
+          <li>Exit: SL = breakout candle ka low/high (capital cap default OFF). T1 = OI wall ya 2R pe 70% booking, SL cost pe, baaki VWAP/T2. OI trap pe Data SL. 20 min mein T1 nahi aaya to exit. Din mein max 2 trade; SL hit hua to us din aur trade nahi.</li>
+          <li>Har 5 min ka situation report aur "aage kya hoga" tab pe + Telegram pe. Trade window band/khula, news freeze, SL stop aur condition fail hone se breakout skip hua — sab notify hota hai.</li>
           <li>News freeze: event ke 15 min pehle se 15 min baad tak koi entry nahi. Events tab mein add/remove karo.</li>
           <li>Telegram/logs mein "Algo 2 |" prefix. Data sirf Master Data API se; option chain shared hai, extra calls nahi.</li>
           <li>Iska historical backtest possible nahi (Dhan ke paas purana chain greeks/OI nahi). Pehle PAPER mein chalao.</li>

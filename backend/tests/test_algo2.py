@@ -213,6 +213,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine._today_trades[-1]["exitReason"], "STOP")
 
     async def test_levels_cap_stop_by_capital_and_use_oi_wall(self):
+        self.engine.cfg.capital_sl_cap = True
         self.group.signal_ctx["NIFTY"] = {"candleLow": 23450.0, "candleHigh": 23510.0, "wall": 23700.0}
         leg = DayLeg("NIFTY", strike=23450)
         with patch.object(self.engine, "_delta_for", return_value=0.7):
@@ -224,6 +225,53 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.engine, "_delta_for", return_value=0.7):
             target, _ = self.engine._levels(leg, "CALL", 23500.0, 20.0, {"quantity": 65, "balance": 100000})
         self.assertAlmostEqual(target, round(23500 + 2 * cap, 2))
+
+    async def test_default_stop_is_breakout_candle_without_capital_cap(self):
+        self.assertFalse(self.engine.cfg.capital_sl_cap)
+        self.group.signal_ctx["NIFTY"] = {"candleLow": 23470.0, "candleHigh": 23510.0, "wall": None}
+        with patch.object(self.engine, "_delta_for", return_value=0.7):
+            target, stop = self.engine._levels(DayLeg("NIFTY"), "CALL", 23500.0, 20.0,
+                                               {"quantity": 390, "balance": 100000})
+        self.assertEqual(stop, 23470.0)
+        self.assertEqual(target, 23560.0)
+        self.group.signal_ctx["NIFTY"] = {"candleLow": 23470.0, "candleHigh": 23530.0, "wall": None}
+        with patch.object(self.engine, "_delta_for", return_value=0.7):
+            target, stop = self.engine._levels(DayLeg("NIFTY"), "PUT", 23500.0, 20.0,
+                                               {"quantity": 390, "balance": 100000})
+        self.assertEqual((target, stop), (23440.0, 23530.0))
+
+    async def test_stop_loss_exit_ends_entries_for_the_day(self):
+        today = algo_module.now_ist().date().isoformat()
+        self.assertIsNone(self.group.sl_hit_today(today))
+        self.engine._today_trades = [{"date": today, "index": "NIFTY", "direction": "CALL",
+                                      "exitReason": "COST_STOP", "exitTime": "10:05:00"}]
+        self.assertIsNone(self.group.sl_hit_today(today))
+        self.engine._today_trades.append({"date": today, "index": "NIFTY", "direction": "CALL",
+                                          "exitReason": "STOP", "exitTime": "10:30:00"})
+        self.assertIn("STOP", self.group.sl_hit_today(today))
+        self.engine.cfg.stop_after_sl = False
+        self.assertIsNone(self.group.sl_hit_today(today))
+
+    async def test_five_minute_report_once_per_slot_and_phase_text(self):
+        self.engine.enabled = True
+        self.group.metrics["NIFTY"] = {
+            "spot": 23500.0, "triggerUp": 23512.5, "triggerDown": 23480.0,
+            "checks": {"CALL": [{"key": "news", "enabled": True, "pass": True},
+                                {"key": "gex_negative", "enabled": True, "pass": False}],
+                       "PUT": [{"key": "news", "enabled": True, "pass": True}]}}
+        logs = []
+        with patch.object(self.engine, "_log", side_effect=lambda msg, **kw: logs.append(msg)), \
+                patch.object(self.group, "flat_phase", return_value="waiting_window"):
+            now = datetime(2026, 11, 11, 11, 20, 3)
+            self.group._notify_updates(now)
+            self.group._notify_updates(now.replace(second=40))
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 21, 0))
+        reports = [m for m in logs if m.startswith("5-min status")]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("CALL above 23,512.5", reports[0])
+        self.assertIn("fail: Net GEX negative", reports[0])
+        self.assertIn("PUT 1/1 OK - READY", reports[0])
+        self.assertEqual(len(self.group.reports), 1)
 
     async def test_condition_toggles_gate_entries(self):
         m = {"checks": {"CALL": [
