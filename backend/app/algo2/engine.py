@@ -205,7 +205,7 @@ class Algo2Engine(AlgoEngine):
         p = self._position
         if p is None or p.execution_state in {"entry_pending", "exit_pending"}:
             if p is None and self.enabled:
-                return self._group_ref.next_actions()
+                return self._group_ref.snapshot_lines()
             return super()._next_actions()
         sign = "above" if p.option_type == "CALL" else "below"
         out = [f"Stop {p.stop_spot:,.1f} | {'T2' if p.t1_done else 'T1'} {p.target_spot:,.1f} ({sign} entry)."]
@@ -536,7 +536,7 @@ class Algo2Group:
         self.dir = directory
         os.makedirs(directory, exist_ok=True)
         self.settings_path = os.path.join(directory, "group.json")
-        self.dry_run = True
+        self.dry_run = False
         self.saved_enabled = False
         self.entry_accounts: Tuple[AccountId, ...] = ("master",)
         self.signal_day: Optional[str] = None
@@ -555,8 +555,11 @@ class Algo2Group:
         self.loop_error: Optional[str] = None
         self.reports: List[Dict[str, str]] = []
         self._last_report_slot: Optional[str] = None
-        self._last_phase: Optional[str] = None
         self._blocked_logged: Dict[str, Tuple[float, str]] = {}
+        self._blocked_recent: List[str] = []
+        # "What happens next" is refreshed only on the 5-min slot or on entry/exit, never every second.
+        self.snapshot: Dict[str, Any] = {"time": None, "lines": []}
+        self._snapshot_holding: Optional[bool] = None
 
     # ------------------------------------------------------- persistence
     def _load_settings(self) -> None:
@@ -565,7 +568,7 @@ class Algo2Group:
                 data = json.load(fh)
         except (OSError, ValueError):
             return
-        self.dry_run = bool(data.get("dryRun", True))
+        self.dry_run = bool(data.get("dryRun", False))
         self.saved_enabled = bool(data.get("enabled", False))
         accounts = tuple(a for a in data.get("accounts") or ["master"] if a in ACCOUNT_IDS)
         self.entry_accounts = accounts or ("master",)
@@ -806,18 +809,30 @@ class Algo2Group:
                              f" x{p.quantity} entry {p.entry_premium} ltp {p.premium} SL {p.stop_spot:,.1f} "
                              f"{'T2' if getattr(p, 't1_done', False) else 'T1'} {p.target_spot:,.1f}")
         lines += [line for line in (self._index_line(k) for k in self.cfg.indices) if line]
+        if self._blocked_recent:
+            lines.append("Skipped breakouts: " + "; ".join(self._blocked_recent))
         return " || ".join(lines)
 
+    def _take_snapshot(self, now: datetime) -> None:
+        self.snapshot = {"time": now.strftime("%H:%M:%S"), "lines": self.next_actions()}
+        self._snapshot_holding = self.has_position()
+
+    def snapshot_lines(self) -> List[str]:
+        return list(self.snapshot["lines"]) or self.next_actions()
+
     def _notify_updates(self, now: datetime) -> None:
-        """Phase changes immediately, plus a situation report every N minutes (journal + Telegram)."""
+        """Quiet by design: one situation report per N-min slot (journal + Telegram).
+
+        Entry/exit messages are sent instantly by the engines themselves; here they only
+        refresh the "what happens next" snapshot. Nothing else is logged in between.
+        """
         if not self.enabled and not self.has_position():
-            self._last_phase = None
+            self._snapshot_holding = None
+            self.snapshot = {"time": None, "lines": []}
+            self._blocked_recent = []
             return
-        phase = "in_trade" if self.has_position() else self.flat_phase()
-        if phase != self._last_phase:
-            if self._last_phase is not None and phase != "in_trade":
-                self.master._log(f"Algo 2 status change: {self.next_action_text()}", level="info")
-            self._last_phase = phase
+        if self._snapshot_holding is None or self.has_position() != self._snapshot_holding:
+            self._take_snapshot(now)
         every = int(self.cfg.status_report_minutes or 0)
         if every <= 0 or now.minute % every:
             return
@@ -826,20 +841,22 @@ class Algo2Group:
             return
         self._last_report_slot = slot
         text = self._situation_text()
+        self._blocked_recent = []
         self.reports.append({"time": now.strftime("%H:%M"), "text": text})
         self.reports = self.reports[-80:]
         self.master._log(text, level="info")
+        self._take_snapshot(now)
 
     def _note_blocked(self, key: str, side: str, bar: float, blockers: List[str], m: Dict[str, Any]) -> None:
+        """Remember a blocked breakout for the next 5-min report (no instant message)."""
         if self._blocked_logged.get(key) == (bar, side):
             return
         self._blocked_logged[key] = (bar, side)
         labels = dict(CONDITIONS)
-        trigger = m.get("triggerUp") if side == "CALL" else m.get("triggerDown")
-        self.master._log(
-            f"{key} {side} breakout (spot {m.get('spot') or 0:,.1f} {'>' if side == 'CALL' else '<'} {trigger or 0:,.1f}) "
-            f"NOT traded - failing: {', '.join(labels.get(b, b).split(' (')[0] for b in blockers)}",
-            level="info", index=key)
+        failing = ", ".join(labels.get(b, b).split(" (")[0] for b in blockers[:4])
+        more = f" +{len(blockers) - 4}" if len(blockers) > 4 else ""
+        self._blocked_recent.append(f"{key} {side} @ {m.get('spot') or 0:,.1f} (fail: {failing}{more})")
+        self._blocked_recent = self._blocked_recent[-6:]
 
     def _data_needed(self, now: datetime) -> bool:
         sess = session_for(now)
@@ -1109,7 +1126,8 @@ class Algo2Group:
             "signals": {"day": self.signal_day, "count": self.signals_used(now.date().isoformat()),
                         "max": self.cfg.max_trades, "last": self.last_signal},
             "loopError": self.loop_error,
-            "nextActions": self.next_actions(),
+            "nextActions": self.snapshot_lines(),
+            "nextActionsAt": self.snapshot["time"],
             "reports": list(reversed(self.reports[-30:])),
             "slStop": self.sl_hit_today(now.date().isoformat()),
             "accounts": accounts,

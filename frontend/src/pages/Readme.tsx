@@ -110,7 +110,18 @@ export function Readme() {
         </ul>
       </Section>
 
-      <Section title="ORB Algo: BUY, SL, target aur exit ka exact flow">
+      <Section title="🧩 Algo 1 + Algo 2: common rules">
+        <ul className="list-disc space-y-2 pl-5 text-xs">
+          <li>Do tab: <b>🤖 Algo 1</b> (ORB) aur <b>🤖 Algo 2</b> (options-flow). Dono ka apna ON/OFF aur apna PAPER/LIVE.</li>
+          <li>Master + Child: same signal, har account apne balance se size. Market data sirf Master Data API se; Child sirf trading.</li>
+          <li>Product alag: Algo 1 = MARGIN (exit 15:29), Algo 2 = INTRADAY (exit 15:15). Kabhi mix nahi.</li>
+          <li>Balance shared hai: Algo 1 ka trade chal raha ho to Algo 2 ko margin kam padega → skip + log, trade count use nahi hota.</li>
+          <li>Same Telegram channel aur journal; Algo 2 ke messages "Algo 2" se shuru. Logs 7 din.</li>
+          <li>AWS server Mon–Fri 09:00 start, 16:00 stop (NSE holiday skip). Stop square-off nahi karta.</li>
+        </ul>
+      </Section>
+
+      <Section title="🤖 Algo 1 (ORB): BUY, SL, target aur exit ka exact flow">
         <ol className="list-decimal space-y-2 pl-5 text-xs">
           <li>
             <strong>Range:</strong> 09:25 IST par pehle 10 minute (09:15:00–09:24:59, 10 candles)
@@ -183,14 +194,15 @@ export function Readme() {
 
       <Section title="🤖 Algo 2 (options-flow): alag ON/OFF aur alag Paper/Live">
         <ul className="list-disc space-y-2 pl-5 text-xs">
-          <li>Purana ORB ab <b>Algo 1</b> hai (koi change nahi). Algo 2 ka apna tab, apna ON/OFF, apna PAPER/LIVE aur apne Master/Child ticks hain. Default: OFF + PAPER. Paper↔Live sirf OFF aur flat hone par.</li>
-          <li>Algo 2 sirf <b>INTRADAY</b> product use karta hai; Algo 1 MARGIN pe rehna chahiye, warna Algo 2 ARM nahi hoga. 15:15 pe exit.</li>
-          <li>Entry: last closed 5-min candle ka high + buffer (CALL) / low − buffer (PUT) toota, aur har ON condition pass. Strike: ITM, delta ~0.70. 14 conditions ke alag switch tab mein hain.</li>
-          <li>Exit: SL = breakout candle ka low/high (capital cap default OFF). T1 = OI wall ya 2R pe 70% booking, SL cost pe, baaki VWAP/T2. OI trap pe Data SL. 20 min mein T1 nahi aaya to exit. Din mein max 2 trade; SL hit hua to us din aur trade nahi.</li>
-          <li>Har 5 min ka situation report aur "aage kya hoga" tab pe + Telegram pe. Trade window band/khula, news freeze, SL stop aur condition fail hone se breakout skip hua — sab notify hota hai.</li>
-          <li>News freeze: event ke 15 min pehle se 15 min baad tak koi entry nahi. Events tab mein add/remove karo.</li>
-          <li>Telegram/logs mein "Algo 2 |" prefix. Data sirf Master Data API se; option chain shared hai, extra calls nahi.</li>
-          <li>Iska historical backtest possible nahi (Dhan ke paas purana chain greeks/OI nahi). Pehle PAPER mein chalao.</li>
+          <li>Algo 2 ka apna tab, ON/OFF, PAPER/LIVE aur Master/Child ticks. <b>Default: OFF + LIVE</b> — ON karte hi real order. Paper↔Live sirf OFF aur flat hone par.</li>
+          <li>Sirf <b>INTRADAY</b>; Algo 1 MARGIN pe rehna chahiye warna Algo 2 ARM nahi hoga.</li>
+          <li>Trade time: 09:45–11:15 aur 13:30–15:00. 15:00 ke baad entry nahi, 15:15 pe exit. News event ke ±15 min entry nahi (events tab mein add/remove).</li>
+          <li>Entry: last closed 5-min candle high + buffer (NIFTY 0.5 / SENSEX 1.5) toota = CALL; low − buffer = PUT. Har ON condition pass honi chahiye (14 conditions, har ek ka switch Settings mein). Strike ITM, delta ~0.70.</li>
+          <li>SL: breakout candle ka low (CALL) / high (PUT). 0.75% capital cap default OFF. Broker pe 2× doori pe safety SL. OI trap pe Data SL.</li>
+          <li>Target: T1 = OI wall ya 2R pe 70% booking, SL cost pe, baaki VWAP trail / T2. 20 min mein T1 nahi aaya to exit.</li>
+          <li>Din mein max 2 trade (Algo 1 ON ho ya OFF). SL hit hua to us din aur trade nahi; target/20-min exit ke baad 2nd allowed.</li>
+          <li><b>Notifications (quiet):</b> entry, T1, exit, SL turant. Baaki sirf har 5 min report — spot, triggers, conditions pass/fail, position, aur us 5 min mein skip hue breakouts. "Aage kya hoga" bhi sirf 5 min pe ya entry/exit pe update hota hai.</li>
+          <li>Data sirf Master Data API; option chain shared, extra calls nahi. Historical backtest possible nahi (Dhan ke paas purana chain greeks/OI nahi).</li>
         </ul>
       </Section>
 

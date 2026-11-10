@@ -155,6 +155,8 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             target.start()
             self.addCleanup(target.stop)
         self.group = Algo2Group(self.tmp.name)
+        self.assertFalse(self.group.dry_run)   # Algo 2 defaults to LIVE
+        self.group.dry_run = True              # tests below must never reach the broker
         self.engine = self.group.items["master"]
         self.engine.cfg.protective_sl = False
         self.engine._day = algo_module.now_ist().date().isoformat()
@@ -272,6 +274,39 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fail: Net GEX negative", reports[0])
         self.assertIn("PUT 1/1 OK - READY", reports[0])
         self.assertEqual(len(self.group.reports), 1)
+        self.assertEqual(len(logs), 1)          # nothing else logged between reports
+
+    async def test_blocked_breakout_goes_into_next_report_not_instant(self):
+        self.engine.enabled = True
+        m = {"spot": 23520.0, "triggerUp": 23512.5}
+        logs = []
+        with patch.object(self.engine, "_log", side_effect=lambda msg, **kw: logs.append(msg)), \
+                patch.object(self.group, "flat_phase", return_value="scanning"):
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 21, 0))
+            snap = list(self.group.snapshot["lines"])
+            self.group._note_blocked("NIFTY", "CALL", 1.0, ["gex_negative"], m)
+            self.group._note_blocked("NIFTY", "CALL", 1.0, ["gex_negative"], m)
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 23, 0))
+            self.assertEqual(logs, [])
+            self.assertEqual(self.group.snapshot["lines"], snap)   # unchanged until the 5-min slot
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 25, 0))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].count("NIFTY CALL @ 23,520.0 (fail: Net GEX negative)"), 1)
+        self.assertEqual(self.group._blocked_recent, [])
+
+    async def test_snapshot_refreshes_immediately_on_entry_and_exit(self):
+        self.engine.enabled = True
+        with patch.object(self.engine, "_log"), patch.object(self.group, "flat_phase", return_value="scanning"):
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 21, 0))
+            self.assertEqual(self.group.snapshot["time"], "11:21:00")
+            self.engine._position = self.position()
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 22, 7))
+            self.assertEqual(self.group.snapshot["time"], "11:22:07")
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 23, 0))
+            self.assertEqual(self.group.snapshot["time"], "11:22:07")
+            self.engine._position = None
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 24, 9))
+            self.assertEqual(self.group.snapshot["time"], "11:24:09")
 
     async def test_condition_toggles_gate_entries(self):
         m = {"checks": {"CALL": [

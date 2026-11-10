@@ -9,10 +9,12 @@ built on the **DhanHQ v2 API**.
   plus subscribed historical-data APIs when available.
 - **Manual orders:** Dhan **Super Order**, LIMIT or MARKET entry with premium-based
   target and a mandatory stop leg. "No SL" means a **90%-away stop**, not no stop.
-- **ORB algo:** regular BUY order, software **spot-based target only by default**,
+- **Algo 1 (ORB):** regular BUY order, software **spot-based target only by default**,
   and a broker **premium SL 70% away** (algo; manual No-SL stays 90%). Software spot SL / break-even are OFF
   in target-only mode. These are separate
   execution paths; do not confuse their stop rules.
+- **Algo 2 (options-flow):** separate tab/switches, INTRADAY, 5-min candle breakout +
+  14 switchable conditions, candle SL, T1 70% booking, 20-minute rule.
 
 > ⚠️ **Read `SECURITY.md` before running.** This app can place real money orders.
 
@@ -292,9 +294,23 @@ These tests do **not** certify real account credentials, permissions, static IP,
 broker uptime or simultaneous/identical fills. Start with DRY-RUN, check funds and
 IP for **each** account, then explicitly ARM the intended recipients.
 
-## Order execution and stop-loss rules (current implementation)
+## Algos: common rules (Algo 1 + Algo 2)
 
-### ORB automatic BUY
+| Topic | Both algos |
+| --- | --- |
+| Tabs | `🤖 Algo 1` (ORB) and `🤖 Algo 2` (options-flow), each with its own ON/OFF and PAPER/LIVE. |
+| Accounts | Master + Child, same signal to each selected account, each sizes from its own balance. |
+| Market data | Master Data API only; Child is trading-only. |
+| Product split | Algo 1 = MARGIN (exit 15:29), Algo 2 = INTRADAY (exit 15:15). Never mix. |
+| Balance | Shared broker balance: an open Algo 1 trade can leave too little for Algo 2 (skip, logged). |
+| Telegram / logs | Same channel and journal; Algo 2 messages start with "Algo 2". Logs kept 7 days. |
+| Manual EXIT | Positions tab EXIT routes a tracked algo contract to that algo's own exit. |
+| Restart | Positions are restored and managed; Algo 1 entries disarm, Algo 2 re-arms if it was ON. |
+| Server | AWS starts 09:00 and stops 16:00 Mon–Fri (skips NSE holidays). The stop does not square off. |
+
+## Algo 1 — ORB (`🤖 Algo 1` tab)
+
+### Algo 1: entry (automatic BUY)
 
 1. Arm the algo from its tab. LIVE arming checks Dhan's registered-IP verdict.
    DRY-RUN simulates orders; it does not submit them.
@@ -320,7 +336,7 @@ IP for **each** account, then explicitly ARM the intended recipients.
 7. Network/5xx uncertainty is retained and resolved by order/correlation ID;
    never blindly resend a possibly accepted BUY or SELL.
 
-### ORB stops, target and exit
+### Algo 1: stops, target and exit
 
 **Current default: `target_only = true`** (`ALGO_TARGET_ONLY=true` for fresh
 config). Software spot SL and break-even exits are disabled even if old SL
@@ -390,47 +406,97 @@ NIFTY uses the configured registry lot size 65, SENSEX 20; verify current
 contract sizes with the exchange/Dhan before LIVE, or set ALGO_LOT_SIZES.
 These are risk estimates, not maximum-loss guarantees; gaps/slippage can exceed them.
 
-### Algo 2 — options-flow engine (separate tab, separate switches)
+## Algo 2 — options-flow engine (`🤖 Algo 2` tab)
 
-The old ORB algo is now labelled **Algo 1** (unchanged). **Algo 2** lives in
-`backend/app/algo2/` and the `🤖 Algo 2` tab. API: `/api/algo2/*`.
+Code: `backend/app/algo2/` (calculations, news_events, market_data, engine) and
+`backend/app/routers/algo2.py` (`/api/algo2/*`). Reuses Algo 1's order execution,
+reconcile and exit code; only the signal, levels and exits below differ.
 
-- **Own ON/OFF, own PAPER/LIVE, own account ticks** (Master / Child), saved in
-  `data/algo2/group.json`. Defaults: OFF + PAPER. Paper/Live change needs OFF + flat.
-  Telegram and logs are prefixed `Algo 2 |`; order correlation IDs use `AL2-`.
-- **Product INTRADAY only.** Algo 1 must stay on MARGIN (default) — Algo 2 refuses to
-  arm otherwise, so broker positions of the two algos never mix. Exit time 15:15
-  (before Dhan's ~15:18 auto square-off).
-- **Entry:** spot breaks the last closed 5-min candle high + buffer (NIFTY 0.5 / SENSEX
-  1.5 pts) for CALL, low − buffer for PUT, and **every enabled condition passes**.
-  Strike = ITM with |delta| closest to 0.70. Each condition has its own switch:
-  news freeze (±15 min), trade windows 09:45–11:15 & 13:30–15:00, PCR chop band
-  0.85–1.10, net delta rising, net GEX < 0, opposite-side OI velocity > +30% (5 min),
-  same-side OI unwinding, HSMI sign, RELIANCE+HDFCBANK+ICICIBANK sync, heavyweight
-  divergence, futures beyond VWAP ±1.5σ band, futures beyond VAH/VAL, basis, VIX.
-  PUT rules mirror CALL rules.
-- **Exits:** stop = breakout candle low/high on spot (optional capital cap, default
-  OFF: `capital_sl_cap` / `max_stop_loss_pct`). Broker safety SL at 2x the stop
-  distance. T1 = highest-OI wall if ≥ 2R away, else 2R: book 70% (1 lot =
-  full exit), stop → cost, remainder trails VWAP / T2 = max(2R, T1 + R). Data SL:
-  same-side OI velocity leads the opposite side by ≥ 10 pp. 20-minute rule: if T1 is
-  not reached in 20 min, exit at market. Sizing: max affordable (as Algo 1).
-  Max 2 trades/day; after a stop-loss exit (STOP, DATA_SL, broker SL, ₹ loss) no
-  more trades that day (`stop_after_sl`, default ON).
-- **Updates:** "next actions" on the tab; phase changes (window closed, news freeze,
-  SL stop) and a 5-min situation report (spot, CALL/PUT triggers, conditions passing,
-  failing ones, open position) go to the journal and Telegram; a breakout blocked by
-  conditions is logged once per 5-min bar.
-- **Data:** Master Data API only. Option chain is reused from the shared chain engine
-  (no extra chain calls); `/marketfeed/ohlc` every 5 s (VIX, index, 6 heavyweights,
-  nearest futures); 5-min candles once per closed bar. VWAP / market profile use
-  futures candles (index has no volume). HSMI/trio/velocity need ~5 min warm-up after ON.
-- **Events:** `data/algo2/events_calendar.json` (seeded with RBI policy / Budget dates;
-  add/remove in the tab). NSE corporate events for heavyweights are fetched once a
-  day; they are date-only and shown but do not block unless timed.
-- **Limits:** no historical backtest is possible (Dhan has no historical chain
-  greeks/OI). With all 14 conditions enabled, signals will be rare — run PAPER first.
+### Algo 2: switches and mode
+
+| Switch | Default | Notes |
+| --- | --- | --- |
+| ON / OFF | OFF | Own switch; never touches Algo 1. Saved in `data/algo2/group.json`; re-arms after restart if it was ON. |
+| PAPER / LIVE | **LIVE** | Own mode (Algo 1 has its own). Change only while OFF and flat. |
+| Accounts | Master | Master / Child ticks, change only while OFF and flat. |
+| Product | INTRADAY | Forced. Arm is refused if Algo 1 is also INTRADAY (Algo 1 stays MARGIN) so broker positions never mix. |
+| Each of the 14 conditions | ON | Settings → Conditions ON/OFF. All ENABLED conditions must pass. |
+| Data SL, T1 70% booking, stop after 1st SL | ON | Settings checkboxes. |
+| 0.75% capital SL cap | OFF | `capital_sl_cap` / `max_stop_loss_pct`. |
+| 5-min report | 5 | `status_report_minutes`; 0 = off. |
+
+### Algo 2: entry
+
+1. Only inside trade windows **09:45–11:15 and 13:30–15:00**, no entry at/after 15:00,
+   no entry during a news freeze (event ±15 min).
+2. CALL when spot breaks the last closed 5-min candle **high + buffer** (NIFTY 0.5 /
+   SENSEX 1.5 pts); PUT when it breaks **low − buffer**. Each candle/side is tried once.
+3. Every enabled condition must pass (PUT rules mirror CALL):
+
+| # | Condition | CALL passes when |
+| --- | --- | --- |
+| 1 | News freeze | no timed event within ±15 min |
+| 2 | Trade window | inside a window above |
+| 3 | PCR filter | PCR outside 0.85–1.10 (chop band) |
+| 4 | Net delta | rising vs 5 min ago (PUT: falling) |
+| 5 | Net GEX | negative (expansion zone) |
+| 6 | OI velocity | PE OI +30% in 5 min (PUT: CE OI) |
+| 7 | OI unwinding | CE OI falling (PUT: PE OI) |
+| 8 | HSMI | weighted heavyweight move > 0 (PUT: < 0) |
+| 9 | Trio sync | RELIANCE, HDFCBANK, ICICIBANK all up (PUT: all down) |
+| 10 | Heavyweight divergence | ≤ 50% of weight moving against |
+| 11 | VWAP band | futures above VWAP + 1.5 sd (PUT: below − 1.5 sd) |
+| 12 | Market profile | futures above VAH (PUT: below VAL) |
+| 13 | Basis | basis ≥ 0, no discount divergence (PUT: basis not rising) |
+| 14 | VIX | VIX move < +3% (PUT: > −3%) |
+
+4. Strike: ITM with |delta| closest to 0.70. Size: max affordable (90% of balance).
+
+### Algo 2: stop-loss and exit rules
+
+| # | Rule |
+| --- | --- |
+| 1 | **SL = breakout 5-min candle LOW (CALL) / HIGH (PUT)** on spot. No capital cap by default. |
+| 2 | Broker protective SL order at 2x the stop distance (safety if the server fails). |
+| 3 | Data SL: same-side OI velocity > 0 and ≥ 10 pp ahead of the other side (OI trap) → exit. |
+| 4 | T1 = highest-OI wall if ≥ 2R away, else 2R: book 70% (1 lot = full exit), stop → cost, rest trails VWAP / T2 = max(2R, T1 + R). |
+| 5 | 20-minute rule: T1 not reached in 20 min → exit at market. |
+| 6 | 15:15 time exit (before Dhan's ~15:18 INTRADAY auto square-off). |
+| 7 | Optional ₹ profit / loss exits (`profit_target_rs`, `stop_loss_rs`). |
+
+Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
+
+### Algo 2: trade count
+
+- Max **2 trades/day**, whether Algo 1 is ON or OFF. The 2nd only after the 1st is closed.
+- After a stop-loss exit (STOP, DATA_SL, broker SL, ₹ loss) **no more trades that day**.
+  Target, cost-stop or 20-minute exits still allow the 2nd trade.
+- LIVE: if Algo 1 has used the margin, Algo 2 skips with "insufficient balance"; the
+  skip does not use up a trade and the next 5-min candle can retry. PAPER: own ₹1L.
+
+### Algo 2: notifications (quiet by design)
+
+- **Instant** (journal + Telegram): entry, T1 booking, exit, SL, errors, ON/OFF, mode change.
+- **Every 5 min** (journal + Telegram + tab): situation report — phase / "no trade at this
+  time", spot, CALL/PUT triggers, conditions passing/failing, open position, and any
+  breakouts skipped in those 5 min with the failing conditions.
+- **"Aage kya hoga"** on the tab refreshes only at the 5-min report or instantly on
+  entry/exit, not every second. Nothing else is sent in between.
+
+### Algo 2: data, events and limits
+
+- Master Data API only. Option chain is reused from the shared chain engine (no extra
+  chain calls); `/marketfeed/ohlc` every 5 s (VIX, index, 6 heavyweights, nearest
+  futures); 5-min candles once per closed bar. VWAP / profile use futures candles
+  (index has no volume). HSMI/trio/velocity need ~5 min warm-up after ON.
+- Events: `data/algo2/events_calendar.json` (seeded RBI policy / Budget; add/remove on
+  the tab). NSE heavyweight corporate events are fetched daily; date-only, shown, not blocking.
+- No historical backtest is possible (Dhan has no historical chain greeks/OI). With all
+  14 conditions ON, signals are rare.
 - Tests: `python -m unittest tests.test_algo2` (from `backend`).
+
+## Manual orders, sync and checks
+
 ### Manual order path
 
 Manual Buy/Sell uses Super Orders, not the ORB formula. Target is entry reference

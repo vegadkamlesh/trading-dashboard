@@ -58,6 +58,7 @@ interface Algo2Status {
   signals: { day: string | null; count: number; max: number; last: Record<string, unknown> | null };
   loopError: string | null;
   nextActions: string[];
+  nextActionsAt: string | null;
   reports: Array<{ time: string; text: string }>;
   slStop: string | null;
   accounts: Record<Account, AccountState>;
@@ -129,7 +130,10 @@ export function Algo2Page() {
         🛑 Stop-loss hit today ({st.slStop}) — Algo 2 takes no more trades today.
       </div>}
       <div className="card p-3">
-        <div className="mb-1 text-sm font-semibold">🔮 Aage kya hoga (live, every second)</div>
+        <div className="mb-1 text-sm font-semibold">
+          🔮 Aage kya hoga <span className="text-[11px] font-normal text-slate-400">
+            (har 5 min + entry/exit pe turant update{st.nextActionsAt ? ` · last ${st.nextActionsAt}` : ""})</span>
+        </div>
         <ul className="list-disc space-y-0.5 pl-5 text-xs text-slate-300">
           {(st.nextActions || []).map((x, i) => <li key={i} className={i === 0 ? "font-semibold text-sky-200" : "font-mono"}>{x}</li>)}
         </ul>
