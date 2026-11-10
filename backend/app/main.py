@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from . import audit, runtime
 from .algo import algo, engines
+from .algo2.engine import group as algo2_group
 from .accounts import ACCOUNT_IDS, account_scope
 from .algo_store import store as algo_store
 from .config import get_settings
@@ -22,6 +23,7 @@ from .telegram_notify import notifier
 from .routers import (
     account,
     algo as algo_router,
+    algo2 as algo2_router,
     audit as audit_router,
     auth,
     intel,
@@ -93,10 +95,13 @@ async def trading_lifespan(app: FastAPI):
         logger.info("ORB algo engine ready (arm it from the Algo tab)")
         from .routers.trading_accounts import apply_startup_defaults
         await apply_startup_defaults()
+        await algo2_group.start()
+        logger.info("Algo 2 engine ready (OFF/Paper by default; controlled from the Algo 2 tab)")
     try:
         yield
     finally:
         token_stop.set()
+        await algo2_group.stop()
         await engines.stop()
         await engine.stop()
         await close_dhan_client()
@@ -138,6 +143,7 @@ app.include_router(audit_router.router)
 app.include_router(intel.router)
 app.include_router(settings_router.router)
 app.include_router(algo_router.router)
+app.include_router(algo2_router.router)
 app.include_router(trading_accounts.router)
 
 

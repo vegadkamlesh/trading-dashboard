@@ -135,6 +135,7 @@ class MarketFeed:
         self._updated_at: Dict[tuple[str, int], float] = {}
         self._segments: Set[tuple[str, int]] = set()
         self._on_tick: Optional[Callable[[int, float, str], None]] = None
+        self._listeners: List[Callable[[int, float, str], None]] = []
 
         self._ws_task: Optional[asyncio.Task] = None
         self._rest_task: Optional[asyncio.Task] = None
@@ -153,6 +154,15 @@ class MarketFeed:
     # ---------------- public API ----------------
     def set_on_tick(self, cb: Optional[Callable[[int, float, str], None]]) -> None:
         self._on_tick = cb
+
+    def add_listener(self, cb: Callable[[int, float, str], None]) -> None:
+        """Extra tick consumer (e.g. Algo 2) alongside the primary on_tick callback."""
+        if cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def remove_listener(self, cb: Callable[[int, float, str], None]) -> None:
+        if cb in self._listeners:
+            self._listeners.remove(cb)
 
     def subscribe(self, security_id: int, segment: str) -> None:
         sid = int(security_id)
@@ -247,9 +257,9 @@ class MarketFeed:
         self._updated_at[key] = time.time()
         self._tick_count += 1
         self._last_tick_at = time.time()
-        if self._on_tick is not None:
+        for cb in ([self._on_tick] if self._on_tick is not None else []) + list(self._listeners):
             try:
-                self._on_tick(security_id, ltp, segment)
+                cb(security_id, ltp, segment)
             except Exception:  # noqa: BLE001 - never let a consumer break the feed
                 logger.exception("feed on_tick callback failed")
 

@@ -6,6 +6,7 @@ import type { IndexInfo } from "../api/types";
 import { ConnectionBar } from "../components/ConnectionBar";
 import { OptionChainPage } from "./OptionChainPage";
 import { AlgoPage } from "./AlgoPage";
+import { Algo2Page } from "./Algo2Page";
 import { Positions } from "./Positions";
 import { Orders } from "./SuperOrders";
 import { Funds } from "./Funds";
@@ -15,10 +16,11 @@ import { Readme } from "./Readme";
 import { TradingAccountsProvider, useTradingAccounts } from "../hooks/useTradingAccounts";
 import { TradingAccountBar } from "../components/TradingAccountBar";
 
-type Tab = "algo" | "chain" | "positions" | "orders" | "funds" | "eod" | "settings" | "readme";
+type Tab = "algo" | "algo2" | "chain" | "positions" | "orders" | "funds" | "eod" | "settings" | "readme";
 
 const TABS: Array<[Tab, string]> = [
-  ["algo", "🤖 Algo"],
+  ["algo", "🤖 Algo 1"],
+  ["algo2", "🤖 Algo 2"],
   ["chain", "Option Chain"],
   ["positions", "Positions"],
   ["orders", "Orders"],
@@ -78,6 +80,7 @@ function TradingDashboard() {
         <p className="mb-3 text-xs text-sky-300">Viewing {view === "master" ? "Master Dhan" : "Child Dhan"} — account-specific holdings, orders, funds and EXIT</p>
         <BrokerSyncBar />
         {tab === "algo" && <AlgoPage />}
+        {tab === "algo2" && <Algo2Page />}
         {tab === "chain" && <OptionChainPage indices={indices ?? []} />}
         {tab === "positions" && <Positions />}
         {tab === "orders" && <Orders />}

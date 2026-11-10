@@ -296,6 +296,27 @@ class Position:
 #  Engine
 # --------------------------------------------------------------------------- #
 class AlgoEngine:
+    ALGO_LABEL = "Algo 1"
+    ORDER_TAG = "ORB"   # correlation-id prefix of this algo's orders
+    POSITION_CLS = Position
+
+    def _is_dry(self) -> bool:
+        return runtime.is_dry_run()
+
+    @property
+    def _store(self):
+        return store
+
+    @property
+    def _group(self) -> "AccountEngines":
+        return engines
+
+    def _levels(self, leg: DayLeg, direction: str, spot: float, rng: float,
+                sizing: Dict[str, Any]) -> tuple:
+        """(target_spot, stop_spot) for a new entry."""
+        sign = 1 if direction == "CALL" else -1
+        return spot + sign * self.cfg.target_mult * rng, spot - sign * self.cfg.sl_mult * rng
+
     def __init__(self, account_id: Optional[AccountId] = None) -> None:
         self.account_id = account_id
         self.cfg = AlgoConfig.from_settings()
@@ -350,12 +371,12 @@ class AlgoEngine:
         self._events.append(ev)
         if len(self._events) > 400:
             self._events = self._events[-400:]
-        store.append_event(ev, day=self._day)
+        self._store.append_event(ev, day=self._day)
         getattr(logger, {"warn": "warning"}.get(level, level), logger.info)(msg, extra={
             "telegram_event": notification,
             "telegram_account": self.account_id or current_account(),
-            "telegram_mode": "DRY-RUN" if runtime.is_dry_run() else "LIVE",
-            "telegram_detail": msg.split(" ", 1)[-1],
+            "telegram_mode": "DRY-RUN" if self._is_dry() else "LIVE",
+            "telegram_detail": f"{self.ALGO_LABEL} | {msg.split(' ', 1)[-1]}",
             "telegram_level": level,
         })
 
@@ -365,14 +386,14 @@ class AlgoEngine:
             return
         self._running = True
         # Rolling retention: drop journals older than 7 days.
-        store.prune_journals()
+        self._store.prune_journals()
         if self.account_id is None:
             feed.set_on_tick(self._on_tick)
             await feed.start()
         self._restore()
         self._subscribe_tracked()
         self._task = asyncio.create_task(self._supervisor(), name="algo-supervisor")
-        logger.info("Algo engine started (enabled=%s, dryRun=%s)", self.enabled, runtime.is_dry_run())
+        logger.info("Algo engine started (enabled=%s, dryRun=%s)", self.enabled, self._is_dry())
 
     async def stop(self) -> None:
         self._running = False
@@ -396,7 +417,7 @@ class AlgoEngine:
 
     # ---------------------------------------------------------------- state
     def _persist(self) -> None:
-        store.save_state(
+        self._store.save_state(
             {
                 "enabled": self.enabled,
                 "phase": self.phase,
@@ -415,14 +436,14 @@ class AlgoEngine:
 
     def _restore(self) -> None:
         """Reload the previous session and re-sync with Dhan's position book."""
-        data = store.load_state()
+        data = self._store.load_state()
         if not data:
             return
         if self.account_id and data.get("clientId") and data["clientId"] != account_credentials(self.account_id)[0]:
             raise RuntimeError(f"{self.account_id}: saved trading state belongs to a different Dhan client ID. "
                                "Restore the original credentials and reconcile before changing accounts.")
         try:
-            cfg = AlgoConfig(**{**asdict(self.cfg), **(data.get("config") or {})})
+            cfg = type(self.cfg)(**{**asdict(self.cfg), **(data.get("config") or {})})
             self.cfg = cfg
         except TypeError:
             pass
@@ -441,7 +462,7 @@ class AlgoEngine:
         pos = data.get("position")
         if pos:
             try:
-                self._position = Position(**pos)
+                self._position = self.POSITION_CLS(**pos)
                 if "target_only" not in (data.get("config") or {}):
                     self._position.protective_policy_pending = self.cfg.target_only
                     if not self._position.exit_order_id and not self._position.exit_correlation_id:
@@ -788,14 +809,14 @@ class AlgoEngine:
 
     async def arm(self) -> Dict[str, Any]:
         # LIVE preflight: never arm into a state where every order will bounce.
-        if not runtime.is_dry_run():
+        if not self._is_dry():
             check = await self._preflight_ip()
             if not check.get("ok"):
                 self._log(f"ARM REFUSED (live): {check['reason']}", level="error")
                 return {**self.status(), "armed": False, "armError": check}
             self._log(f"IP preflight OK: {check['reason']}", level="info")
         self.enabled = True
-        self._log(f"ALGO ARMED ({'DRY-RUN' if runtime.is_dry_run() else 'LIVE'})", level="success",
+        self._log(f"ALGO ARMED ({'DRY-RUN' if self._is_dry() else 'LIVE'})", level="success",
                   notification="algo_armed")
         await self.reconcile()
         # Run one supervisor pass immediately so the returned status already
@@ -836,7 +857,7 @@ class AlgoEngine:
         if self._position is not None or self._execution_lock.locked():
             raise HTTPException(409, "Cannot change algo configuration while execution/position is active.")
         allowed = set(asdict(self.cfg).keys())
-        cfg = AlgoConfig(**{**asdict(self.cfg), **{
+        cfg = type(self.cfg)(**{**asdict(self.cfg), **{
             k: v for k, v in (patch or {}).items() if k in allowed and v is not None
         }})
         for key in ("sl_mult", "target_mult", "risk_pct", "max_capital_pct", "protective_sl_mult"):
@@ -933,7 +954,7 @@ class AlgoEngine:
         # OR build + watch
         if minute >= sess.or_ready_min:
             if self.account_id == "child":
-                master = engines.items["master"]
+                master = self._group.items["master"]
                 if self._position is None and (
                         master._signal_day != today
                         or any(l.status == "watching" for l in master._legs.values())):
@@ -972,7 +993,7 @@ class AlgoEngine:
         used = self._signals_used(today)
         if (self.account_id != "master" or not 0 < used < self._max_trades()
                 or minute >= self._cutoff_min()
-                or any(e._position is not None for e in engines.items.values())
+                or any(e._position is not None for e in self._group.items.values())
                 or any(l.status == "watching" for l in self._legs.values())):
             return
         reopened = []
@@ -1352,7 +1373,7 @@ class AlgoEngine:
                 or len(self._today_trades) >= self._max_trades(now)
                 or self._signals_used(today) >= self._max_trades(now)):
             return
-        if self.account_id is not None and any(e._position is not None for e in engines.items.values()):
+        if self.account_id is not None and any(e._position is not None for e in self._group.items.values()):
             return
         for key in self.cfg.indices:
             leg = self._legs.get(key)
@@ -1397,13 +1418,13 @@ class AlgoEngine:
                 continue
             if leg.spot > leg.or_high:
                 if self.account_id is not None:
-                    await engines.enter_signal(leg, "CALL")
+                    await self._group.enter_signal(leg, "CALL")
                 else:
                     await self._enter(leg, "CALL")
                 return
             if leg.spot < leg.or_low:
                 if self.account_id is not None:
-                    await engines.enter_signal(leg, "PUT")
+                    await self._group.enter_signal(leg, "PUT")
                 else:
                     await self._enter(leg, "PUT")
                 return
@@ -1440,7 +1461,7 @@ class AlgoEngine:
         leg.option_ltp = premium
 
         balance: Optional[float] = None
-        if not runtime.is_dry_run():
+        if not self._is_dry():
             try:
                 client = get_dhan_client()
                 # One parallel round-trip instead of four sequential REST calls.
@@ -1492,19 +1513,16 @@ class AlgoEngine:
             return
         if self.account_id is None:
             spot = live_spot
-        target = spot + self.cfg.target_mult * rng if direction == "CALL" \
-            else spot - self.cfg.target_mult * rng
-        stop = spot - self.cfg.sl_mult * rng if direction == "CALL" \
-            else spot + self.cfg.sl_mult * rng
+        target, stop = self._levels(leg, direction, spot, rng, sizing)
 
-        pos = Position(
+        pos = self.POSITION_CLS(
             index_key=leg.index_key, option_type=direction,
             security_id=leg.security_id, strike=float(leg.strike),
             expiry=leg.expiry or "", lots=sizing["lots"], quantity=sizing["quantity"],
             entry_spot=spot, entry_premium=leg.option_ltp or 0.0,
             entry_time=now_ist().strftime("%H:%M:%S"), entry_ts=time.time(),
             or_range=rng, target_spot=round(target, 2), stop_spot=round(stop, 2),
-            initial_stop_spot=round(stop, 2), dry_run=runtime.is_dry_run(),
+            initial_stop_spot=round(stop, 2), dry_run=self._is_dry(),
             spot=spot, premium=leg.option_ltp,
         )
         t0 = getattr(self, "_signal_t0", None)
@@ -1523,7 +1541,7 @@ class AlgoEngine:
 
         # Place the entry
         pos.execution_state = "entry_pending"
-        pos.entry_correlation_id = f"ORB-E-{uuid.uuid4().hex[:18]}"
+        pos.entry_correlation_id = f"{self.ORDER_TAG}-E-{uuid.uuid4().hex[:18]}"
         self._position = pos
         self._persist()
         fill = await self._send_order(
@@ -1779,7 +1797,7 @@ class AlgoEngine:
         return None
 
     async def _balance(self) -> float:
-        if runtime.is_dry_run():
+        if self._is_dry():
             base = getattr(self, "_paper_balance", None)
             if base is None:
                 base = 100000.0
@@ -1847,7 +1865,7 @@ class AlgoEngine:
             "afterMarketOrder": False,
             "correlationId": correlation_id,
         }
-        simulate = runtime.is_dry_run() if dry_run is None else dry_run
+        simulate = self._is_dry() if dry_run is None else dry_run
         if simulate:
             audit.log_order(action=f"algo_{tag}", success=True, dry_run=True, status="DRY_RUN",
                             message=f"[algo] {tag} {side} x{qty} (dry-run)", payload=payload)
@@ -1894,7 +1912,7 @@ class AlgoEngine:
             self._log(pos.execution_error, level="error")
             await self._exit_position_locked(pos, "PROTECTIVE_LEVEL")
             return
-        pos.protective_correlation_id = f"ORB-S-{uuid.uuid4().hex[:18]}"
+        pos.protective_correlation_id = f"{self.ORDER_TAG}-S-{uuid.uuid4().hex[:18]}"
         pos.protective_cancel_requested = False
         self._persist()
         res = await self._send_order(
@@ -2033,7 +2051,7 @@ class AlgoEngine:
         else:
             qty = pos.quantity
         pos.execution_state = "exit_pending"
-        pos.exit_correlation_id = f"ORB-X-{uuid.uuid4().hex[:18]}"
+        pos.exit_correlation_id = f"{self.ORDER_TAG}-X-{uuid.uuid4().hex[:18]}"
         self._persist()
         res = await self._send_order(
             side="SELL", security_id=pos.security_id, qty=qty,
@@ -2054,13 +2072,16 @@ class AlgoEngine:
             self._log(f"Exit submitted ({pos.exit_order_id}); waiting for broker flat confirmation.")
         self._persist()
 
+    def _trade_pnl(self, pos: Position, exit_premium: float) -> float:
+        return (exit_premium - pos.entry_premium) * (pos.entry_quantity or pos.quantity)
+
     def _finalise_position(
         self, pos: Position, exit_premium: float, reason: str, estimated: bool = False
     ) -> None:
         if self._position is not pos:
             return
         quantity = pos.entry_quantity or pos.quantity
-        gross_premium_pnl = (exit_premium - pos.entry_premium) * quantity
+        gross_premium_pnl = self._trade_pnl(pos, exit_premium)
         trade = {
             "date": self._day, "index": pos.index_key, "direction": pos.option_type,
             "strike": pos.strike, "expiry": pos.expiry, "lots": pos.lots,
@@ -2078,7 +2099,7 @@ class AlgoEngine:
             "exitPriceEstimated": estimated,
         }
         self._today_trades.append(trade)
-        store.append_trade(trade)
+        self._store.append_trade(trade)
         if pos.dry_run:
             self._paper_balance = getattr(self, "_paper_balance", 100000.0) + gross_premium_pnl
         level = "success" if exit_premium >= pos.entry_premium else "warn"
@@ -2192,7 +2213,7 @@ class AlgoEngine:
             "enabled": self.enabled,
             "phase": self.phase,
             "phaseLabel": self._phase_label(),
-            "dryRun": runtime.is_dry_run(),
+            "dryRun": self._is_dry(),
             "serverTime": now.strftime("%Y-%m-%d %H:%M:%S"),
             "serverTimeShort": now.strftime("%H:%M:%S"),
             "day": self._day,
@@ -2256,7 +2277,7 @@ class AlgoEngine:
     def _stats(self) -> Dict[str, Any]:
         closed = self._today_trades
         wins = [t for t in closed if t.get("premiumPnl", 0) > 0]
-        week = store.recent_trades(days=7)
+        week = self._store.recent_trades(days=7)
         return {
             "todayTrades": len(closed),
             "todayPnl": round(sum(t.get("premiumPnl", 0) for t in closed), 0),
@@ -2265,7 +2286,7 @@ class AlgoEngine:
             "weekTrades": len(week),
             "weekPnl": round(sum(t.get("premiumPnl", 0) for t in week), 0),
             "weekR": round(sum(t.get("rMultiple", 0) for t in week), 2),
-            "allTimePnl": round(sum(t.get("premiumPnl", 0) for t in store.read_trades(limit=5000)), 0),
+            "allTimePnl": round(sum(t.get("premiumPnl", 0) for t in self._store.read_trades(limit=5000)), 0),
         }
 
 

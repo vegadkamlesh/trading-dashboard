@@ -168,6 +168,11 @@ async def _place_locked(body: OrderPlaceBody):
     if (tracked and str(tracked.security_id) == str(payload["securityId"])
             and algo._segment_for(tracked.index_key) == payload["exchangeSegment"]):
         raise HTTPException(409, "This contract is managed by the algo. Use its EXIT; do not mix manual entry quantity.")
+    from ..algo2.engine import group as algo2_group
+    tracked2 = algo2_group.items[current_account()]._position
+    if (tracked2 and str(tracked2.security_id) == str(payload["securityId"])
+            and algo2_group.master._segment_for(tracked2.index_key) == payload["exchangeSegment"]):
+        raise HTTPException(409, "This contract is managed by Algo 2. Use its EXIT; do not mix manual entry quantity.")
 
     pv = order_logic.preview(req)
 

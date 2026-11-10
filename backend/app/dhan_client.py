@@ -666,6 +666,13 @@ class DhanClient:
         """
         return await self._request("POST", "/marketfeed/ltp", json=instruments)
 
+    async def get_ohlc(self, instruments: Dict[str, List[int]]) -> Dict[str, Any]:
+        """Batch LTP + day OHLC (``ohlc.close`` = previous close), same 1 req/sec quote budget.
+
+        Response: {"data": {"NSE_EQ": {"2885": {"last_price": .., "ohlc": {"open", "close", "high", "low"}}}}}
+        """
+        return await self._request("POST", "/marketfeed/ohlc", json=instruments)
+
     # ---------------- historical / analytics data ----------------
     async def get_historical_daily(
         self,

@@ -390,6 +390,40 @@ NIFTY uses the configured registry lot size 65, SENSEX 20; verify current
 contract sizes with the exchange/Dhan before LIVE, or set ALGO_LOT_SIZES.
 These are risk estimates, not maximum-loss guarantees; gaps/slippage can exceed them.
 
+### Algo 2 — options-flow engine (separate tab, separate switches)
+
+The old ORB algo is now labelled **Algo 1** (unchanged). **Algo 2** lives in
+`backend/app/algo2/` and the `🤖 Algo 2` tab. API: `/api/algo2/*`.
+
+- **Own ON/OFF, own PAPER/LIVE, own account ticks** (Master / Child), saved in
+  `data/algo2/group.json`. Defaults: OFF + PAPER. Paper/Live change needs OFF + flat.
+  Telegram and logs are prefixed `Algo 2 |`; order correlation IDs use `AL2-`.
+- **Product INTRADAY only.** Algo 1 must stay on MARGIN (default) — Algo 2 refuses to
+  arm otherwise, so broker positions of the two algos never mix. Exit time 15:15
+  (before Dhan's ~15:18 auto square-off).
+- **Entry:** spot breaks the last closed 5-min candle high + buffer (NIFTY 0.5 / SENSEX
+  1.5 pts) for CALL, low − buffer for PUT, and **every enabled condition passes**.
+  Strike = ITM with |delta| closest to 0.70. Each condition has its own switch:
+  news freeze (±15 min), trade windows 09:45–11:15 & 13:30–15:00, PCR chop band
+  0.85–1.10, net delta rising, net GEX < 0, opposite-side OI velocity > +30% (5 min),
+  same-side OI unwinding, HSMI sign, RELIANCE+HDFCBANK+ICICIBANK sync, heavyweight
+  divergence, futures beyond VWAP ±1.5σ band, futures beyond VAH/VAL, basis, VIX.
+  PUT rules mirror CALL rules.
+- **Exits:** stop = breakout candle low/high, capped at 0.75% of balance
+  (÷ delta × qty). T1 = highest-OI wall if ≥ 2R away, else 2R: book 70% (1 lot =
+  full exit), stop → cost, remainder trails VWAP / T2 = max(2R, T1 + R). Data SL:
+  same-side OI velocity leads the opposite side by ≥ 10 pp. 20-minute rule: if T1 is
+  not reached in 20 min, exit at market. Sizing: max affordable (as Algo 1).
+- **Data:** Master Data API only. Option chain is reused from the shared chain engine
+  (no extra chain calls); `/marketfeed/ohlc` every 5 s (VIX, index, 6 heavyweights,
+  nearest futures); 5-min candles once per closed bar. VWAP / market profile use
+  futures candles (index has no volume). HSMI/trio/velocity need ~5 min warm-up after ON.
+- **Events:** `data/algo2/events_calendar.json` (seeded with RBI policy / Budget dates;
+  add/remove in the tab). NSE corporate events for heavyweights are fetched once a
+  day; they are date-only and shown but do not block unless timed.
+- **Limits:** no historical backtest is possible (Dhan has no historical chain
+  greeks/OI). With all 14 conditions enabled, signals will be rare — run PAPER first.
+- Tests: `python -m unittest tests.test_algo2` (from `backend`).
 ### Manual order path
 
 Manual Buy/Sell uses Super Orders, not the ORB formula. Target is entry reference

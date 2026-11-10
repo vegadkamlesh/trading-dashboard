@@ -346,6 +346,17 @@ async def square_off(
     _session: str = Depends(require_session),
     _csrf: None = Depends(require_csrf),
 ):
+    from ..algo2.engine import group as algo2_group
+    algo2 = algo2_group.items[current_account()]
+    tracked2 = algo2._position
+    if (tracked2 and str(tracked2.security_id) == body.securityId
+            and algo2._segment_for(tracked2.index_key) == body.exchangeSegment
+            and algo2.cfg.product_type == body.productType):
+        async with algo2._execution_lock:
+            await algo2._exit_position_locked(tracked2, "MANUAL")
+        if algo2._position is not None and algo2._position.execution_error:
+            raise HTTPException(409, algo2._position.execution_error)
+        return {"ok": True, "dryRun": tracked2.dry_run, "algo": "Algo 2"}
     async with algo._execution_lock:
         return await _square_off_locked(body)
 
