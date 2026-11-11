@@ -347,7 +347,8 @@ class Algo2Engine(AlgoEngine):
             return None
         algo1 = base.engines.items.get(self.account_id)
         pos = getattr(algo1, "_position", None)
-        if pos is None or pos.dry_run or pos.execution_state not in {"open", "exit_pending"}:
+        # "attention" = still held at Dhan but e.g. its broker SL was rejected; the safe exit re-checks qty.
+        if pos is None or pos.dry_run or pos.execution_state not in {"open", "exit_pending", "attention"}:
             return None
         return pos
 

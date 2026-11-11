@@ -13,7 +13,7 @@ What it does, once you flip it ON
                break DOWN -> buy PUT
   in trade     target = entry spot +/- (target_mult x OR range)
                target-only default: spot SL and break-even OFF
-               broker premium SL = 50% of entry premium (50% away)
+               broker premium SL 35% below entry (inside NSE LPP), software backup exit at 50%
                classic spot stops require explicit target_only=False
   15:29        force square-off (MARGIN product, so Dhan does not auto-square ~15:18)
   15:30        day closed, everything archived to the journal
@@ -100,7 +100,10 @@ SIGNAL_RETRY_COOLDOWN = 3.0
 AFFORDABLE_BALANCE_PCT = 90.0   # 10% buffer for premium move + Dhan market-order margin
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 # Algo's broker-parked disaster SL: trigger when premium has fallen this % from entry.
-ALGO_PROTECTIVE_SL_PCT = 50.0
+# NSE Limit Price Protection rejects option SL prices >40% from LTP (error 17070), so stay inside it.
+ALGO_PROTECTIVE_SL_PCT = 35.0
+# Software backup: algo itself sells at MARKET if premium falls this % (e.g. broker SL rejected).
+ALGO_SOFTWARE_SL_PCT = 50.0
 # A funds/margin rejection is retried at once with one lot fewer, at most this many times.
 FUNDS_RETRY_MAX = 3
 # A funds rejection discovered later than this after the BUY is too stale to chase.
@@ -144,7 +147,7 @@ def _fmt_min(m: int) -> str:
 @dataclass
 class AlgoConfig:
     indices: List[str] = field(default_factory=lambda: ["NIFTY", "SENSEX"])
-    target_only: bool = True       # no software spot stop/break-even; broker SL 50% away
+    target_only: bool = True       # no software spot stop/break-even; broker SL 35% away + software 50%
     sl_mult: float = 0.2            # stop   = sl_mult     x OR range
     target_mult: float = 2.0        # target = target_mult x OR range
     breakeven_at: float = 0.0       # move stop to entry after this many x OR (0=off)
@@ -746,10 +749,11 @@ class AlgoEngine:
                     order = await self._order_state(pos.protective_order_id, pos.protective_correlation_id)
                     status = str(order["orderStatus"]).upper()
                     if status in {"REJECTED", "CANCELLED", "EXPIRED"}:
-                        pos.execution_state = "attention"
-                        pos.execution_error = f"Protective SL {status}; broker protection is not active. Check Dhan."
-                        self._log(pos.execution_error, level="error")
-                        self._persist()
+                        if pos.execution_state != "attention" or "Protective SL" not in (pos.execution_error or ""):
+                            pos.execution_state = "attention"
+                            pos.execution_error = f"Protective SL {status}; broker protection is not active. Check Dhan."
+                            self._log(pos.execution_error, level="error")
+                            self._persist()
                 except DhanAPIError as exc:
                     self._broker_sync_error = exc.error_message
         else:
@@ -1335,6 +1339,14 @@ class AlgoEngine:
                     and pos.premium <= self._protective_trigger(pos)):
                 await self._exit_position_locked(pos, "PROTECTIVE_SL")
                 return
+        if self.cfg.target_only and not pos.dry_run and pos.entry_premium and pos.premium is not None:
+            premium_age = feed.age(pos.security_id, self._segment_for(pos.index_key))
+            if (premium_age is not None and premium_age <= MAX_PRICE_AGE
+                    and pos.premium <= pos.entry_premium * (1 - ALGO_SOFTWARE_SL_PCT / 100)):
+                self._log(f"{pos.index_key}: premium {pos.premium:.1f} is {ALGO_SOFTWARE_SL_PCT:.0f}% below entry "
+                          f"-> software SL exit", level="warn", index=pos.index_key)
+                await self._exit_position_locked(pos, "SOFTWARE_SL")
+                return
         inst = get_index(pos.index_key)
         age = feed.age(inst.sec_id, "IDX_I") if inst else None
         if age is None or age > MAX_PRICE_AGE:
@@ -1703,7 +1715,7 @@ class AlgoEngine:
     async def _size_position(self, leg: DayLeg, balance: Optional[float] = None) -> Dict[str, Any]:
         """Size using policy-specific risk, available cash and the lot bounds.
 
-        Target-only estimates 50% premium loss (100% without protection).
+        Target-only estimates 35% premium loss (100% without protection).
         Classic mode uses spot-stop distance x delta. The minimum-lot floor can
         exceed percentage budgets but never actual cash; neither is a loss cap.
         """
@@ -1835,7 +1847,7 @@ class AlgoEngine:
             pos.next_exit_try_at = 0
         pos.protective_policy_pending = False
         pos.execution_error = ""
-        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 50%-away premium trigger.",
+        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 35%-away premium trigger (software backup at 50%).",
                   level="warn")
         self._persist()
         return True
@@ -2144,7 +2156,7 @@ class AlgoEngine:
             if p.execution_state == "exit_pending":
                 return ["Exit submitted or protective stop filled; waiting for broker flat confirmation.",
                         "No duplicate SELL will be submitted while the outcome is unresolved."]
-            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (50% away)."
+            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (35% away; software backup 50%)."
                           if self.cfg.protective_sl else "Broker protective SL OFF.")
             out.append(
                 f"Target-only: watching spot target {p.target_spot:,.1f}; software spot/break-even SL OFF. "

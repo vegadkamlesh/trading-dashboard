@@ -649,7 +649,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.engine.cfg.protective_sl = True
         for side in ("CALL", "PUT"):
             pos = position(option_type=side, entry_premium=100)
-            self.assertEqual(self.engine._protective_trigger(pos), 50)
+            self.assertEqual(self.engine._protective_trigger(pos), 65)
             with patch.object(algo_module.feed, "price", return_value=99), \
                     patch.object(algo_module.feed, "age", return_value=0), \
                     patch.object(self.engine, "_send_order", AsyncMock(return_value={
@@ -657,7 +657,21 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
                     })) as send:
                 pos.dry_run = True
                 await self.engine._place_protective_sl(pos)
-                self.assertEqual(send.await_args.kwargs["trigger"], 50)
+                self.assertEqual(send.await_args.kwargs["trigger"], 65)
+
+    async def test_live_software_sl_exits_at_50_percent_when_broker_sl_missing(self):
+        self.engine.cfg.target_only = True
+        pos = self.engine._position
+        pos.dry_run, pos.execution_state, pos.entry_premium = False, "attention", 100.0
+        with patch.object(algo_module.feed, "age", return_value=0), \
+                patch.object(self.engine, "_maybe_rupee_exit_locked", AsyncMock(return_value=None)), \
+                patch.object(self.engine, "_exit_position_locked", AsyncMock()) as exit_mock:
+            pos.premium = 51.0
+            await self.engine._manage_position()
+            exit_mock.assert_not_awaited()
+            pos.premium = 50.0
+            await self.engine._manage_position()
+            exit_mock.assert_awaited_once_with(pos, "SOFTWARE_SL")
 
     async def test_target_only_keeps_1529_time_exit(self):
         self.engine.cfg.target_only = True
@@ -696,7 +710,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pos.protective_policy_pending)
         self.client.place_order.assert_not_awaited()
 
-    async def test_legacy_stop_is_replaced_by_50_percent_far_stop_after_cancel(self):
+    async def test_legacy_stop_is_replaced_by_35_percent_far_stop_after_cancel(self):
         pos = self.engine._position
         pos.protective_order_id = "old-sl"
         pos.protective_policy_pending = True
@@ -715,7 +729,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
             await self.engine.reconcile()
         self.client.cancel_order.assert_awaited_once_with("old-sl")
         send.assert_awaited_once()
-        self.assertEqual(send.await_args.kwargs["trigger"], 63.9)
+        self.assertEqual(send.await_args.kwargs["trigger"], 83.1)
         self.assertEqual(pos.protective_order_id, "far-sl")
         self.assertFalse(pos.protective_policy_pending)
         self.assertIs(self.engine._position, pos)
@@ -816,9 +830,9 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         leg, qtys = await self._funds_entry([{"ok": False, "code": "DH-906", "error": "Invalid order"}], [])
         self.assertEqual(qtys, [100])
 
-    def test_algo_protective_sl_parks_at_50_percent_premium_drop(self):
+    def test_algo_protective_sl_parks_at_35_percent_premium_drop(self):
         self.engine.cfg.target_only = True
-        self.assertEqual(self.engine._protective_trigger(position(entry_premium=363.55)), 181.8)
+        self.assertEqual(self.engine._protective_trigger(position(entry_premium=363.55)), 236.3)
 
     async def test_target_only_risk_estimate_uses_70_percent_premium(self):
         self.engine.cfg.target_only = True
@@ -827,7 +841,7 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.engine._balance = AsyncMock(return_value=100000)
         with patch.object(self.engine, "_delta_for", return_value=.5):
             sizing = await self.engine._size_position(leg)
-        self.assertEqual(sizing["riskPerLot"], 3250)   # 100 x 50% x 65
+        self.assertEqual(sizing["riskPerLot"], 2275)   # 100 x 35% x 65
 
     async def test_manual_far_sl_defaults_match_algo_for_long_option(self):
         from app.orders import OrderRequest, build_super_order

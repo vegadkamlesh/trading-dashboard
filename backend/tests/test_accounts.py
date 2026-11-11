@@ -924,6 +924,7 @@ class MultiAccountIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(self.brokers["master"].net, 0)
         engine = self.manager.items["master"]
         pos.spot = pos.target_spot  # old spot-target rule still fires
+        pos.premium = pos.entry_premium  # not near the 50% software SL
         with account_scope("master"), patch.object(algo_module.feed, "age", return_value=0):
             await engine._manage_position()
         self.assertEqual((pos.exit_reason, self.brokers["master"].net), ("TARGET", 0))

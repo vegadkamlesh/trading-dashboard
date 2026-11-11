@@ -416,6 +416,16 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         algo1._exit_position_locked.assert_awaited_once_with(pos, "ALGO2_PRIORITY")
         self.client.place_order.assert_not_awaited()
 
+    async def test_priority_exits_algo1_whose_broker_sl_was_rejected(self):
+        # 2026-11-11 child: Algo 1 SL rejected (LPP) -> state "attention" -> priority was skipped.
+        self.group.dry_run = False
+        algo1, pos = self.fake_algo1(protective_order_id="SL1")
+        pos.execution_state = "attention"
+        with patch.dict(algo_module.engines.items, {"master": algo1}), patch.object(self.engine, "_persist"):
+            self.assertTrue(await self.engine.free_margin_from_algo1("NIFTY"))
+        algo1._exit_position_locked.assert_awaited_once_with(pos, "ALGO2_PRIORITY")
+        self.client.modify_order.assert_not_called()   # rejected SL cannot be modified: safe exit
+
     async def test_priority_gives_up_when_algo1_exit_is_rejected(self):
         self.group.dry_run = False
         algo1, _ = self.fake_algo1(status="REJECTED")
