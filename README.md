@@ -14,7 +14,7 @@ built on the **DhanHQ v2 API**.
   in target-only mode. These are separate
   execution paths; do not confuse their stop rules.
 - **Algo 2 (options-flow):** separate tab/switches, INTRADAY, 5-min candle breakout +
-  14 switchable conditions, candle SL, T1 70% booking, 20-minute rule.
+  4 gates + score ≥ 7 of 10, candle SL, 2R full-exit target, entries 09:45–15:00, exit 15:15.
 
 > ⚠️ **Read `SECURITY.md` before running.** This app can place real money orders.
 
@@ -424,20 +424,23 @@ reconcile and exit code; only the signal, levels and exits below differ.
 | Product | INTRADAY | Forced. Arm is refused if Algo 1 is also INTRADAY (Algo 1 stays MARGIN) so broker positions never mix. |
 | 4 gates (News, Trade window, Heavyweight divergence, VIX) | always ON | Cannot be switched off. |
 | Each of the 10 score conditions | ON | Settings → ON/OFF. An OFF condition leaves the score count. |
-| Min score (`min_score`) | **6** | Settings → "Min score to trade (of 10)", 0–10. |
+| Min score (`min_score`) | **7** | Settings → "Min score to trade (of 10)", 0–10. |
 | OI velocity spike / VWAP band | **10% / 1.0 sd** | `oi_velocity_spike` / `vwap_band_sd`. |
-| Data SL, T1 70% booking, stop after 1st SL | ON | Settings checkboxes. |
+| Target at OI wall (`oi_wall_target`) | **OFF** | OFF = target is always 2R (full exit). |
+| Data SL, T1 70% booking, stop after 1st SL | **OFF** | Settings checkboxes; code kept. |
+| Daily trade limit (`trade_limit` / `max_trades`) | **OFF** (2) | OFF = no daily cap; still one trade at a time. |
+| Hold-time rule (`max_hold_minutes`) | **0 = OFF** | e.g. 20 = exit if target not hit in 20 min. |
 | 0.75% capital SL cap | OFF | `capital_sl_cap` / `max_stop_loss_pct`. |
 | 5-min report | 5 | `status_report_minutes`; 0 = off. |
 
 ### Algo 2: entry
 
-1. Only inside trade windows **09:45–11:15 and 13:30–15:00**, no entry at/after 15:00,
+1. Only inside the trade window **09:45–15:00** (`trade_windows`), no entry at/after 15:00,
    no entry during a news freeze (event ±15 min).
 2. CALL when spot breaks the last closed 5-min candle **high + buffer** (NIFTY 0.5 /
    SENSEX 1.5 pts); PUT when it breaks **low − buffer**. Each candle/side is tried once.
 3. **Gates + score** (PUT rules mirror CALL): all 🔒 gates must pass, and at least
-   `min_score` (default **6**) of the ON 🎯 score conditions must pass. If fewer score
+   `min_score` (default **7**) of the ON 🎯 score conditions must pass. If fewer score
    conditions are ON than `min_score`, all ON ones must pass.
 
 | # | Condition | Type | CALL passes when |
@@ -457,7 +460,8 @@ reconcile and exit code; only the signal, levels and exits below differ.
 | 13 | Basis | 🎯 score | basis ≥ 0, no discount divergence (PUT: basis not rising) |
 | 14 | VIX | 🔒 gate | VIX move < +3% (PUT: > −3%) |
 
-Saved configs from before this rule set are moved once to min score 6, OI 10%, VWAP 1.0 sd.
+Saved configs are migrated once (`config_version` 3) to: min score 7, window 09:45–15:00,
+2R target, no Data SL / hold rule / trade cap / stop-after-SL. Later Settings edits are kept.
 
 4. Strike: ITM with |delta| closest to 0.70. Size: max affordable (90% of balance).
 
@@ -467,19 +471,20 @@ Saved configs from before this rule set are moved once to min score 6, OI 10%, V
 | --- | --- |
 | 1 | **SL = breakout 5-min candle LOW (CALL) / HIGH (PUT)** on spot. No capital cap by default. |
 | 2 | Broker protective SL order at 2x the stop distance (safety if the server fails). |
-| 3 | Data SL: same-side OI velocity > 0 and ≥ 10 pp ahead of the other side (OI trap) → exit. |
-| 4 | T1 = highest-OI wall if ≥ 2R away, else 2R: book 70% (1 lot = full exit), stop → cost, rest trails VWAP / T2 = max(2R, T1 + R). |
-| 5 | 20-minute rule: T1 not reached in 20 min → exit at market. |
-| 6 | 15:15 time exit (before Dhan's ~15:18 INTRADAY auto square-off). |
+| 3 | **Target = 2R** (2 × candle stop distance on spot) → full exit. Optional (OFF): OI-wall target, 70% partial booking with stop → cost and VWAP / T2 trail. |
+| 4 | Data SL (OFF by default): same-side OI velocity > 0 and ≥ 10 pp ahead of the other side (OI trap) → exit. |
+| 5 | Hold-time rule (OFF by default, `max_hold_minutes`): target not reached in N min → exit. |
+| 6 | **15:15 time exit** if neither SL nor target hit (before Dhan's ~15:18 INTRADAY auto square-off). |
 | 7 | Optional ₹ profit / loss exits (`profit_target_rs`, `stop_loss_rs`). |
 
 Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
 
 ### Algo 2: trade count
 
-- Max **2 trades/day**, whether Algo 1 is ON or OFF. The 2nd only after the 1st is closed.
-- After a stop-loss exit (STOP, DATA_SL, broker SL, ₹ loss) **no more trades that day**.
-  Target, cost-stop or 20-minute exits still allow the 2nd trade.
+- **No daily trade limit** by default (`trade_limit` OFF), but only **one position at a time**:
+  a new signal is taken only after the previous trade has closed.
+- Stop-after-SL is OFF by default; when ON, a stop-loss exit (STOP, DATA_SL, broker SL,
+  ₹ loss) blocks further trades that day.
 - **Priority over Algo 1** (LIVE, `priority_over_algo1`, default ON): if Algo 1 holds a LIVE
   position and Algo 2's sizing finds "insufficient balance", Algo 2 immediately exits Algo 1
   (reason `ALGO2_PRIORITY`) and, as soon as that SELL is TRADED, re-sends the same signal

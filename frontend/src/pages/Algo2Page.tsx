@@ -44,7 +44,7 @@ type Config = Record<string, unknown> & {
   entry_cutoff: string; exit_time: string; max_stop_loss_pct: number; max_hold_minutes: number;
   oi_velocity_spike: number; min_score: number; vwap_band_sd: number; t1_pct: number; target_delta: number; event_window_minutes: number;
   pcr_chop_low: number; pcr_chop_high: number; vix_spike_pct: number; data_sl: boolean; partial_booking: boolean;
-  capital_sl_cap: boolean; stop_after_sl: boolean; priority_over_algo1: boolean; status_report_minutes: number; protective_sl_mult: number;
+  capital_sl_cap: boolean; stop_after_sl: boolean; priority_over_algo1: boolean; trade_limit: boolean; oi_wall_target: boolean; status_report_minutes: number; protective_sl_mult: number;
   entry_buffer: Record<string, number>;
 };
 
@@ -56,7 +56,7 @@ interface Algo2Status {
     upcoming: NewsEvent[]; nseError: string | null };
   data: { futures: Record<string, { securityId: number; symbol?: string }>; futuresError: string | null;
     quoteAgeSeconds: number | null; quoteError: string | null; candleError: string | null; apiCalls: Record<string, number> };
-  signals: { day: string | null; count: number; max: number; last: Record<string, unknown> | null };
+  signals: { day: string | null; count: number; max: number | null; last: Record<string, unknown> | null };
   loopError: string | null;
   nextActions: string[];
   nextActionsAt: string | null;
@@ -214,7 +214,7 @@ function ControlBar({ st, busy, anyOpen, call }: {
           {acc === "master" ? "Master" : "Child"}{!st.accounts[acc]?.configured && " (not configured)"}
         </label>
       ))}
-      <span className="text-xs text-slate-400">Signals today: {st.signals.count}/{st.signals.max}</span>
+      <span className="text-xs text-slate-400">Signals today: {st.signals.count}/{st.signals.max ?? "no limit"}</span>
       <span className="ml-auto flex gap-2">
         <button className="btn-ghost" disabled={busy} onClick={() => call("/api/algo2/reconcile", undefined, "Reconciled with Dhan")}>Reconcile</button>
         <button className="btn-sell" disabled={busy || !anyOpen}
@@ -402,8 +402,8 @@ function TradesPanel({ st }: { st: Algo2Status }) {
 }
 
 const NUM_FIELDS: Array<[string, string, number]> = [
-  ["max_trades", "Max signals / day", 1],
-  ["max_hold_minutes", "Hold limit (min)", 1],
+  ["max_trades", "Max trades / day (only if limit ON)", 1],
+  ["max_hold_minutes", "Hold limit (min, 0 = off)", 1],
   ["status_report_minutes", "Status report every (min, 0 = off)", 1],
   ["max_stop_loss_pct", "Capital SL cap % (only if cap ON)", 0.05],
   ["min_score", "Min score to trade (of 10)", 1],
@@ -429,7 +429,8 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
     }
     void call("/api/algo2/config", patch, "Algo 2 settings saved").then(() => setDraft({}));
   };
-  const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl" | "priority_over_algo1", label: string) => (
+  const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl" | "priority_over_algo1"
+    | "trade_limit" | "oi_wall_target", label: string) => (
     <label className="flex items-center gap-1 text-xs">
       <input type="checkbox" disabled={busy} checked={!!st.config[k]}
         onChange={(e) => call("/api/algo2/config", { [k]: e.target.checked }, `${label} ${e.target.checked ? "ON" : "OFF"}`)} />
@@ -456,8 +457,10 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
       </div>
       <div className="mt-3 text-xs font-semibold text-slate-300">Exit / risk switches</div>
       <div className="mt-1 flex flex-wrap items-center gap-4">
+        {flag("trade_limit", `Daily trade limit (max ${st.config.max_trades})`)}
         {flag("stop_after_sl", "1st SL hit → no more trades today")}
         {flag("data_sl", "Data SL (OI trap exit)")}
+        {flag("oi_wall_target", "Target at OI wall (OFF = 2R)")}
         {flag("partial_booking", "T1 partial booking (70%)")}
         {flag("capital_sl_cap", "Cap candle SL at capital %")}
         {flag("priority_over_algo1", "Priority: exit Algo 1 if its margin blocks an Algo 2 entry (LIVE)")}
@@ -509,10 +512,10 @@ function ExitRulesCard({ st }: { st: Algo2Status }) {
     `Stop-loss: breakout 5-min candle LOW (CALL) / HIGH (PUT) on spot${c.capital_sl_cap ? `, capped at ${c.max_stop_loss_pct}% of capital` : " — no capital cap"}.`,
     `Broker safety SL order: placed at ${c.protective_sl_mult}× the stop distance (backup if the app/server fails).`,
     `Data SL: ${c.data_sl ? "ON" : "OFF"} — exit early if same-side OI velocity overtakes the other side (institutional trap).`,
-    `T1: highest-OI wall if ≥ 2R away, else 2R. ${c.partial_booking ? `Book ${c.t1_pct}% there (1 lot = full exit), stop moves to cost, rest trails VWAP / T2.` : "Full exit at T1."}`,
-    `${c.max_hold_minutes}-minute rule: T1 not reached in ${c.max_hold_minutes} min → exit (theta).`,
+    `Target: ${c.oi_wall_target ? "highest-OI wall if ≥ 2R away, else 2R" : "2R (2 × candle stop distance on spot)"}. ${c.partial_booking ? `Book ${c.t1_pct}% there (1 lot = full exit), stop moves to cost, rest trails VWAP / T2.` : "Full exit at target."}`,
+    c.max_hold_minutes > 0 ? `${c.max_hold_minutes}-minute rule: T1 not reached in ${c.max_hold_minutes} min → exit (theta).` : "Hold-time rule: OFF.",
     `Time exit: ${c.exit_time} (before Dhan INTRADAY auto square-off). New entries till ${c.entry_cutoff}, windows ${c.trade_windows}.`,
-    `Trades: max ${c.max_trades}/day, next only after the previous one closes${c.stop_after_sl ? "; after any stop-loss exit no more trades today" : ""}.`,
+    `Trades: ${c.trade_limit ? `max ${c.max_trades}/day` : "no daily limit"}, one at a time — next only after the previous one closes${c.stop_after_sl ? "; after any stop-loss exit no more trades today" : ""}.`,
     `Priority over Algo 1: ${c.priority_over_algo1 ? "ON — if Algo 1's open LIVE trade leaves too little balance, Algo 1 is exited at market and Algo 2 enters as soon as that SELL fills" : "OFF — Algo 2 skips the signal when balance is short"}.`,
   ];
   return (

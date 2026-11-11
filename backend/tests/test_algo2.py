@@ -178,6 +178,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         return Algo2Position(**(values | changes))
 
     async def test_paper_t1_partial_then_cost_stop_never_calls_broker(self):
+        self.engine.cfg.partial_booking = True
         pos = self.position()
         self.engine._position = pos
         pos.spot, pos.premium = 23541.0, 130.0
@@ -203,12 +204,29 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.engine._position)
         self.assertEqual(self.engine._today_trades[-1]["exitReason"], "T1_FULL")
 
+    async def test_default_two_r_target_exits_all_lots(self):
+        self.engine._position = pos = self.position()
+        pos.spot, pos.premium = 23541.0, 130.0
+        await self.engine._manage_position()
+        self.assertIsNone(self.engine._position)
+        trade = self.engine._today_trades[-1]
+        self.assertEqual((trade["exitReason"], trade["quantity"]), ("T1_FULL", 195))
+
+    async def test_hold_rule_and_data_sl_are_off_by_default(self):
+        self.engine._position = pos = self.position(entry_confirmed_ts=time.time() - 60 * 60, spot=23510.0)
+        with patch.object(self.group.data, "oi_velocity", return_value={"ce": 25.0, "pe": 5.0}):
+            await self.engine._manage_position()
+        self.assertIs(self.engine._position, pos)
+        self.assertFalse(any("minute rule" in line for line in self.engine._next_actions()))
+
     async def test_twenty_minute_rule_exits_when_t1_not_hit(self):
+        self.engine.cfg.max_hold_minutes = 20
         self.engine._position = self.position(entry_confirmed_ts=time.time() - 20 * 60 - 1, spot=23510.0)
         await self.engine._manage_position()
         self.assertEqual(self.engine._today_trades[-1]["exitReason"], "STAGNANT_20M")
 
     async def test_data_sl_exits_on_call_oi_trap(self):
+        self.engine.cfg.data_sl = True
         self.engine._position = self.position(spot=23510.0)
         with patch.object(self.group.data, "oi_velocity", return_value={"ce": 25.0, "pe": 5.0}):
             await self.engine._manage_position()
@@ -223,6 +241,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_levels_cap_stop_by_capital_and_use_oi_wall(self):
         self.engine.cfg.capital_sl_cap = True
+        self.engine.cfg.oi_wall_target = True
         self.group.signal_ctx["NIFTY"] = {"candleLow": 23450.0, "candleHigh": 23510.0, "wall": 23700.0}
         leg = DayLeg("NIFTY", strike=23450)
         with patch.object(self.engine, "_delta_for", return_value=0.7):
@@ -249,9 +268,17 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                                                {"quantity": 390, "balance": 100000})
         self.assertEqual((target, stop), (23440.0, 23530.0))
 
+    async def test_default_target_ignores_oi_wall(self):
+        self.group.signal_ctx["NIFTY"] = {"candleLow": 23470.0, "candleHigh": 23510.0, "wall": 23700.0}
+        with patch.object(self.engine, "_delta_for", return_value=0.7):
+            target, stop = self.engine._levels(DayLeg("NIFTY"), "CALL", 23500.0, 20.0,
+                                               {"quantity": 65, "balance": 100000})
+        self.assertEqual((target, stop), (23560.0, 23470.0))
+
     async def test_stop_loss_exit_ends_entries_for_the_day(self):
         today = algo_module.now_ist().date().isoformat()
         self.assertIsNone(self.group.sl_hit_today(today))
+        self.engine.cfg.stop_after_sl = True
         self.engine._today_trades = [{"date": today, "index": "NIFTY", "direction": "CALL",
                                       "exitReason": "COST_STOP", "exitTime": "10:05:00"}]
         self.assertIsNone(self.group.sl_hit_today(today))
@@ -347,7 +374,15 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_defaults_and_min_score_setting(self):
         cfg = self.engine.cfg
-        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (6, 10.0, 1.0))
+        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (7, 10.0, 1.0))
+        self.assertEqual((cfg.trade_windows, cfg.entry_cutoff, cfg.exit_time), ("09:45-15:00", "15:00", "15:15"))
+        self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.trade_limit, cfg.oi_wall_target,
+                              cfg.partial_booking, cfg.max_hold_minutes)))
+        today = algo_module.now_ist().date().isoformat()
+        with patch.object(self.group, "signals_used", return_value=9):
+            self.assertFalse(self.group.trades_done(today))
+            self.engine.set_config({"trade_limit": True})
+            self.assertTrue(self.group.trades_done(today))
         self.engine.set_config({"min_score": 8, "conditions": {"news": False, "pcr_filter": False}})
         self.assertEqual(self.engine.cfg.min_score, 8)
         self.assertTrue(self.engine.cfg.conditions["news"])         # gates cannot be switched off
@@ -356,16 +391,28 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException):
                 self.engine.set_config({"min_score": bad})
 
-    async def test_old_saved_config_migrates_to_v2(self):
-        saved = {**engine_module.asdict(self.engine.cfg), "oi_velocity_spike": 30.0, "vwap_band_sd": 1.5}
+    async def test_old_saved_config_migrates_to_v3(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "oi_velocity_spike": 30.0, "vwap_band_sd": 1.5,
+                 "min_score": 6, "trade_windows": "09:45-11:15,13:30-15:00", "data_sl": True,
+                 "stop_after_sl": True, "partial_booking": True, "max_hold_minutes": 20}
         saved.pop("config_version")
-        saved.pop("min_score")
         with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
                 patch.object(self.engine, "_persist") as persist:
             self.engine._restore()
-        self.assertEqual((self.engine.cfg.oi_velocity_spike, self.engine.cfg.vwap_band_sd,
-                          self.engine.cfg.min_score), (10.0, 1.0, 6))
+        cfg = self.engine.cfg
+        self.assertEqual((cfg.oi_velocity_spike, cfg.vwap_band_sd, cfg.min_score, cfg.trade_windows,
+                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 7, "09:45-15:00", 0, 3))
+        self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.partial_booking, cfg.trade_limit)))
         persist.assert_called()
+
+    async def test_v2_saved_config_migrates_to_v3_keeping_v2_values(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "config_version": 2, "oi_velocity_spike": 12.0,
+                 "min_score": 6, "data_sl": True}
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist"):
+            self.engine._restore()
+        cfg = self.engine.cfg
+        self.assertEqual((cfg.oi_velocity_spike, cfg.min_score, cfg.data_sl), (12.0, 7, False))
 
     async def test_breakout_history_records_skip_and_outcome(self):
         hist = self.group.history

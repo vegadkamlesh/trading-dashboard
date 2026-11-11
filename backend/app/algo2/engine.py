@@ -75,7 +75,8 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
 GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required
-CONFIG_VERSION = 2   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+CONFIG_VERSION = 3   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+#                      v3: score >= 7, 09:45-15:00, 2R full exit, no data SL / hold rule / trade cap / SL stop
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
 SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
@@ -98,25 +99,27 @@ class Algo2Config(AlgoConfig):
     entry_cutoff: str = "15:00"
     exit_time: str = "15:15"
     max_trades: int = 2
+    trade_limit: bool = False         # False = no daily trade cap (max_trades ignored)
     protective_sl: bool = True
     protective_sl_mult: float = 2.0
     conditions: Dict[str, bool] = field(default_factory=_default_conditions)
-    trade_windows: str = "09:45-11:15,13:30-15:00"
+    trade_windows: str = "09:45-15:00"
     entry_buffer: Dict[str, float] = field(default_factory=lambda: {"NIFTY": 0.5, "SENSEX": 1.5})
     max_stop_loss_pct: float = 0.75
     capital_sl_cap: bool = False      # operator choice: SL = breakout candle low/high only
-    stop_after_sl: bool = True        # no more entries today once a trade exits on a stop
+    stop_after_sl: bool = False       # True: no more entries today once a trade exits on a stop
     priority_over_algo1: bool = True  # LIVE: exit Algo 1's position when its margin blocks an Algo 2 entry
     status_report_minutes: int = 5
-    max_hold_minutes: int = 20
+    max_hold_minutes: int = 0         # 0 = off; else exit if T1 not reached within this many minutes
     oi_velocity_spike: float = 10.0
-    min_score: int = 6                # entry needs every gate + at least this many score conditions
-    config_version: int = 2
-    data_sl: bool = True
+    min_score: int = 7                # entry needs every gate + at least this many score conditions
+    config_version: int = 3
+    data_sl: bool = False
     data_sl_gap_pct: float = 10.0
+    oi_wall_target: bool = False      # False: target = 2R; True: highest-OI wall if >= 2R away
     event_window_minutes: int = 15
     target_delta: float = 0.70
-    partial_booking: bool = True
+    partial_booking: bool = False
     t1_pct: float = 70.0
     pcr_chop_low: float = 0.85
     pcr_chop_high: float = 1.10
@@ -217,7 +220,7 @@ class Algo2Engine(AlgoEngine):
             "trades_done": "Max trades for today done",
             "sl_stop": "Stop-loss hit today - no more entries today",
             "market_closed": "Market closed",
-            "in_trade": "In a trade - managing stop, T1, data SL and 20-minute rule",
+            "in_trade": "In a trade - managing stop, target and enabled exit rules",
         }.get(self.phase) or super()._phase_label()
 
     def _next_actions(self) -> List[str]:
@@ -229,8 +232,10 @@ class Algo2Engine(AlgoEngine):
         sign = "above" if p.option_type == "CALL" else "below"
         out = [f"Stop {p.stop_spot:,.1f} | {'T2' if p.t1_done else 'T1'} {p.target_spot:,.1f} ({sign} entry)."]
         if not p.t1_done:
-            left = self.cfg.max_hold_minutes * 60 - (time.time() - (p.entry_confirmed_ts or p.entry_ts))
-            out.append(f"20-minute rule: exit if T1 not hit in {max(0, left) / 60:.1f} min.")
+            if self.cfg.max_hold_minutes > 0:
+                left = self.cfg.max_hold_minutes * 60 - (time.time() - (p.entry_confirmed_ts or p.entry_ts))
+                out.append(f"{self.cfg.max_hold_minutes}-minute rule: exit if T1 not hit in "
+                           f"{max(0, left) / 60:.1f} min.")
         else:
             out.append(f"T1 booked {p.t1_qty} @ {p.t1_premium}; stop at cost/VWAP trail.")
         out.append(f"Forced square-off at {self._sess_val('exit_time')}.")
@@ -249,12 +254,20 @@ class Algo2Engine(AlgoEngine):
     def _restore(self) -> None:
         saved = (self._store.load_state() or {}).get("config") or {}
         super()._restore()
-        if saved and int(saved.get("config_version") or 1) < CONFIG_VERSION:
+        version = int(saved.get("config_version") or 1) if saved else CONFIG_VERSION
+        if version < 2:
             # One-time move to the gate + score rules; later operator edits are kept.
             self.cfg.oi_velocity_spike, self.cfg.vwap_band_sd = 10.0, 1.0
-            self.cfg.min_score, self.cfg.config_version = 6, CONFIG_VERSION
             self.cfg.conditions = {**_default_conditions(), **(self.cfg.conditions or {}),
                                    **{k: True for k in GATE_CONDITIONS}}
+        if version < 3:
+            # One-time move to the 2R rules backtested on 2026-11-11.
+            self.cfg.min_score, self.cfg.trade_windows = 7, "09:45-15:00"
+            self.cfg.entry_cutoff, self.cfg.exit_time = "15:00", "15:15"
+            self.cfg.data_sl = self.cfg.stop_after_sl = self.cfg.trade_limit = False
+            self.cfg.oi_wall_target = self.cfg.partial_booking = False
+            self.cfg.max_hold_minutes = 0
+            self.cfg.config_version = CONFIG_VERSION
             self._persist()
 
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -329,7 +342,7 @@ class Algo2Engine(AlgoEngine):
                           index=leg.index_key)
                 dist = cap
         dist = max(dist, 0.05)
-        wall = ctx.get("wall")
+        wall = ctx.get("wall") if self.cfg.oi_wall_target else None
         t1 = wall if wall and sign * (wall - spot) >= 2 * dist else spot + sign * 2 * dist
         return round(t1, 2), round(spot - sign * dist, 2)
 
@@ -649,7 +662,7 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         positive(name, upper)
     if cfg["pcr_chop_low"] >= cfg["pcr_chop_high"]:
         raise HTTPException(400, "pcr_chop_low must be below pcr_chop_high")
-    for name in ("capital_sl_cap", "stop_after_sl", "data_sl", "partial_booking"):
+    for name in ("capital_sl_cap", "stop_after_sl", "data_sl", "partial_booking", "trade_limit", "oi_wall_target"):
         if not isinstance(cfg.get(name), bool):
             raise HTTPException(400, f"{name} must be true/false")
     for name, low, high in (("max_hold_minutes", 0, 375), ("event_window_minutes", 0, 240), ("oi_strikes", 1, 40),
@@ -1018,13 +1031,16 @@ class Algo2Group:
             return "market_closed"
         if self.sl_hit_today(now.date().isoformat()):
             return "sl_stop"
-        if self.signals_used(now.date().isoformat()) >= self.cfg.max_trades:
+        if self.trades_done(now.date().isoformat()):
             return "trades_done"
         if self.news.is_news_freeze_active(now)[0]:
             return "news_freeze"
         if not self.in_window(minute) or minute >= self.master._cutoff_min(now):
             return "waiting_window"
         return "scanning"
+
+    def trades_done(self, today: str) -> bool:
+        return self.cfg.trade_limit and self.signals_used(today) >= self.cfg.max_trades
 
     def sl_hit_today(self, today: str) -> Optional[str]:
         """Text of today's first stop-loss exit when ``stop_after_sl`` is on, else None."""
@@ -1188,7 +1204,7 @@ class Algo2Group:
         self._notify_updates(now)
         if self.has_position() or not self.enabled or self._dispatching:
             return
-        if self.signals_used(today.isoformat()) >= self.cfg.max_trades:
+        if self.trades_done(today.isoformat()):
             return
         if self.sl_hit_today(today.isoformat()):
             return
@@ -1369,7 +1385,8 @@ class Algo2Group:
         s = self.score_summary(m["checks"][side], self.cfg.min_score)
         passed = ", ".join(c["key"] for c in m["checks"][side] if c["enabled"] and c["pass"] and not c.get("gate"))
         self.history.breakout(now_ist(), key, side, m, taken=True, blockers=[])
-        master._log(f"SIGNAL {key} {side} (trade {trade_no}/{self.cfg.max_trades}): spot {spot:,.1f} broke 5-min "
+        limit = f"/{self.cfg.max_trades}" if self.cfg.trade_limit else ""
+        master._log(f"SIGNAL {key} {side} (trade {trade_no}{limit}): spot {spot:,.1f} broke 5-min "
                     f"candle {'high' if side == 'CALL' else 'low'} {leg.or_high if side == 'CALL' else leg.or_low:,.1f}; "
                     f"T1 wall {wall_strike or '1:2 R:R'}; gates OK, score {s['passed']}/{s['total']} "
                     f"(need {s['need']}) [{passed}] -> "
@@ -1450,7 +1467,8 @@ class Algo2Group:
             "data": self.data.status(),
             "dailyCache": self.cache.status(),
             "signals": {"day": self.signal_day, "count": self.signals_used(now.date().isoformat()),
-                        "max": self.cfg.max_trades, "last": self.last_signal},
+                        "max": self.cfg.max_trades if self.cfg.trade_limit else None,
+                        "last": self.last_signal},
             "loopError": self.loop_error,
             "nextActions": self.snapshot_lines(),
             "nextActionsAt": self.snapshot["time"],

@@ -35,6 +35,8 @@ class ConfigPatch(BaseModel):
     entry_cutoff: Optional[str] = None
     exit_time: Optional[str] = None
     max_trades: Optional[int] = None
+    trade_limit: Optional[bool] = None
+    oi_wall_target: Optional[bool] = None
     max_lots: Optional[int] = None
     min_lots: Optional[int] = None
     max_affordable: Optional[bool] = None
