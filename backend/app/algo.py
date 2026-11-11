@@ -13,7 +13,7 @@ What it does, once you flip it ON
                break DOWN -> buy PUT
   in trade     target = entry spot +/- (target_mult x OR range)
                target-only default: spot SL and break-even OFF
-               broker premium SL = 30% of entry premium (70% away)
+               broker premium SL = 50% of entry premium (50% away)
                classic spot stops require explicit target_only=False
   15:29        force square-off (MARGIN product, so Dhan does not auto-square ~15:18)
   15:30        day closed, everything archived to the journal
@@ -100,7 +100,7 @@ SIGNAL_RETRY_COOLDOWN = 3.0
 AFFORDABLE_BALANCE_PCT = 90.0   # 10% buffer for premium move + Dhan market-order margin
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 # Algo's broker-parked disaster SL: trigger when premium has fallen this % from entry.
-ALGO_PROTECTIVE_SL_PCT = 70.0
+ALGO_PROTECTIVE_SL_PCT = 50.0
 # A funds/margin rejection is retried at once with one lot fewer, at most this many times.
 FUNDS_RETRY_MAX = 3
 # A funds rejection discovered later than this after the BUY is too stale to chase.
@@ -144,7 +144,7 @@ def _fmt_min(m: int) -> str:
 @dataclass
 class AlgoConfig:
     indices: List[str] = field(default_factory=lambda: ["NIFTY", "SENSEX"])
-    target_only: bool = True       # no software spot stop/break-even; broker SL 70% away
+    target_only: bool = True       # no software spot stop/break-even; broker SL 50% away
     sl_mult: float = 0.2            # stop   = sl_mult     x OR range
     target_mult: float = 2.0        # target = target_mult x OR range
     breakeven_at: float = 0.0       # move stop to entry after this many x OR (0=off)
@@ -1703,7 +1703,7 @@ class AlgoEngine:
     async def _size_position(self, leg: DayLeg, balance: Optional[float] = None) -> Dict[str, Any]:
         """Size using policy-specific risk, available cash and the lot bounds.
 
-        Target-only estimates 70% premium loss (100% without protection).
+        Target-only estimates 50% premium loss (100% without protection).
         Classic mode uses spot-stop distance x delta. The minimum-lot floor can
         exceed percentage budgets but never actual cash; neither is a loss cap.
         """
@@ -1835,7 +1835,7 @@ class AlgoEngine:
             pos.next_exit_try_at = 0
         pos.protective_policy_pending = False
         pos.execution_error = ""
-        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 70%-away premium trigger.",
+        self._log("Target-only policy active: no spot/break-even SL; broker protection uses a 50%-away premium trigger.",
                   level="warn")
         self._persist()
         return True
@@ -2144,7 +2144,7 @@ class AlgoEngine:
             if p.execution_state == "exit_pending":
                 return ["Exit submitted or protective stop filled; waiting for broker flat confirmation.",
                         "No duplicate SELL will be submitted while the outcome is unresolved."]
-            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (70% away)."
+            protection = (f"Far broker premium SL {self._protective_trigger(p):.2f} (50% away)."
                           if self.cfg.protective_sl else "Broker protective SL OFF.")
             out.append(
                 f"Target-only: watching spot target {p.target_spot:,.1f}; software spot/break-even SL OFF. "

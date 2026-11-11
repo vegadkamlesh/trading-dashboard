@@ -10,7 +10,7 @@ built on the **DhanHQ v2 API**.
 - **Manual orders:** Dhan **Super Order**, LIMIT or MARKET entry with premium-based
   target and a mandatory stop leg. "No SL" means a **90%-away stop**, not no stop.
 - **Algo 1 (ORB):** regular BUY order, software **spot-based target only by default**,
-  and a broker **premium SL 70% away** (algo; manual No-SL stays 90%). Software spot SL / break-even are OFF
+  and a broker **premium SL 50% away** (algo; manual No-SL stays 90%). Software spot SL / break-even are OFF
   in target-only mode. These are separate
   execution paths; do not confuse their stop rules.
 - **Algo 2 (options-flow):** separate tab/switches, INTRADAY, 5-min candle breakout +
@@ -116,7 +116,7 @@ Market feed ONLINE, socket connected aur algo ON **open trade ka proof nahi**.
   + mandatory SL. No SL checkbox = confirmed/reference premium ke around **90% away**
   protective stop, zero stop nahi. LIMIT input auto-change nahi; MARKET estimate fill nahi.
 - **ORB default:** confirmed BUY ke baad protection; software spot SL/break-even OFF,
-  spot target first, broker premium SL ~70% below fill, manual EXIT, ORB 15:29 square-off.
+  spot target first, broker premium SL ~50% below fill, manual EXIT, ORB 15:29 square-off.
   Far SL hit na hone ki guarantee nahi: premium near-zero ho sakta hai.
 - Accepted/TRANSIT order != filled; rejection/timeout/partial fill account-wise.
   Same request UUID automatic repeat nahi; Child fail ho to Master rollback nahi.
@@ -343,7 +343,7 @@ IP for **each** account, then explicitly ARM the intended recipients.
 config). Software spot SL and break-even exits are disabled even if old SL
 multipliers/break-even settings are present. CALL target = `S + target_mult x R`;
 PUT target = `S - target_mult x R`. Manual EXIT and **15:29 ORB time exit remain**.
-The broker protective SELL SL is **70% below the confirmed entry premium**:
+The broker protective SELL SL is **50% below the confirmed entry premium**:
 `max(0.05, tick_round(fill premium x 0.30))`. Rs100 fill -> Rs30 trigger.
 This is deliberately far away, **not a guarantee it cannot hit**. You can lose
 nearly the entire premium (or worse execution across gaps).
@@ -396,7 +396,7 @@ No artificial minimum holding time is imposed: a genuine stop hit can exit quick
   After downtime, level-based signals can still trigger; no historical entry
   price is guaranteed.
 
-**Sizing:** target-only risk/lot estimates **70% of premium x lot size**
+**Sizing:** target-only risk/lot estimates **50% of premium x lot size**
 (100% if protective SL disabled), not the old tight spot stop. Classic mode
 uses spot stop distance x abs(delta) x lot size. Risk lots =
 floor(balance x risk% / risk per lot); cash lots = floor(capital budget / premium per lot); capped by

@@ -355,7 +355,7 @@ function IndexCard({ leg, cfg, status }: { leg: AlgoLeg; cfg: AlgoConfig; status
               <span className="text-rose-300">↓ PUT stop {n(leg.spot! + cfg.sl_mult * rng, 1)}</span>
             </>}
           </div>
-          {cfg.target_only && <p className="mt-1 text-amber-300">Target-only · spot SL OFF · broker premium SL 70% away</p>}
+          {cfg.target_only && <p className="mt-1 text-amber-300">Target-only · spot SL OFF · broker premium SL 50% away</p>}
         </div>
       )}
 
@@ -423,7 +423,7 @@ function PositionCard({ pos, cfg, busy, onCall, brokerNetQty, brokerPnl }: {
         <span>entry {pos.entryTime}</span>
         <span>MFE {n(pos.mfe, 1)} pts</span>
         <span>MAE {n(pos.mae, 1)} pts</span>
-        <span>target = {cfg.target_mult}× OR · {cfg.target_only ? "spot/break-even SL OFF; premium SL 70% away" : `stop = ${cfg.sl_mult}× OR`}</span>
+        <span>target = {cfg.target_mult}× OR · {cfg.target_only ? "spot/break-even SL OFF; premium SL 50% away" : `stop = ${cfg.sl_mult}× OR`}</span>
         {pos.protectiveOrderId && <span>protective SL order: {pos.protectiveOrderId} (pending SELL is not a filled exit)</span>}
       </div>
     </div>
@@ -909,7 +909,7 @@ const NUM_FIELDS: Array<[keyof AlgoConfig, string, string]> = [
   ["strike_offset", "Strike offset (0=ATM)", "0 = ATM, 1 = ek strike OTM"],
   ["min_or_pct", "Min OR % of price (0=off)", "Chhoti range wale din skip"],
   ["max_or_pct", "Max OR % of price (0=off)", "Bahut bade gap wale din skip"],
-  ["protective_sl_mult", "Classic-mode protective multiplier", "Ignored in target-only mode; premium SL fixed 70% away"],
+  ["protective_sl_mult", "Classic-mode protective multiplier", "Ignored in target-only mode; premium SL fixed 50% away"],
 ];
 
 type Draft = Record<string, string | number | boolean | string[]>;
@@ -948,7 +948,7 @@ function TuningPanel({ cfg, busy, onCall }: { cfg: AlgoConfig; busy: boolean; on
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={Boolean(draft.target_only)}
             onChange={(e) => setDraft({ ...draft, target_only: e.target.checked })} />
-          <span className="text-xs text-amber-300">Target-only (default): spot/break-even SL OFF, far broker SL 70% away. Large loss possible.</span>
+          <span className="text-xs text-amber-300">Target-only (default): spot/break-even SL OFF, far broker SL 50% away. Large loss possible.</span>
         </label>
         {NUM_FIELDS.map(([key, label, hint]) => (
           <label key={String(key)} className="flex flex-col gap-1">
