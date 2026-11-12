@@ -75,8 +75,9 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
 GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required
-CONFIG_VERSION = 3   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
-#                      v3: score >= 7, 09:45-15:00, 2R full exit, no data SL / hold rule / trade cap / SL stop
+CONFIG_VERSION = 4   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+#                      v3: score >= 7, 09:45-15:00, 2R full exit, optional rules off
+#                      v4: software-only stop; Dhan mishandled Algo 2 protective SL-M orders
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
 SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
@@ -100,7 +101,7 @@ class Algo2Config(AlgoConfig):
     exit_time: str = "15:15"
     max_trades: int = 2
     trade_limit: bool = False         # False = no daily trade cap (max_trades ignored)
-    protective_sl: bool = True
+    protective_sl: bool = False
     protective_sl_mult: float = 2.0
     conditions: Dict[str, bool] = field(default_factory=_default_conditions)
     trade_windows: str = "09:45-15:00"
@@ -230,7 +231,8 @@ class Algo2Engine(AlgoEngine):
                 return self._group_ref.snapshot_lines()
             return super()._next_actions()
         sign = "above" if p.option_type == "CALL" else "below"
-        out = [f"Stop {p.stop_spot:,.1f} | {'T2' if p.t1_done else 'T1'} {p.target_spot:,.1f} ({sign} entry)."]
+        out = [f"Software spot stop {p.stop_spot:,.1f} | "
+               f"{'T2' if p.t1_done else 'T1'} {p.target_spot:,.1f} ({sign} entry)."]
         if not p.t1_done:
             if self.cfg.max_hold_minutes > 0:
                 left = self.cfg.max_hold_minutes * 60 - (time.time() - (p.entry_confirmed_ts or p.entry_ts))
@@ -269,11 +271,17 @@ class Algo2Engine(AlgoEngine):
             self.cfg.max_hold_minutes = 0
             self.cfg.config_version = CONFIG_VERSION
             self._persist()
+        if version < 4 or self.cfg.protective_sl:
+            self.cfg.protective_sl = False
+            self.cfg.config_version = CONFIG_VERSION
+            self._persist()
 
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         patch = dict(patch or {})
         patch["product_type"] = "INTRADAY"
         patch["target_only"] = False
+        # Until Dhan's SL-M handling is verified, Algo 2 exits only via its software spot stop.
+        patch["protective_sl"] = False
         patch["config_version"] = CONFIG_VERSION
         if isinstance(patch.get("conditions"), dict):
             patch["conditions"] = {**patch["conditions"], **{k: True for k in GATE_CONDITIONS}}

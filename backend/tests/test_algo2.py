@@ -212,6 +212,36 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         trade = self.engine._today_trades[-1]
         self.assertEqual((trade["exitReason"], trade["quantity"]), ("T1_FULL", 195))
 
+    async def test_software_spot_stop_remains_active_without_broker_sl(self):
+        self.assertFalse(self.engine.cfg.protective_sl)
+        pos = self.position(spot=23479.0, premium=95.0)
+        self.engine._position = pos
+        with patch.object(self.engine, "_send_order", new_callable=AsyncMock,
+                          return_value={"ok": True, "dryRun": True, "orderId": "DRY-stop"}) as send:
+            await self.engine._manage_position()
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.kwargs["side"], "SELL")
+        self.assertEqual(send.await_args.kwargs["order_type"], "MARKET")
+        self.assertEqual(self.engine._today_trades[-1]["exitReason"], "STOP")
+
+    async def test_entry_does_not_place_broker_protective_sl(self):
+        leg = DayLeg("NIFTY", status="watching", or_high=23500.0, or_low=23480.0,
+                     strike=23450.0, security_id=1, option_ltp=100.0, spot=23510.0,
+                     expiry="2026-11-17", prepared_side="CALL")
+        self.engine._legs = {"NIFTY": leg}
+        sizing = {"lots": 1, "quantity": 65, "balance": 100000.0, "reason": "test"}
+        with patch.object(self.engine, "_prepare_contract", new_callable=AsyncMock), \
+                patch.object(self.engine, "_size_position", new_callable=AsyncMock, return_value=sizing), \
+                patch.object(algo_module.feed, "price", return_value=100.0), \
+                patch.object(algo_module.feed, "age", return_value=0.2), \
+                patch.object(self.engine, "_send_order", new_callable=AsyncMock,
+                             return_value={"ok": True, "dryRun": True, "orderId": "DRY-entry"}), \
+                patch.object(self.engine, "_place_protective_sl", new_callable=AsyncMock) as protective_sl:
+            await self.engine._enter(leg, "CALL")
+        protective_sl.assert_not_awaited()
+        self.assertIsNotNone(self.engine._position, leg.note or f"entry status: {leg.status}")
+        self.assertEqual(self.engine._position.execution_state, "open")
+
     async def test_hold_rule_and_data_sl_are_off_by_default(self):
         self.engine._position = pos = self.position(entry_confirmed_ts=time.time() - 60 * 60, spot=23510.0)
         with patch.object(self.group.data, "oi_velocity", return_value={"ce": 25.0, "pe": 5.0}):
@@ -377,7 +407,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (7, 10.0, 1.0))
         self.assertEqual((cfg.trade_windows, cfg.entry_cutoff, cfg.exit_time), ("09:45-15:00", "15:00", "15:15"))
         self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.trade_limit, cfg.oi_wall_target,
-                              cfg.partial_booking, cfg.max_hold_minutes)))
+                              cfg.partial_booking, cfg.max_hold_minutes, cfg.protective_sl)))
         today = algo_module.now_ist().date().isoformat()
         with patch.object(self.group, "signals_used", return_value=9):
             self.assertFalse(self.group.trades_done(today))
@@ -385,13 +415,15 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.group.trades_done(today))
         self.engine.set_config({"min_score": 8, "conditions": {"news": False, "pcr_filter": False}})
         self.assertEqual(self.engine.cfg.min_score, 8)
+        self.engine.set_config({"protective_sl": True})
+        self.assertFalse(self.engine.cfg.protective_sl)
         self.assertTrue(self.engine.cfg.conditions["news"])         # gates cannot be switched off
         self.assertFalse(self.engine.cfg.conditions["pcr_filter"])
         for bad in (11, -1, 2.5):
             with self.assertRaises(HTTPException):
                 self.engine.set_config({"min_score": bad})
 
-    async def test_old_saved_config_migrates_to_v3(self):
+    async def test_old_saved_config_migrates_to_v4(self):
         saved = {**engine_module.asdict(self.engine.cfg), "oi_velocity_spike": 30.0, "vwap_band_sd": 1.5,
                  "min_score": 6, "trade_windows": "09:45-11:15,13:30-15:00", "data_sl": True,
                  "stop_after_sl": True, "partial_booking": True, "max_hold_minutes": 20}
@@ -401,18 +433,29 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.vwap_band_sd, cfg.min_score, cfg.trade_windows,
-                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 7, "09:45-15:00", 0, 3))
-        self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.partial_booking, cfg.trade_limit)))
+                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 7, "09:45-15:00", 0, 4))
+        self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.partial_booking, cfg.trade_limit,
+                              cfg.protective_sl)))
         persist.assert_called()
 
-    async def test_v2_saved_config_migrates_to_v3_keeping_v2_values(self):
+    async def test_v2_saved_config_migrates_to_v4_keeping_v2_values(self):
         saved = {**engine_module.asdict(self.engine.cfg), "config_version": 2, "oi_velocity_spike": 12.0,
-                 "min_score": 6, "data_sl": True}
+                 "min_score": 6, "data_sl": True, "protective_sl": True}
         with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
                 patch.object(self.engine, "_persist"):
             self.engine._restore()
         cfg = self.engine.cfg
-        self.assertEqual((cfg.oi_velocity_spike, cfg.min_score, cfg.data_sl), (12.0, 7, False))
+        self.assertEqual((cfg.oi_velocity_spike, cfg.min_score, cfg.data_sl, cfg.protective_sl,
+                          cfg.config_version), (12.0, 7, False, False, 4))
+
+    async def test_v3_saved_config_disables_broker_protective_sl(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "config_version": 3, "protective_sl": True}
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist") as persist:
+            self.engine._restore()
+        self.assertFalse(self.engine.cfg.protective_sl)
+        self.assertEqual(self.engine.cfg.config_version, 4)
+        persist.assert_called_once()
 
     async def test_breakout_history_records_skip_and_outcome(self):
         hist = self.group.history

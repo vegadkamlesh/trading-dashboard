@@ -510,7 +510,7 @@ function ExitRulesCard({ st }: { st: Algo2Status }) {
   const c = st.config;
   const rules = [
     `Stop-loss: breakout 5-min candle LOW (CALL) / HIGH (PUT) on spot${c.capital_sl_cap ? `, capped at ${c.max_stop_loss_pct}% of capital` : " — no capital cap"}.`,
-    `Broker safety SL order: placed at ${c.protective_sl_mult}× the stop distance (backup if the app/server fails).`,
+    "Software-only SL: app watches live index-spot ticks and sends a MARKET exit at the candle stop. No broker backup order; this needs the app and live feed running.",
     `Data SL: ${c.data_sl ? "ON" : "OFF"} — exit early if same-side OI velocity overtakes the other side (institutional trap).`,
     `Target: ${c.oi_wall_target ? "highest-OI wall if ≥ 2R away, else 2R" : "2R (2 × candle stop distance on spot)"}. ${c.partial_booking ? `Book ${c.t1_pct}% there (1 lot = full exit), stop moves to cost, rest trails VWAP / T2.` : "Full exit at target."}`,
     c.max_hold_minutes > 0 ? `${c.max_hold_minutes}-minute rule: T1 not reached in ${c.max_hold_minutes} min → exit (theta).` : "Hold-time rule: OFF.",
