@@ -31,6 +31,7 @@ try:
     from websockets.asyncio.client import connect as order_ws_connect
 except ImportError:
     from websockets.client import connect as order_ws_connect
+from websockets.exceptions import WebSocketException
 
 from .config import get_settings
 from .rate_limit import DATA_GATE, chain_gate_for, gate_for
@@ -335,14 +336,18 @@ class DhanClient:
                             self._on_order_update(json_codec.loads(message))
                         except (ValueError, TypeError, KeyError) as exc:
                             # One malformed alert must never drop the stream (2026-11-13: every alert did).
-                            logger.warning("account=%s order_stream_bad_message type=%s",
-                                           self.account_id, type(exc).__name__)
+                            preview = str(message)[:300]
+                            for secret in (self._client_id, self._headers.get("access-token")):
+                                if secret:
+                                    preview = preview.replace(str(secret), "***")
+                            logger.warning("account=%s order_stream_bad_message type=%s message=%r",
+                                           self.account_id, type(exc).__name__, preview)
                             self._refresh_event.set()
                         if time.monotonic() - connected_at > 30:
                             delay = 1.0
             except asyncio.CancelledError:
                 raise
-            except (OSError, ValueError, DhanAPIError, httpx.HTTPError) as exc:
+            except (OSError, ValueError, DhanAPIError, httpx.HTTPError, WebSocketException) as exc:
                 self._order_error = f"{type(exc).__name__}: order stream unavailable; REST polling continues"
                 logger.warning("account=%s order_stream_unavailable type=%s retry_in=%s",
                                self.account_id, type(exc).__name__, delay)
