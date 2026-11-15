@@ -51,6 +51,7 @@ from ..instruments import get_index, lot_size_for
 from . import calculations as calc
 from .daily_cache import Algo2DailyCache
 from .market_data import HEAVYWEIGHT_IDS, INDIA_VIX_ID, VELOCITY_WINDOW, Algo2MarketData
+from .microstructure import MicrostructureRecorder
 from .news_events import NewsEventFetcher
 
 logger = logging.getLogger("dhan.algo2")
@@ -834,6 +835,7 @@ class Algo2Group:
         self.items: Dict[AccountId, Algo2Engine] = {a: Algo2Engine(self, a) for a in ACCOUNT_IDS}
         self.news = NewsEventFetcher(directory)
         self.data = Algo2MarketData(directory)
+        self.micro = MicrostructureRecorder(os.path.join(directory, "microstructure"), self.data)
         self.signal_ctx: Dict[str, Dict[str, Any]] = {}
         self.metrics: Dict[str, Dict[str, Any]] = {}
         self.last_signal: Optional[Dict[str, Any]] = None
@@ -908,6 +910,10 @@ class Algo2Group:
         if self.saved_enabled:
             await self._rearm_after_restart()
         self._task = asyncio.create_task(self._signal_loop(), name="algo2-signal")
+        try:
+            await self.micro.start()
+        except Exception:  # noqa: BLE001 - research recorder must never block trading start-up
+            logger.warning("Microstructure recorder failed to start", exc_info=True)
         logger.info("Algo 2 started (paper=%s, accounts=%s)", self.dry_run, ",".join(self.entry_accounts))
         self._announce_startup()
 
@@ -939,6 +945,7 @@ class Algo2Group:
     async def stop(self) -> None:
         self._running = False
         feed.remove_listener(self.on_tick)
+        await self.micro.stop()
         if self._task:
             self._task.cancel()
             try:
@@ -1473,6 +1480,7 @@ class Algo2Group:
             "metrics": self.metrics,
             "news": self.news.status(now),
             "data": self.data.status(),
+            "microstructure": self.micro.status(),
             "dailyCache": self.cache.status(),
             "signals": {"day": self.signal_day, "count": self.signals_used(now.date().isoformat()),
                         "max": self.cfg.max_trades if self.cfg.trade_limit else None,

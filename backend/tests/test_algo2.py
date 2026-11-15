@@ -14,6 +14,7 @@ from app.algo import DayLeg
 from app.algo2 import calculations as calc
 from app.algo2 import daily_cache
 from app.algo2 import engine as engine_module
+from app.algo2 import microstructure as micro
 from app.algo2.engine import Algo2Group, Algo2Position, parse_windows, validate_algo2_config
 from app.algo2.market_data import Series, parse_candles, resolve_futures_from_csv
 from app.algo2.news_events import NewsEventFetcher
@@ -707,6 +708,93 @@ class DailyCacheTests(unittest.IsolatedAsyncioTestCase):
         await self.cache.schedule(morning, ["NIFTY"])
         self.assertTrue(self.cache.is_done("2026-11-09"))
         self.assertEqual(self.client.get_intraday.await_count, 2 + 8)   # resumed, saved file not re-fetched
+
+
+class MicrostructureRecorderTests(unittest.TestCase):
+    @staticmethod
+    def full_packet(sid, ltp):
+        head = micro.FULL.pack(8, 162, 2, sid, ltp, 75, 1763000000, ltp - 1, 12345, 900, 1100, 5000, 5100, 4900,
+                               ltp - 5, 0.0, ltp + 5, ltp - 10)
+        levels = b"".join(micro.LEVEL5.pack(100 + n, 200 + n, 3, 4, ltp - n, ltp + n) for n in range(5))
+        return head + levels
+
+    @staticmethod
+    def depth_packet(code, sid, base):
+        body = b"".join(micro.LEVEL20.pack(base + n, 10 * n, n) for n in range(20))
+        return micro.DEPTH_HDR.pack(12 + len(body), code, 2, sid, 7) + body
+
+    def test_recorded_feed_round_trips_raw_bytes_and_decodes(self):
+        msg = self.full_packet(111, 250.5) + self.full_packet(222, 99.25)
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = micro.StreamWriter(os.path.join(tmp, "d", "feed.bin.gz"))
+            writer.add(1.5, msg)
+            writer.write(writer.take())
+            writer.add(2.5, msg[:162])           # second flush -> second gzip member
+            writer.write(writer.take())
+            records = list(micro.read_records(writer.path))
+        self.assertEqual(records, [(1.5, msg), (2.5, msg[:162])])
+        packets = micro.split_feed(records[0][1])
+        self.assertEqual([len(p) for p in packets], [162, 162])
+        first = micro.parse_full(packets[0])
+        self.assertEqual((first["securityId"], first["ltq"], first["volume"]), (111, 75, 12345))
+        self.assertEqual((first["totalBuyQty"], first["totalSellQty"], first["oi"]), (1100, 900, 5000))
+        self.assertAlmostEqual(first["ltp"], 250.5)
+        self.assertEqual(first["depth"][4]["bidQty"], 104)
+        self.assertAlmostEqual(first["depth"][4]["ask"], 254.5)
+
+    def test_depth20_message_splits_into_bid_and_ask_books(self):
+        msg = self.depth_packet(41, 333, 100.0) + self.depth_packet(51, 333, 101.0)
+        books = [micro.parse_depth20(p) for p in micro.split_depth(msg)]
+        self.assertEqual([b["side"] for b in books], ["bid", "ask"])
+        self.assertEqual(len(books[0]["levels"]), 20)
+        self.assertEqual(books[1]["levels"][3], {"price": 104.0, "qty": 30, "orders": 3})
+
+    def test_targets_cover_futures_and_atm_options_and_depth_is_nse_only(self):
+        rows = [chain_row(k, 1, 1, 0.5, -0.5) for k in (23400, 23450, 23500, 23550, 23600, 23650)]
+        snaps = {"NIFTY": {"expiry": "2026-11-17", "underlyingLtp": 23510.0, "rows": rows},
+                 "SENSEX": {"expiry": "2026-11-20", "underlyingLtp": 77000.0,
+                            "rows": [chain_row(77000, 1, 1, 0.5, -0.5)]}}
+        source = MagicMock(futures={"NIFTY": {"securityId": 5001, "segment": "NSE_FNO", "expiry": "2026-11-25"},
+                                    "SENSEX": {"securityId": 6001, "segment": "BSE_FNO", "expiry": "2026-11-27"}})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(micro.chain_engine, "snapshot", snaps.get):
+            rec = micro.MicrostructureRecorder(tmp, source)
+            rec.roll_day(datetime(2026, 11, 16, 9, 30))
+            t = rec.targets()
+            feed_ids = {r["securityId"] for r in t["feed"]}
+            self.assertTrue({13, 51, 5001, 6001} <= feed_ids)
+            nifty_strikes = {r["strike"] for r in t["feed"] if r["index"] == "NIFTY" and r["kind"] == "option"}
+            self.assertEqual(nifty_strikes, {23400, 23450, 23500, 23550, 23600})
+            self.assertEqual({r["segment"] for r in t["depth20"]}, {"NSE_FNO"})
+            self.assertEqual({r.get("strike") for r in t["depth20"]}, {None, 23450, 23500, 23550})
+            self.assertEqual(len(rec.new_targets("feed", t["feed"])), len(t["feed"]))
+            self.assertEqual(rec.new_targets("feed", t["feed"]), [])          # deduped
+            with open(os.path.join(tmp, "2026-11-16", "instruments.jsonl"), encoding="utf-8") as fh:
+                self.assertEqual(sum(1 for _ in fh), len(t["feed"]))
+            msg = json.loads(rec.subscribe_messages("feed", t["feed"][:2])[0])
+            self.assertEqual((msg["RequestCode"], msg["InstrumentCount"]), (21, 2))
+
+    def test_low_disk_pauses_recording_without_deleting_and_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = micro.MicrostructureRecorder(tmp)
+            rec.roll_day(datetime(2026, 11, 16, 10, 0))
+            rec.record("feed", b"x" * 20, at=1.0)
+            rec.flush_all(force=True)
+            low = MagicMock(free=micro.MIN_FREE_BYTES - 1)
+            with patch.object(micro.shutil, "disk_usage", return_value=low):
+                self.assertFalse(rec.disk_ok())
+            rec.record("feed", b"y" * 20, at=2.0)                   # dropped while paused
+            rec.flush_all(force=True)
+            self.assertEqual(list(micro.read_records(rec.writers["feed"].path)), [(1.0, b"x" * 20)])
+            with patch.object(micro.shutil, "disk_usage", return_value=MagicMock(free=micro.MIN_FREE_BYTES)):
+                self.assertTrue(rec.disk_ok())
+            with open(os.path.join(tmp, "2026-11-16", "events.jsonl"), encoding="utf-8") as fh:
+                self.assertEqual([json.loads(x)["event"] for x in fh], ["disk_pause", "disk_resume"])
+
+    def test_window_is_weekday_0910_to_1535(self):
+        self.assertFalse(micro.in_window(datetime(2026, 11, 16, 9, 9)))
+        self.assertTrue(micro.in_window(datetime(2026, 11, 16, 9, 10)))
+        self.assertFalse(micro.in_window(datetime(2026, 11, 16, 15, 35)))
+        self.assertFalse(micro.in_window(datetime(2026, 11, 15, 11, 0)))   # Sunday
 
 
 if __name__ == "__main__":
