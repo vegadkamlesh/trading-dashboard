@@ -406,7 +406,8 @@ const NUM_FIELDS: Array<[string, string, number]> = [
   ["max_hold_minutes", "Hold limit (min, 0 = off)", 1],
   ["status_report_minutes", "Status report every (min, 0 = off)", 1],
   ["max_stop_loss_pct", "Capital SL cap % (only if cap ON)", 0.05],
-  ["min_score", "Min score to trade (of 10)", 1],
+  ["min_score", "Min score to trade (see score total)", 1],
+  ["sl_candle_minutes", "SL candle (5/10/15 min)", 5],
   ["oi_velocity_spike", "OI velocity spike %", 1],
   ["vwap_band_sd", "VWAP band (std dev)", 0.1],
   ["t1_pct", "T1 booking %", 5],
@@ -423,14 +424,14 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
   const save = () => {
     const patch: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(draft)) {
-      if (k === "trade_windows" || k === "entry_cutoff" || k === "exit_time") patch[k] = v;
+      if (k === "trade_windows" || k === "entry_cutoff" || k === "exit_time" || k === "expiry_block") patch[k] = v;
       else if (k === "indices") patch[k] = v.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
       else patch[k] = Number(v);
     }
     void call("/api/algo2/config", patch, "Algo 2 settings saved").then(() => setDraft({}));
   };
   const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl" | "priority_over_algo1"
-    | "trade_limit" | "oi_wall_target", label: string) => (
+    | "trade_limit" | "oi_wall_target" | "first_touch_only" | "atm_fallback", label: string) => (
     <label className="flex items-center gap-1 text-xs">
       <input type="checkbox" disabled={busy} checked={!!st.config[k]}
         onChange={(e) => call("/api/algo2/config", { [k]: e.target.checked }, `${label} ${e.target.checked ? "ON" : "OFF"}`)} />
@@ -441,7 +442,8 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
     <details className="card p-3" open>
       <summary className="cursor-pointer text-sm font-semibold">Algo 2 settings (ON/OFF switches + values)</summary>
       <div className="mt-2 text-xs font-semibold text-slate-300">
-        Entry: 🔒 4 gates always pass + 🎯 at least {st.config.min_score} score conditions (ON ones) pass
+        Entry ({String(st.config.score_model ?? "classic")}): 🔒 {st.conditionCatalog.filter((c) => c.gate).length} gates always pass
+        + 🎯 at least {st.config.min_score} of {st.conditionCatalog.filter((c) => !c.gate).length} score conditions (ON ones) pass
       </div>
       <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2 lg:grid-cols-3">
         {st.conditionCatalog.map((c) => c.gate ? (
@@ -464,10 +466,12 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
         {flag("partial_booking", "T1 partial booking (70%)")}
         {flag("capital_sl_cap", "Cap candle SL at capital %")}
         {flag("priority_over_algo1", "Priority: exit Algo 1 if its margin blocks an Algo 2 entry (LIVE)")}
+        {flag("first_touch_only", "First touch per 5-min candle only")}
+        {flag("atm_fallback", "ITM unaffordable → buy ATM (max lots)")}
       </div>
       <div className="mt-3 text-xs font-semibold text-slate-300">Values</div>
       <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
-        {[["indices", "Indices"], ["trade_windows", "Trade windows"], ["entry_cutoff", "Entry cutoff"], ["exit_time", "Exit time"]].map(([k, label]) => (
+        {[["indices", "Indices"], ["trade_windows", "Trade windows"], ["entry_cutoff", "Entry cutoff"], ["exit_time", "Exit time"], ["expiry_block", "Expiry-day block (v5)"]].map(([k, label]) => (
           <label key={k} className="text-xs">{label}
             <input className="input w-full" value={k === "indices" ? (draft[k] ?? st.config.indices.join(",")) : value(k)}
               onChange={(e) => setDraft({ ...draft, [k]: e.target.value })} />

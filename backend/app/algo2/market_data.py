@@ -36,8 +36,10 @@ SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 QUOTE_SECONDS = 5.0
 CHAIN_SAMPLE_SECONDS = 15.0
 VELOCITY_WINDOW = 300.0      # 5 minutes
-HISTORY_SECONDS = 900.0
+HISTORY_SECONDS = 1200.0     # > 15 min so the v5 BANKNIFTY 15-minute move has a sample
 MAX_SPOT_AGE = 5.0
+BANKNIFTY_ID = 25
+FUT_1M_SECONDS = 60.0
 
 # Verified from the Dhan scrip master (NSE_EQ security ids).
 HEAVYWEIGHT_IDS: Dict[str, int] = {
@@ -152,6 +154,9 @@ class Algo2MarketData:
         self.oi_series: Dict[str, Dict[str, Series]] = {}
         self.delta_series: Dict[str, Series] = {}
         self.basis_series: Dict[str, Series] = {}
+        self.fut_1m: Dict[str, List[Dict[str, float]]] = {}
+        self._fut_1m_for: Dict[str, float] = {}
+        self.strike_oi: Dict[str, Deque[Tuple[float, Dict[float, Tuple[Optional[float], Optional[float]]]]]] = {}
         self._last_chain_sample: Dict[str, float] = {}
         self._last_quote_poll = 0.0
         self._next_candle_try: Dict[str, float] = {}
@@ -190,7 +195,7 @@ class Algo2MarketData:
 
     # ----------------------------------------------------------- quotes
     def _instruments(self, indices: List[str]) -> Dict[str, List[int]]:
-        out: Dict[str, List[int]] = {"IDX_I": [INDIA_VIX_ID], "NSE_EQ": list(HEAVYWEIGHT_IDS.values())}
+        out: Dict[str, List[int]] = {"IDX_I": [INDIA_VIX_ID, BANKNIFTY_ID], "NSE_EQ": list(HEAVYWEIGHT_IDS.values())}
         for key in indices:
             inst = get_index(key)
             if inst:
@@ -308,6 +313,51 @@ class Algo2MarketData:
         self.candles_for[index_key] = boundary
         self.candle_error = None
 
+    async def refresh_fut_1m(self, index_key: str, now: datetime) -> None:
+        """Closed 1-minute futures candles (with volume) for the v5 1-min VWAP, once per minute."""
+        minute = now.replace(second=0, microsecond=0)
+        boundary = minute.timestamp()
+        fut = self.futures.get(index_key)
+        if (not fut or self._fut_1m_for.get(index_key) == boundary or now.second < 2
+                or time.time() < self._next_candle_try.get(f"{index_key}:1m", 0.0)):
+            return
+        frm = f"{now.date().isoformat()} 09:15:00"
+        to = (minute + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.calls["candles"] += 1
+            raw = await get_data_client().get_intraday(str(fut["securityId"]), fut["segment"], "FUTIDX", "1", frm, to)
+        except DhanAPIError as exc:
+            self.candle_error = f"{index_key} 1m: {exc.error_message}"
+            self._next_candle_try[f"{index_key}:1m"] = time.time() + (60 if exc.status_code == 429 or "904" in exc.error_code else 15)
+            return
+        rows = [c for c in parse_candles(raw) if c["t"] < boundary]
+        if rows:
+            self.fut_1m[index_key] = rows
+        if rows and rows[-1]["t"] >= boundary - FUT_1M_SECONDS:
+            self._fut_1m_for[index_key] = boundary
+        else:
+            self._next_candle_try[f"{index_key}:1m"] = time.time() + 5
+
+    def series_value(self, segment: str, sid: int, seconds: float = 0.0) -> Optional[float]:
+        series = self.quote_series.get((segment, int(sid)))
+        if not series:
+            return None
+        return series.latest() if seconds <= 0 else series.ago(seconds)
+
+    def strike_oi_ago(self, index_key: str, seconds: float = VELOCITY_WINDOW,
+                      tolerance: float = 90.0) -> Optional[Dict[float, Tuple[Optional[float], Optional[float]]]]:
+        """Per-strike (CE OI, PE OI) from the newest chain sample at least ``seconds`` old."""
+        target = time.time() - seconds
+        found = None
+        for at, snap in self.strike_oi.get(index_key) or ():
+            if at <= target:
+                found = (at, snap)
+            else:
+                break
+        if found is None or target - found[0] > tolerance:
+            return None
+        return found[1]
+
     def last_closed_candle(self, index_key: str) -> Optional[Dict[str, float]]:
         candles = self.spot_candles.get(index_key) or []
         return candles[-1] if candles else None
@@ -338,6 +388,11 @@ class Algo2MarketData:
         self.delta_series.setdefault(index_key, Series()).add(calc.compute_net_delta(near), now)
         self.basis_series.setdefault(index_key, Series()).add(
             calc.compute_basis(spot, self.futures_price(index_key)), now)
+        hist = self.strike_oi.setdefault(index_key, deque())
+        hist.append((now, {float(r["strike"]): ((r.get("ce") or {}).get("oi"), (r.get("pe") or {}).get("oi"))
+                           for r in calc.near_rows(rows, spot, 10)}))
+        while hist and hist[0][0] < now - 600:
+            hist.popleft()
         self._last_chain_sample[index_key] = now
 
     def oi_velocity(self, index_key: str) -> Dict[str, Optional[float]]:

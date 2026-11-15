@@ -21,6 +21,11 @@ time exit, rupee exits, Dhan-parked protective SL.
 
 Algo 2 always trades the INTRADAY product; Algo 1 trades MARGIN. Broker
 reconcile filters by product, so the two algos never adopt each other's qty.
+
+v5 (default since config version 5, see score_v5.py): NIFTY only, gates =
+trade window + VIX + expiry-day 10:45-11:45 block, 24-feature score >= 17,
+first touch per 5-min candle, stop = last closed 15-min candle, target 2R,
+max lots with an ITM -> ATM fallback when funds fall short.
 """
 from __future__ import annotations
 
@@ -32,7 +37,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
@@ -49,8 +54,9 @@ from ..dhan_client import DhanAPIError
 from ..feed import feed
 from ..instruments import get_index, lot_size_for
 from . import calculations as calc
+from . import score_v5 as v5
 from .daily_cache import Algo2DailyCache
-from .market_data import HEAVYWEIGHT_IDS, INDIA_VIX_ID, VELOCITY_WINDOW, Algo2MarketData
+from .market_data import BANKNIFTY_ID, HEAVYWEIGHT_IDS, INDIA_VIX_ID, VELOCITY_WINDOW, Algo2MarketData
 from .microstructure import MicrostructureRecorder
 from .news_events import NewsEventFetcher
 
@@ -75,10 +81,23 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("basis", "Futures basis confirms (no discount divergence)"),
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
-GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required
-CONFIG_VERSION = 4   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required (classic)
+CONFIG_VERSION = 5   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
 #                      v3: score >= 7, 09:45-15:00, 2R full exit, optional rules off
 #                      v4: software-only stop; Dhan mishandled Algo 2 protective SL-M orders
+#                      v5: NIFTY-only 24-feature score >= 17, VIX gate, expiry 10:45-11:45 block,
+#                          15-min candle SL, first touch only, ITM -> ATM fallback
+SCORE_MODELS = ("classic", "v5")
+
+
+def model_conditions(model: str) -> List[Tuple[str, str]]:
+    if model == "v5":
+        return [(k, v5.LABELS[k]) for k in (*v5.GATES, *v5.FEATURES)]
+    return CONDITIONS
+
+
+def model_gates(model: str) -> frozenset:
+    return frozenset(v5.GATES) if model == "v5" else GATE_CONDITIONS
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
 SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
@@ -96,6 +115,7 @@ def _default_conditions() -> Dict[str, bool]:
 @dataclass
 class Algo2Config(AlgoConfig):
     target_only: bool = False
+    indices: List[str] = field(default_factory=lambda: ["NIFTY"])
     product_type: str = "INTRADAY"
     max_affordable: bool = True
     entry_cutoff: str = "15:00"
@@ -114,7 +134,12 @@ class Algo2Config(AlgoConfig):
     status_report_minutes: int = 5
     max_hold_minutes: int = 0         # 0 = off; else exit if T1 not reached within this many minutes
     oi_velocity_spike: float = 10.0
-    min_score: int = 7                # entry needs every gate + at least this many score conditions
+    min_score: int = 17               # entry needs every gate + at least this many score conditions
+    score_model: str = "v5"           # "v5" = 24-feature score (backtest May-Nov 2026); "classic" = 10 checks
+    sl_candle_minutes: int = 15       # stop = low/high of the last closed N-min candle (aligned 09:15)
+    expiry_block: str = "10:45-11:45"  # v5 gate: no entries in these windows on expiry day ("" = off)
+    first_touch_only: bool = True     # evaluate each 5-min candle breakout once per side (as backtested)
+    atm_fallback: bool = True         # ITM unaffordable / funds-rejected -> buy the ATM strike at once
     config_version: int = 3
     data_sl: bool = False
     data_sl_gap_pct: float = 10.0
@@ -276,6 +301,18 @@ class Algo2Engine(AlgoEngine):
             self.cfg.protective_sl = False
             self.cfg.config_version = CONFIG_VERSION
             self._persist()
+        if version < 5:
+            # One-time move to the v5 rules chosen on 2026-11-16 (6-month backtest, live by owner request).
+            self.cfg.indices, self.cfg.score_model, self.cfg.min_score = ["NIFTY"], "v5", 17
+            self.cfg.sl_candle_minutes, self.cfg.expiry_block = 15, "10:45-11:45"
+            self.cfg.first_touch_only = self.cfg.atm_fallback = self.cfg.max_affordable = True
+            self.cfg.trade_windows, self.cfg.entry_cutoff, self.cfg.exit_time = "09:45-15:00", "15:00", "15:15"
+            self.cfg.oi_wall_target = self.cfg.partial_booking = self.cfg.capital_sl_cap = False
+            self.cfg.stop_after_sl = self.cfg.trade_limit = self.cfg.data_sl = False
+            self.cfg.max_hold_minutes = 0
+            self.cfg.conditions = {**(self.cfg.conditions or {}), **{k: True for k in v5.FEATURES}}
+            self.cfg.config_version = CONFIG_VERSION
+            self._persist()
 
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         patch = dict(patch or {})
@@ -285,7 +322,8 @@ class Algo2Engine(AlgoEngine):
         patch["protective_sl"] = False
         patch["config_version"] = CONFIG_VERSION
         if isinstance(patch.get("conditions"), dict):
-            patch["conditions"] = {**patch["conditions"], **{k: True for k in GATE_CONDITIONS}}
+            model = patch.get("score_model") or self.cfg.score_model
+            patch["conditions"] = {**patch["conditions"], **{k: True for k in model_gates(model)}}
         merged = {**asdict(self.cfg), **{k: v for k, v in patch.items() if v is not None}}
         validate_algo2_config(merged)
         return super().set_config(patch)
@@ -361,6 +399,73 @@ class Algo2Engine(AlgoEngine):
         if isinstance(pos, Algo2Position) and not pos.t1_spot:
             pos.t1_spot = pos.target_spot
             self._persist()
+
+    # ------------------------------------------------------ ITM -> ATM fallback
+    @staticmethod
+    def funds_problem(leg: DayLeg) -> Optional[str]:
+        """Why the ITM entry failed for money (sizing or broker funds rejection), else None."""
+        note, error = leg.note or "", leg.error or ""
+        if leg.status == "skipped" and "insufficient balance" in note:
+            return note
+        if leg.status in ("watching", "error") and base._FUNDS_REJECT.search(f"{error} {note}"):
+            return error or note
+        return None
+
+    async def _prepare_atm_contract(self, leg: DayLeg, direction: str) -> bool:
+        """Switch ``leg`` to the strike nearest to spot (same side) and wait briefly for its premium."""
+        inst = get_index(leg.index_key)
+        snap = base.chain_engine.snapshot(leg.index_key) or {}
+        rows = [r for r in snap.get("rows") or [] if _as_int((r.get("ce" if direction == "CALL" else "pe")
+                                                               or {}).get("securityId"))]
+        spot = self._group_ref.data.spot(leg.index_key) or leg.spot or float(snap.get("underlyingLtp") or 0)
+        if inst is None or not rows or not spot:
+            leg.note = "ATM fallback: option chain/spot not ready"
+            return False
+        row = min(rows, key=lambda r: abs(float(r["strike"]) - spot))
+        if leg.strike is not None and abs(float(row["strike"]) - float(leg.strike)) < 1e-6:
+            leg.note = "ATM fallback: ATM strike is the same contract"
+            return False
+        node = row["ce" if direction == "CALL" else "pe"]
+        sec = _as_int(node.get("securityId"))
+        segment = self._segment_for(leg.index_key)
+        feed.subscribe(sec, inst.derivative_segment)
+        leg.strike, leg.security_id, leg.prepared_side = float(row["strike"]), sec, direction
+        leg.option_ltp = _as_float(node.get("ltp"))
+        for _ in range(30):
+            age = feed.age(sec, segment)
+            if feed.price(sec, segment) is not None and age is not None and age <= MAX_PRICE_AGE:
+                return True
+            await asyncio.sleep(0.1)
+        return True   # _enter reports the stale premium itself
+
+    async def enter_atm(self, leg: DayLeg, direction: str, reason: str) -> bool:
+        """ITM could not be bought for lack of funds: buy max lots of the ATM strike right away."""
+        if not self.cfg.atm_fallback or self._position is not None or getattr(leg, "_atm_tried", False):
+            return False
+        object.__setattr__(leg, "_atm_tried", True)
+        itm = int(leg.strike or 0)
+        if not await self._prepare_atm_contract(leg, direction):
+            self._log(f"{leg.index_key} {direction}: ITM {itm} unaffordable and {leg.note}", level="warn")
+            return False
+        leg.status, leg.note, leg.error, leg.signal, leg.lot_cap = "watching", "", "", None, None
+        leg.funds_retries = max(1, leg.funds_retries)   # accepted signal: no breakout recheck
+        self._log(f"{leg.index_key} {direction}: ITM {itm} not affordable ({reason.strip()[:140]}) -> "
+                  f"buying ATM {int(leg.strike)} {'CE' if direction == 'CALL' else 'PE'} now (max lots)",
+                  level="warn", index=leg.index_key)
+        await self._enter(leg, direction)
+        return True
+
+    async def _retry_after_delayed_reject(self, pos: Position) -> bool:
+        if await super()._retry_after_delayed_reject(pos):
+            return True
+        leg = self._legs.get(pos.index_key)
+        if leg is None or leg.status != "error" or not self.enabled or pos.dry_run or self._position is not None:
+            return False
+        now = now_ist()
+        if (now.hour * 60 + now.minute >= self._cutoff_min(now) or not base._FUNDS_REJECT.search(leg.note or "")
+                or time.time() - (pos.entry_ts or 0) > base.FUNDS_RETRY_WINDOW):
+            return False
+        return await self.enter_atm(leg, pos.option_type, leg.note)
 
     # ------------------------------------------------- priority over Algo 1
     def _algo1_blocking_position(self) -> Optional[Position]:
@@ -678,7 +783,18 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
                             ("status_report_minutes", 0, 60)):
         if not isinstance(cfg.get(name), int) or not low <= cfg[name] <= high:
             raise HTTPException(400, f"{name} must be an integer between {low} and {high}")
-    score_total = len(CONDITIONS) - len(GATE_CONDITIONS)
+    score_total = len(model_conditions(cfg.get("score_model"))) - len(model_gates(cfg.get("score_model")))
+    if cfg.get("score_model") not in SCORE_MODELS:
+        raise HTTPException(400, f"score_model must be one of {SCORE_MODELS}")
+    if cfg.get("sl_candle_minutes") not in (5, 10, 15):
+        raise HTTPException(400, "sl_candle_minutes must be 5, 10 or 15")
+    for name in ("first_touch_only", "atm_fallback"):
+        if not isinstance(cfg.get(name), bool):
+            raise HTTPException(400, f"{name} must be true/false")
+    try:
+        parse_windows(cfg.get("expiry_block") or "")
+    except ValueError as exc:
+        raise HTTPException(400, f"expiry_block: {exc}") from exc
     if not isinstance(cfg.get("min_score"), int) or isinstance(cfg.get("min_score"), bool) \
             or not 0 <= cfg["min_score"] <= score_total:
         raise HTTPException(400, f"min_score must be an integer between 0 and {score_total}")
@@ -759,7 +875,8 @@ class Algo2History:
         return {**{k: m.get(k) for k in ("spot", "candle", "triggerUp", "triggerDown", "breakout", "netDelta",
                                          "netDeltaPrev", "netGex", "pcr", "oiVelocity", "hsmi", "heavyweights",
                                          "vwap", "profile", "futures", "basis", "vixMovePct", "chainRows")},
-                "score": m.get("score"), "checks": {s: checks(s) for s in ("CALL", "PUT")}}
+                "score": m.get("score"), "checks": {s: checks(s) for s in ("CALL", "PUT")},
+                "v5": {k: v for k, v in (m.get("v5") or {}).items() if k != "features"} or None}
 
     def breakout(self, now: datetime, key: str, side: str, m: Dict[str, Any], taken: bool,
                  blockers: List[str]) -> None:
@@ -840,6 +957,11 @@ class Algo2Group:
         self.metrics: Dict[str, Dict[str, Any]] = {}
         self.last_signal: Optional[Dict[str, Any]] = None
         self._attempted: Dict[str, Tuple[float, str]] = {}
+        self._touched: Dict[str, set] = {}
+        self._touched_day: Optional[str] = None
+        self._maxpain: Dict[Tuple[str, str], float] = {}
+        self._presubscribed_at = 0.0
+        self.v5ctx = v5.DailyContext(os.path.join(directory, "v5_context"))
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._dispatching = False
@@ -1048,7 +1170,7 @@ class Algo2Group:
             return "sl_stop"
         if self.trades_done(now.date().isoformat()):
             return "trades_done"
-        if self.news.is_news_freeze_active(now)[0]:
+        if self.cfg.score_model != "v5" and self.news.is_news_freeze_active(now)[0]:
             return "news_freeze"
         if not self.in_window(minute) or minute >= self.master._cutoff_min(now):
             return "waiting_window"
@@ -1091,14 +1213,19 @@ class Algo2Group:
             return f"News freeze: {self.news.is_news_freeze_active(now)[1]} - no entries until it clears."
         if phase == "waiting_window":
             return f"No trade at this time ({self.cfg.trade_windows}); {self._next_window_text(minute)}."
-        return ("Scanning: entry when spot breaks the last 5-min candle, all 4 gates pass and the score is at least "
-                f"{self.cfg.min_score}/10; {self._next_window_text(minute)}.")
+        gates = len(model_gates(self.cfg.score_model))
+        total = len(model_conditions(self.cfg.score_model)) - gates
+        return (f"Scanning: entry when spot breaks the last 5-min candle, all {gates} gates pass and the score is at "
+                f"least {self.cfg.min_score}/{total}; {self._next_window_text(minute)}.")
+
+    def _labels(self) -> Dict[str, str]:
+        return dict(model_conditions(self.cfg.score_model))
 
     def _index_line(self, key: str) -> Optional[str]:
         m = self.metrics.get(key)
         if not m:
             return None
-        labels = dict(CONDITIONS)
+        labels = self._labels()
         parts = [f"{key} {m['spot']:,.1f}" if m.get("spot") else key]
         if m.get("triggerUp") is not None:
             parts.append(f"CALL above {m['triggerUp']:,.1f} / PUT below {m['triggerDown']:,.1f}")
@@ -1171,7 +1298,7 @@ class Algo2Group:
         if self._blocked_logged.get(key) == (bar, side):
             return
         self._blocked_logged[key] = (bar, side)
-        labels = dict(CONDITIONS)
+        labels = self._labels()
         failing = ", ".join(labels.get(b, b).split(" (")[0] for b in blockers[:4])
         more = f" +{len(blockers) - 4}" if len(blockers) > 4 else ""
         self._blocked_recent.append(f"{key} {side} @ {m.get('spot') or 0:,.1f} (fail: {failing}{more})")
@@ -1209,19 +1336,29 @@ class Algo2Group:
         await self.data.ensure_futures(today)
         await self.news.refresh_nse(HEAVYWEIGHT_IDS.keys(), today)
         await self.data.poll_quotes(indices)
+        v5_on = self.cfg.score_model == "v5"
+        if v5_on:
+            self.v5ctx.schedule(now)
+            warn = self.v5ctx.warning(now)
+            if warn:
+                self.master._log(warn, level="warn")
         for key in indices:
             await self.data.refresh_candles(key, now)
+            if v5_on:
+                await self.data.refresh_fut_1m(key, now)
             self.data.sample_chain(key, self.data.spot(key), self.cfg.oi_strikes)
             self.metrics[key] = self.compute_metrics(key, now)
             self.history.chain_snapshot(now, key, self.data.spot(key), self.data.futures_price(key),
                                         self.data.chain_expiry(key), self.data.chain_rows(key))
         self.history.on_tick(now, self.metrics)
         self._notify_updates(now)
-        if self.has_position() or not self.enabled or self._dispatching:
-            return
-        if self.trades_done(today.isoformat()):
-            return
-        if self.sl_hit_today(today.isoformat()):
+        self._presubscribe(indices)
+        if self._touched_day != today.isoformat():
+            self._touched, self._touched_day = {}, today.isoformat()
+        busy = (self.has_position() or not self.enabled or self._dispatching
+                or self.trades_done(today.isoformat()) or bool(self.sl_hit_today(today.isoformat())))
+        first_touch = v5_on and self.cfg.first_touch_only
+        if busy and not first_touch:
             return
         for key in indices:
             m = self.metrics.get(key) or {}
@@ -1229,15 +1366,47 @@ class Algo2Group:
             if not side:
                 continue
             bar = float((m.get("candle") or {}).get("t") or 0)
+            touched = self._touched.setdefault(key, set())
+            if first_touch:
+                if (bar, side) in touched:
+                    continue
+                if busy:
+                    touched.add((bar, side))   # backtest: one position at a time, touches meanwhile are spent
+                    continue
             if self._attempted.get(key) == (bar, side):
                 continue
+            if v5_on and (m.get("v5") or {}).get("stopCandle") is None:
+                continue   # the closing 15-min candle is not published yet: evaluate on the next second
             blockers = self.entry_blockers(m, side, self.cfg.min_score)
+            if v5_on and not blockers and (m["v5"].get("stopDist") or {}).get(side, 0) <= 0:
+                blockers = [f"{self.cfg.sl_candle_minutes}-min SL candle on the wrong side"]
+            if first_touch:
+                touched.add((bar, side))
             if blockers:
                 self._note_blocked(key, side, bar, blockers, m)
                 continue
             self._attempted[key] = (bar, side)
             await self.dispatch(key, side, m)
+            if self._attempted.get(key) is None:
+                touched.discard((bar, side))   # premium not ready: same touch is retried next second
             return
+
+    def _presubscribe(self, indices: List[str]) -> None:
+        """Keep ITM (target delta) and ATM option ticks warm for both sides so entries never wait."""
+        if time.time() - self._presubscribed_at < 30:
+            return
+        self._presubscribed_at = time.time()
+        for key in indices:
+            inst, rows, spot = get_index(key), self.data.chain_rows(key), self.data.spot(key)
+            if inst is None or not rows or not spot:
+                continue
+            for side, leg in (("CALL", "ce"), ("PUT", "pe")):
+                picks = [calc.pick_delta_strike(rows, spot, side, self.cfg.target_delta),
+                         min(rows, key=lambda r: abs(float(r["strike"]) - spot))]
+                for row in picks:
+                    sec = _as_int(((row or {}).get(leg) or {}).get("securityId"))
+                    if sec:
+                        feed.subscribe(sec, inst.derivative_segment)
 
     @staticmethod
     def entry_blockers(m: Dict[str, Any], side: str, min_score: Optional[int] = None) -> List[str]:
@@ -1344,6 +1513,27 @@ class Algo2Group:
                                                        else vix_move > -cfg.vix_spike_pct),
                       fmt(vix_move, 2, "%")),
             ]
+        v5_info = None
+        if cfg.score_model == "v5":
+            # Tri-state (None = input missing -> no point), unlike the classic pass/fail booleans.
+            base_checks: Dict[str, Dict[str, Optional[bool]]] = {}
+            for side in ("CALL", "PUT"):
+                sign = 1 if side == "CALL" else -1
+                same = "ce" if side == "CALL" else "pe"
+                band = (vwap or {}).get("upper" if side == "CALL" else "lower")
+                new_extreme = bool(spot and day_high and spot > day_high) if side == "CALL" else bool(
+                    spot and day_low and spot < day_low)
+                if side == "CALL":
+                    basis_ok = None if basis is None else basis >= 0 and not calc.basis_divergence(new_extreme, basis)
+                else:
+                    basis_ok = None if basis is None or basis_prev is None else basis <= basis_prev
+                base_checks[side] = {
+                    "oi_unwinding": None if vel.get(same) is None else vel[same] < 0,
+                    "vwap_band": None if fut_ltp is None or band is None else sign * (fut_ltp - band) > 0,
+                    "basis": basis_ok,
+                }
+            v5_info, checks = self._v5_checks(key, now, spot, candle, spot_candles, fut_ltp, vwap, rows, near,
+                                              vix, vix_move, in_window, base_checks, fmt)
         score = {s: self.score_summary(checks[s], cfg.min_score) for s in checks}
         return {
             "index": key, "name": inst.name if inst else key, "spot": spot,
@@ -1352,9 +1542,81 @@ class Algo2Group:
             "oiVelocity": vel, "hsmi": hsmi, "heavyweights": changes, "vwap": vwap, "profile": profile,
             "futures": fut_ltp, "basis": basis, "basisPrev": basis_prev, "vixMovePct": vix_move,
             "chainRows": len(rows), "candles": len(spot_candles), "futCandles": len(fut_candles),
-            "checks": checks, "score": score,
+            "checks": checks, "score": score, "v5": v5_info,
             "allPass": {s: score[s]["ready"] for s in checks},
         }
+
+    def expiry_blocked(self, expiry: Optional[date], now: datetime) -> bool:
+        if expiry is None or expiry != now.date():
+            return False
+        minute = now.hour * 60 + now.minute
+        try:
+            return any(s <= minute < e for s, e in parse_windows(self.cfg.expiry_block or ""))
+        except ValueError:
+            return False
+
+    def _v5_checks(self, key: str, now: datetime, spot: Optional[float], candle: Optional[Dict[str, float]],
+                   spot_candles: List[Dict[str, float]], fut_ltp: Optional[float], vwap: Optional[Dict[str, Any]],
+                   rows: List[Dict[str, Any]], near: List[Dict[str, Any]], vix: Optional[Dict[str, float]],
+                   vix_move: Optional[float], in_window: bool, base_checks: Dict[str, Dict[str, Optional[bool]]],
+                   fmt: Any) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+        """v5: 3 gates + 24 scored features; a feature 'passes' when it earns its point."""
+        cfg = self.cfg
+        try:
+            expiry = date.fromisoformat(str(self.data.chain_expiry(key) or "")[:10])
+        except ValueError:
+            expiry = None
+        if rows and expiry is not None:
+            mp_key = (now.date().isoformat(), expiry.isoformat())
+            if mp_key not in self._maxpain:
+                mp = v5.max_pain(rows)
+                if mp is not None:
+                    self._maxpain = {mp_key: mp}
+        maxpain = self._maxpain.get((now.date().isoformat(), expiry.isoformat())) if expiry else None
+        ctx = self.v5ctx.data if self.v5ctx.day == now.date().isoformat() else {}
+        stop = v5.last_closed_candle(spot_candles, now, int(cfg.sl_candle_minutes)) if spot_candles else None
+        blocked = self.expiry_blocked(expiry, now)
+        oi_before = self.data.strike_oi_ago(key, VELOCITY_WINDOW)
+        bank_now = self.data.series_value("IDX_I", BANKNIFTY_ID)
+        bank_15 = self.data.series_value("IDX_I", BANKNIFTY_ID, 900)
+        fut1m = self.data.fut_1m.get(key) or []
+        labels = dict(model_conditions("v5"))
+        checks: Dict[str, List[Dict[str, Any]]] = {}
+        features: Dict[str, Dict[str, Optional[bool]]] = {}
+        stop_dist: Dict[str, float] = {}
+        for side in ("CALL", "PUT"):
+            entry = spot or 0.0
+            if stop and spot:
+                stop_dist[side] = round(spot - stop["low"] if side == "CALL" else stop["high"] - spot, 2)
+            feats = v5.compute_features(
+                side, now=now, entry=entry, spot=entry, ctx=ctx, candle5=candle, spot_candles=spot_candles,
+                fut1m=fut1m, fut_ltp=fut_ltp, vwap5=vwap, rows=rows, near=near, oi_before=oi_before,
+                maxpain=maxpain, expiry=expiry, vix_open=(vix or {}).get("open") or None, bank_now=bank_now,
+                bank_15=bank_15, base_checks=base_checks[side]) if spot else {k: None for k in v5.FEATURES}
+            features[side] = feats
+
+            def gate(name: str, ok: bool, value: str) -> Dict[str, Any]:
+                return {"key": name, "label": labels[name], "gate": True, "enabled": True, "pass": bool(ok),
+                        "value": value}
+            side_checks = [
+                gate("time_window", in_window, cfg.trade_windows),
+                gate("vix", vix_move is not None and (vix_move < cfg.vix_spike_pct if side == "CALL"
+                                                      else vix_move > -cfg.vix_spike_pct), fmt(vix_move, 2, "%")),
+                gate("expiry_block", not blocked,
+                     f"expiry {expiry.isoformat() if expiry else 'n/a'} block {cfg.expiry_block or 'off'}"),
+            ]
+            for k in v5.FEATURES:
+                raw = feats.get(k)
+                want = "want yes" if k in v5.POS else "want no"
+                side_checks.append({"key": k, "label": labels[k], "gate": False,
+                                    "enabled": bool(cfg.conditions.get(k, True)), "pass": v5.earned(k, raw),
+                                    "value": f"{'n/a' if raw is None else 'yes' if raw else 'no'} ({want})"})
+            checks[side] = side_checks
+        info = {"stopCandle": stop, "stopDist": stop_dist, "slMinutes": cfg.sl_candle_minutes,
+                "maxPain": maxpain, "expiry": expiry.isoformat() if expiry else None, "expiryBlocked": blocked,
+                "contextComplete": self.v5ctx.complete() if ctx else False,
+                "points": {s: v5.points(features[s]) for s in features}, "features": features}
+        return info, checks
 
     @staticmethod
     def score_summary(checks: List[Dict[str, Any]], min_score: int) -> Dict[str, Any]:
@@ -1384,7 +1646,9 @@ class Algo2Group:
                      spot=round(spot, 2))
         rows = self.data.chain_rows(key)
         wall_strike = calc.oi_wall(rows, spot, side, self.cfg.oi_strikes * 2)
-        self.signal_ctx[key] = {"candleHigh": candle["high"], "candleLow": candle["low"], "wall": wall_strike}
+        stop_candle = (m.get("v5") or {}).get("stopCandle") if self.cfg.score_model == "v5" else None
+        sl_from = stop_candle or candle
+        self.signal_ctx[key] = {"candleHigh": sl_from["high"], "candleLow": sl_from["low"], "wall": wall_strike}
         with account_scope("master"):
             await master._prepare_contract(leg, side)
         if leg.prepared_side != side or not leg.security_id:
@@ -1401,9 +1665,11 @@ class Algo2Group:
         passed = ", ".join(c["key"] for c in m["checks"][side] if c["enabled"] and c["pass"] and not c.get("gate"))
         self.history.breakout(now_ist(), key, side, m, taken=True, blockers=[])
         limit = f"/{self.cfg.max_trades}" if self.cfg.trade_limit else ""
+        sl_text = (f"SL {self.cfg.sl_candle_minutes}-min candle {'low' if side == 'CALL' else 'high'} "
+                   f"{sl_from['low'] if side == 'CALL' else sl_from['high']:,.1f}")
         master._log(f"SIGNAL {key} {side} (trade {trade_no}{limit}): spot {spot:,.1f} broke 5-min "
                     f"candle {'high' if side == 'CALL' else 'low'} {leg.or_high if side == 'CALL' else leg.or_low:,.1f}; "
-                    f"T1 wall {wall_strike or '1:2 R:R'}; gates OK, score {s['passed']}/{s['total']} "
+                    f"{sl_text}; T1 wall {wall_strike or '1:2 R:R'}; gates OK, score {s['passed']}/{s['total']} "
                     f"(need {s['need']}) [{passed}] -> "
                     f"{','.join(self.entry_accounts)}", level="success", index=key)
         signal = asdict(leg)
@@ -1432,6 +1698,10 @@ class Algo2Group:
                                 if engine._position is not None or "insufficient balance" not in (local.note or ""):
                                     break
                                 await asyncio.sleep(PRIORITY_POLL_SECONDS)
+                        if engine._position is None and engine.funds_problem(local):
+                            reason = engine.funds_problem(local) or ""
+                            if await engine.enter_atm(local, side, reason):
+                                consumed = True
                         if engine._position is not None or local.entry_attempts > 0:
                             consumed = True
                         elif local.note:
@@ -1476,7 +1746,9 @@ class Algo2Group:
             "phase": self.master.phase if self.master.enabled or self.master._position else (
                 self.flat_phase() if self.enabled else "off"),
             "config": asdict(self.cfg),
-            "conditionCatalog": [{"key": k, "label": label, "gate": k in GATE_CONDITIONS} for k, label in CONDITIONS],
+            "conditionCatalog": [{"key": k, "label": label, "gate": k in model_gates(self.cfg.score_model)}
+                                 for k, label in model_conditions(self.cfg.score_model)],
+            "v5Context": self.v5ctx.status(),
             "metrics": self.metrics,
             "news": self.news.status(now),
             "data": self.data.status(),

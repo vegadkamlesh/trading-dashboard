@@ -4,7 +4,7 @@ import os
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
@@ -15,6 +15,7 @@ from app.algo2 import calculations as calc
 from app.algo2 import daily_cache
 from app.algo2 import engine as engine_module
 from app.algo2 import microstructure as micro
+from app.algo2 import score_v5 as v5
 from app.algo2.engine import Algo2Group, Algo2Position, parse_windows, validate_algo2_config
 from app.algo2.market_data import Series, parse_candles, resolve_futures_from_csv
 from app.algo2.news_events import NewsEventFetcher
@@ -38,6 +39,75 @@ CHAIN = [
     chain_row(23550, 6000, 1500, 0.30, -0.70),
     chain_row(23600, 9000, 500, 0.15, -0.85),
 ]
+
+
+class ScoreV5Tests(unittest.TestCase):
+    def candles(self, day, n, start=(9, 15)):
+        t0 = datetime(day.year, day.month, day.day, *start, tzinfo=v5.IST).timestamp()
+        return [{"t": t0 + i * 300, "open": 100 + i, "high": 110 + i, "low": 90 + i, "close": 105 + i}
+                for i in range(n)]
+
+    def test_points_missing_data_earns_nothing(self):
+        feats = {k: None for k in v5.FEATURES}
+        self.assertEqual(v5.points(feats), 0)
+        feats.update(oi_unwinding=True, vwap_band=False, basis=True, f08_vix_low=False)
+        self.assertEqual(v5.points(feats), 2)
+        self.assertEqual(len(v5.FEATURES), 24)
+
+    def test_fifteen_minute_stop_candle_needs_all_parts(self):
+        day = date(2026, 11, 16)
+        c = self.candles(day, 12)                       # 09:15 .. 10:10 closed 5-min candles
+        now = datetime(2026, 11, 16, 10, 15, 2, tzinfo=v5.IST)
+        got = v5.last_closed_candle(c, now, 15)
+        self.assertEqual((got["open"], got["high"], got["low"], got["close"]), (109, 121, 99, 116))
+        self.assertIsNone(v5.last_closed_candle(c[:-1], now, 15))   # 10:10 bar not published yet
+        self.assertEqual(v5.last_closed_candle(c[:-1], now.replace(minute=13), 15)["low"], 96)
+        self.assertIs(v5.last_closed_candle(c, now, 5), c[-1])
+
+    def test_orb_range_and_max_pain(self):
+        day = date(2026, 11, 16)
+        c = self.candles(day, 9)
+        now = datetime(2026, 11, 16, 10, 0, tzinfo=v5.IST)
+        self.assertEqual(v5.range_between(c, now, 555, 585), (115, 90))
+        self.assertIsNone(v5.range_between(c[:5], now, 555, 585))
+        rows = [{"strike": k, "ce": {"prevOi": ce}, "pe": {"prevOi": pe}}
+                for k, ce, pe in ((23400, 10, 900), (23450, 50, 500), (23500, 300, 300), (23550, 600, 40),
+                                  (23600, 900, 10))]
+        self.assertEqual(v5.max_pain(rows), 23500.0)
+
+    def test_participant_and_global_cues(self):
+        csv_text = ('"Participant wise Open Interest"\nClient Type,Future Index Long,Future Index Short\n'
+                    "Client,150000,90000\nDII,1,2\n")
+        self.assertEqual(v5.parse_participant(csv_text), 60000.0)
+        self.assertIsNone(v5.parse_participant("<html>blocked</html>"))
+        utc = timezone.utc
+        series = [(datetime(2026, 11, d, 21, 0, tzinfo=utc).timestamp(), c)
+                  for d, c in ((11, 100.0), (12, 102.0), (13, 101.0))]
+        self.assertAlmostEqual(v5.daily_change(series, date(2026, 11, 16)), (101 - 102) / 102 * 100)
+        es = [(datetime(2026, 11, 13, 9, 0, tzinfo=utc).timestamp(), 6000.0),
+              (datetime(2026, 11, 13, 10, 0, tzinfo=utc).timestamp(), 6100.0),
+              (datetime(2026, 11, 16, 3, 0, tzinfo=utc).timestamp(), 6060.0),
+              (datetime(2026, 11, 16, 4, 0, tzinfo=utc).timestamp(), 7000.0)]
+        self.assertAlmostEqual(v5.es_overnight(es, date(2026, 11, 13), date(2026, 11, 16)), 1.0)
+
+    def test_features_side_mirroring(self):
+        now = datetime(2026, 11, 16, 10, 7, tzinfo=v5.IST)
+        c = self.candles(now.date(), 10)
+        ctx = {"prevDay": {"high": 120.0, "low": 80.0, "close": 100.0}, "vixOpens": [15.0] * 20,
+               "clientChange": -5000.0, "global": {"esOvernight": 0.5, "spx": -0.2, "usvix": 3.0, "inr": -0.1}}
+        kw = dict(now=now, entry=130.0, spot=130.0, ctx=ctx, candle5=c[-1], spot_candles=c, fut1m=[],
+                  fut_ltp=None, vwap5=None, rows=[], near=[], oi_before=None, maxpain=110.0,
+                  expiry=date(2026, 11, 17), vix_open=14.0, bank_now=50100.0, bank_15=50000.0,
+                  base_checks={"oi_unwinding": True, "vwap_band": False, "basis": True})
+        call, put = v5.compute_features("CALL", **kw), v5.compute_features("PUT", **kw)
+        self.assertTrue(call["x_orb_break"] and call["f06_prev_break"] and call["f02_day_dir"])
+        self.assertFalse(put["x_orb_break"] or put["f06_prev_break"] or put["f02_day_dir"])
+        self.assertEqual((call["f16_toward_maxpain"], put["f16_toward_maxpain"]), (False, True))
+        self.assertEqual((call["f17_client_contra"], put["f17_client_contra"]), (True, False))
+        self.assertEqual((call["f22_usvix_down"], put["f22_usvix_down"]), (False, True))
+        self.assertTrue(call["f08_vix_low"] and call["f09_dte_le1"])
+        self.assertIsNone(call["x_flow_delta"])
+        self.assertIsNone(call["f03_vwap_side"])
 
 
 class NewsFreezeTests(unittest.TestCase):
@@ -349,6 +419,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_blocked_breakout_goes_into_next_report_not_instant(self):
         self.engine.enabled = True
+        self.engine.cfg.score_model = "classic"
         m = {"spot": 23520.0, "triggerUp": 23512.5}
         logs = []
         with patch.object(self.engine, "_log", side_effect=lambda msg, **kw: logs.append(msg)), \
@@ -405,7 +476,10 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_defaults_and_min_score_setting(self):
         cfg = self.engine.cfg
-        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (7, 10.0, 1.0))
+        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (17, 10.0, 1.0))
+        self.assertEqual((cfg.score_model, cfg.indices, cfg.sl_candle_minutes, cfg.expiry_block),
+                         ("v5", ["NIFTY"], 15, "10:45-11:45"))
+        self.assertTrue(cfg.first_touch_only and cfg.atm_fallback and cfg.max_affordable)
         self.assertEqual((cfg.trade_windows, cfg.entry_cutoff, cfg.exit_time), ("09:45-15:00", "15:00", "15:15"))
         self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.trade_limit, cfg.oi_wall_target,
                               cfg.partial_booking, cfg.max_hold_minutes, cfg.protective_sl)))
@@ -414,17 +488,23 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.group.trades_done(today))
             self.engine.set_config({"trade_limit": True})
             self.assertTrue(self.group.trades_done(today))
-        self.engine.set_config({"min_score": 8, "conditions": {"news": False, "pcr_filter": False}})
-        self.assertEqual(self.engine.cfg.min_score, 8)
+        self.engine.set_config({"min_score": 18, "conditions": {"expiry_block": False, "f19_bank_15m": False}})
+        self.assertEqual(self.engine.cfg.min_score, 18)
         self.engine.set_config({"protective_sl": True})
         self.assertFalse(self.engine.cfg.protective_sl)
-        self.assertTrue(self.engine.cfg.conditions["news"])         # gates cannot be switched off
-        self.assertFalse(self.engine.cfg.conditions["pcr_filter"])
-        for bad in (11, -1, 2.5):
+        self.assertTrue(self.engine.cfg.conditions["expiry_block"])   # gates cannot be switched off
+        self.assertFalse(self.engine.cfg.conditions["f19_bank_15m"])
+        for bad in (25, -1, 2.5):
             with self.assertRaises(HTTPException):
                 self.engine.set_config({"min_score": bad})
+        for bad in ({"sl_candle_minutes": 7}, {"score_model": "x"}, {"expiry_block": "11:45-10:45"}):
+            with self.assertRaises(HTTPException):
+                self.engine.set_config(bad)
+        self.engine.set_config({"score_model": "classic", "min_score": 8})
+        with self.assertRaises(HTTPException):
+            self.engine.set_config({"min_score": 11})   # classic scores only 10 conditions
 
-    async def test_old_saved_config_migrates_to_v4(self):
+    async def test_old_saved_config_migrates_to_v5(self):
         saved = {**engine_module.asdict(self.engine.cfg), "oi_velocity_spike": 30.0, "vwap_band_sd": 1.5,
                  "min_score": 6, "trade_windows": "09:45-11:15,13:30-15:00", "data_sl": True,
                  "stop_after_sl": True, "partial_booking": True, "max_hold_minutes": 20}
@@ -434,12 +514,12 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.vwap_band_sd, cfg.min_score, cfg.trade_windows,
-                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 7, "09:45-15:00", 0, 4))
+                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 17, "09:45-15:00", 0, 5))
         self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.partial_booking, cfg.trade_limit,
                               cfg.protective_sl)))
         persist.assert_called()
 
-    async def test_v2_saved_config_migrates_to_v4_keeping_v2_values(self):
+    async def test_v2_saved_config_migrates_to_v5_keeping_v2_values(self):
         saved = {**engine_module.asdict(self.engine.cfg), "config_version": 2, "oi_velocity_spike": 12.0,
                  "min_score": 6, "data_sl": True, "protective_sl": True}
         with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
@@ -447,7 +527,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.min_score, cfg.data_sl, cfg.protective_sl,
-                          cfg.config_version), (12.0, 7, False, False, 4))
+                          cfg.config_version), (12.0, 17, False, False, 5))
 
     async def test_v3_saved_config_disables_broker_protective_sl(self):
         saved = {**engine_module.asdict(self.engine.cfg), "config_version": 3, "protective_sl": True}
@@ -455,8 +535,173 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.engine, "_persist") as persist:
             self.engine._restore()
         self.assertFalse(self.engine.cfg.protective_sl)
-        self.assertEqual(self.engine.cfg.config_version, 4)
-        persist.assert_called_once()
+        self.assertEqual(self.engine.cfg.config_version, 5)
+        persist.assert_called()
+
+    async def test_v4_live_config_moves_to_v5_rules(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "config_version": 4, "indices": ["NIFTY", "SENSEX"],
+                 "score_model": "classic", "min_score": 7, "first_touch_only": False, "atm_fallback": False,
+                 "max_affordable": False, "conditions": {"pcr_filter": False}}
+        for k in ("sl_candle_minutes", "expiry_block"):
+            saved.pop(k)
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist") as persist:
+            self.engine._restore()
+        cfg = self.engine.cfg
+        self.assertEqual((cfg.indices, cfg.score_model, cfg.min_score, cfg.sl_candle_minutes, cfg.expiry_block,
+                          cfg.exit_time, cfg.config_version), (["NIFTY"], "v5", 17, 15, "10:45-11:45", "15:15", 5))
+        self.assertTrue(cfg.first_touch_only and cfg.atm_fallback and cfg.max_affordable)
+        self.assertTrue(all(cfg.conditions[k] for k in v5.FEATURES))
+        persist.assert_called()
+        persist.reset_mock()
+        saved = {**engine_module.asdict(cfg), "min_score": 18}
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist") as persist:
+            self.engine._restore()
+        self.assertEqual(self.engine.cfg.min_score, 18)   # operator edits after v5 are kept
+        persist.assert_not_called()
+
+    def v5_metrics(self, side="CALL", points=17, stop_low=23480.0, bar=1000.0):
+        feats = [{"key": k, "gate": False, "enabled": True, "pass": i < points} for i, k in enumerate(v5.FEATURES)]
+        gates = [{"key": k, "gate": True, "enabled": True, "pass": True} for k in v5.GATES]
+        return {"spot": 23520.0, "breakout": side, "candle": {"t": bar, "high": 23515.0, "low": 23500.0},
+                "triggerUp": 23515.5, "triggerDown": 23499.5,
+                "checks": {"CALL": gates + feats, "PUT": gates + feats},
+                "v5": {"stopCandle": {"high": 23530.0, "low": stop_low},
+                       "stopDist": {"CALL": 23520.0 - stop_low, "PUT": 10.0}}}
+
+    async def run_tick(self, m, busy=False, dispatch_effect=None):
+        g = self.group
+        g.cfg.indices = ["NIFTY"]
+        with patch.object(engine_module, "now_ist", return_value=datetime(2026, 11, 16, 10, 7, 30,
+                                                                         tzinfo=algo_module.IST)), \
+                patch.object(g, "_data_needed", return_value=True), \
+                patch.object(g.data, "ensure_futures", new_callable=AsyncMock), \
+                patch.object(g.news, "refresh_nse", new_callable=AsyncMock), \
+                patch.object(g.data, "poll_quotes", new_callable=AsyncMock), \
+                patch.object(g.data, "refresh_candles", new_callable=AsyncMock), \
+                patch.object(g.data, "refresh_fut_1m", new_callable=AsyncMock), \
+                patch.object(g.v5ctx, "schedule"), patch.object(g, "_presubscribe"), \
+                patch.object(g, "compute_metrics", return_value=m), \
+                patch.object(g, "has_position", return_value=busy), \
+                patch.object(g, "dispatch", new_callable=AsyncMock, side_effect=dispatch_effect) as dispatch, \
+                patch.object(g, "_note_blocked") as blocked:
+            g.master.enabled = True
+            await g.tick()
+        return dispatch, blocked
+
+    async def test_v5_first_touch_only_and_touches_while_holding_are_spent(self):
+        dispatch, _ = await self.run_tick(self.v5_metrics(), busy=True)
+        dispatch.assert_not_awaited()
+        dispatch, _ = await self.run_tick(self.v5_metrics())        # same candle after the exit: not re-entered
+        dispatch.assert_not_awaited()
+        dispatch, _ = await self.run_tick(self.v5_metrics(bar=1300.0))
+        dispatch.assert_awaited_once()
+        self.group._attempted.clear()
+        dispatch, _ = await self.run_tick(self.v5_metrics(bar=1300.0))   # second touch of the same candle
+        dispatch.assert_not_awaited()
+
+    async def test_v5_blocked_first_touch_is_not_retried(self):
+        dispatch, blocked = await self.run_tick(self.v5_metrics(points=16))
+        dispatch.assert_not_awaited()
+        self.assertIn("score 16/24 < 17", blocked.call_args.args[3])
+        dispatch, blocked = await self.run_tick(self.v5_metrics(points=20))   # score improves later: still spent
+        dispatch.assert_not_awaited()
+        blocked.assert_not_called()
+
+    async def test_v5_waits_for_stop_candle_and_rejects_wrong_side_stop(self):
+        m = self.v5_metrics()
+        m["v5"]["stopCandle"] = None
+        dispatch, blocked = await self.run_tick(m)
+        dispatch.assert_not_awaited()
+        blocked.assert_not_called()                                   # not spent: re-evaluated next second
+        dispatch, blocked = await self.run_tick(self.v5_metrics(stop_low=23525.0))
+        dispatch.assert_not_awaited()
+        self.assertIn("15-min SL candle on the wrong side", blocked.call_args.args[3])
+
+    async def test_v5_premium_not_ready_keeps_touch_for_retry(self):
+        async def not_ready(key, side, m):
+            self.group._attempted.pop(key, None)                      # what _dispatch does on a stale premium
+        dispatch, _ = await self.run_tick(self.v5_metrics(), dispatch_effect=not_ready)
+        dispatch.assert_awaited_once()
+        dispatch, _ = await self.run_tick(self.v5_metrics())
+        dispatch.assert_awaited_once()                                # same touch retried
+        self.group._attempted.clear()
+        dispatch, _ = await self.run_tick(self.v5_metrics())
+        dispatch.assert_not_awaited()                                 # a real dispatch spends the touch
+
+    async def test_v5_missing_futures_data_earns_no_points(self):
+        g = self.group
+        now = datetime(2026, 11, 16, 10, 0, 5, tzinfo=algo_module.IST)
+        t0 = now.replace(hour=9, minute=15, second=0).timestamp()
+        g.data.spot_candles["NIFTY"] = [{"t": t0 + i * 300, "open": 23400.0, "high": 23420.0, "low": 23390.0,
+                                         "close": 23410.0} for i in range(9)]
+        with patch.object(g.data, "spot", return_value=23500.0), \
+                patch.object(g.data, "chain_rows", return_value=CHAIN), \
+                patch.object(g.data, "futures_price", return_value=None):
+            m = g.compute_metrics("NIFTY", now)
+        for side in ("CALL", "PUT"):
+            feats = m["v5"]["features"][side]
+            self.assertEqual((feats["vwap_band"], feats["basis"], feats["oi_unwinding"]), (None, None, None))
+            self.assertEqual(m["score"][side]["passed"], v5.points(feats))
+            self.assertEqual(m["score"][side]["total"], 24)
+        self.assertEqual(m["v5"]["stopCandle"]["low"], 23390.0)
+
+    async def test_expiry_block_only_on_expiry_day_inside_window(self):
+        g = self.group
+        exp = date(2026, 11, 17)
+        self.assertTrue(g.expiry_blocked(exp, datetime(2026, 11, 17, 10, 45)))
+        self.assertTrue(g.expiry_blocked(exp, datetime(2026, 11, 17, 11, 44)))
+        self.assertFalse(g.expiry_blocked(exp, datetime(2026, 11, 17, 11, 45)))
+        self.assertFalse(g.expiry_blocked(exp, datetime(2026, 11, 16, 11, 0)))
+        self.assertFalse(g.expiry_blocked(None, datetime(2026, 11, 17, 11, 0)))
+
+    async def test_atm_fallback_when_itm_unaffordable(self):
+        eng = self.engine
+        eng.enabled = True
+        leg = DayLeg("NIFTY", status="watching", or_high=23515.5, or_low=23499.5, strike=23250.0, security_id=1,
+                     spot=23520.0, expiry="2026-11-17", prepared_side="CALL")
+        leg.status, leg.note = "skipped", "insufficient balance: Rs15,000 < 1 lot"
+        self.assertTrue(eng.funds_problem(leg))
+        rows = [{"strike": s, "ce": {"securityId": int(s), "ltp": 100.0}, "pe": {"securityId": int(s) + 1}}
+                for s in (23250.0, 23500.0, 23550.0)]
+        entered = []
+
+        async def fake_enter(l, d):
+            entered.append((l.strike, l.security_id, l.status, l.funds_retries))
+        with patch.object(algo_module.chain_engine, "snapshot", return_value={"rows": rows}), \
+                patch.object(self.group.data, "spot", return_value=23520.0), \
+                patch.object(engine_module.feed, "price", return_value=100.0), \
+                patch.object(engine_module.feed, "age", return_value=0.1), \
+                patch.object(eng, "_enter", side_effect=fake_enter), patch.object(eng, "_log"):
+            self.assertTrue(await eng.enter_atm(leg, "CALL", leg.note))
+            self.assertFalse(await eng.enter_atm(leg, "CALL", leg.note))   # only one ATM try per signal
+        self.assertEqual(entered, [(23500.0, 23500, "watching", 1)])
+        broker = DayLeg("NIFTY", status="watching", error="DH-906: Insufficient Funds")
+        self.assertTrue(eng.funds_problem(broker))
+        self.assertIsNone(eng.funds_problem(DayLeg("NIFTY", status="skipped", note="Contract already held")))
+
+    async def test_dispatch_falls_back_to_atm_after_funds_skip(self):
+        g, eng = self.group, self.engine
+        eng.enabled = True
+        g.entry_accounts = ["master"]
+        m = self.v5_metrics()
+
+        async def prep(leg, side):
+            leg.strike, leg.security_id, leg.prepared_side = 23250.0, 1, "CALL"
+
+        async def itm_skip(leg, side):
+            leg.status, leg.note = "skipped", "insufficient balance: Rs9,000"
+        with patch.object(eng, "_prepare_contract", side_effect=prep), \
+                patch.object(eng, "_enter", side_effect=itm_skip), \
+                patch.object(eng, "free_margin_from_algo1", new_callable=AsyncMock, return_value=False), \
+                patch.object(eng, "enter_atm", new_callable=AsyncMock, return_value=True) as atm, \
+                patch.object(engine_module.feed, "price", return_value=100.0), \
+                patch.object(eng, "_log"):
+            await g._dispatch("NIFTY", "CALL", m)
+        atm.assert_awaited_once()
+        self.assertTrue(g.last_signal["consumed"])
+        self.assertEqual(g.signal_ctx["NIFTY"]["candleLow"], 23480.0)   # SL = 15-min candle, not the 5-min one
 
     async def test_breakout_history_records_skip_and_outcome(self):
         hist = self.group.history
