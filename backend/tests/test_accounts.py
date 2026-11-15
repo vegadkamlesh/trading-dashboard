@@ -55,7 +55,8 @@ class Broker:
             order = dict(body, orderId=f"same-id-{len(self.orders) + len(self.supers)}",
                          orderStatus="PENDING" if pending else "TRADED",
                          filledQty=0 if pending else body["quantity"],
-                         averageTradedPrice=100, quantity=body["quantity"])
+                         averageTradedPrice=100, quantity=body["quantity"],
+                         exchangeTime=algo_module.now_ist().strftime("%Y-%m-%d %H:%M:%S"))
             if not pending:
                 self.net += body["quantity"] * (1 if body["transactionType"] == "BUY" else -1)
             if path == "/super/orders":
@@ -81,11 +82,23 @@ class Broker:
                         o["orderStatus"] = "CANCELLED"
             return httpx.Response(200, json={"orderStatus": "CANCELLED"})
         if path == "/positions":
+            held = {("47153", "NSE_FNO"): 0}
+            for o in [*self.orders, *self.supers]:
+                if o.get("filledQty"):
+                    sign = 1 if o["transactionType"] == "BUY" else -1
+                    key = (o["securityId"], o["exchangeSegment"])
+                    held[key] = held.get(key, 0) + sign * o["filledQty"]
+            rows = [dict(securityId=sid, exchangeSegment=segment, productType=self.product,
+                         netQty=qty, buyAvg=100, sellAvg=100, realizedProfit=0, unrealizedProfit=0)
+                    for (sid, segment), qty in held.items()]
+            return httpx.Response(200, json=rows)
+        if path == "/trades":
             return httpx.Response(200, json=[dict(
-                securityId="47153", exchangeSegment="NSE_FNO", productType=self.product,
-                netQty=self.net, buyAvg=100, sellAvg=100,
-                realizedProfit=0, unrealizedProfit=0,
-            )])
+                orderId=o["orderId"], securityId=o["securityId"], exchangeSegment=o["exchangeSegment"],
+                productType=o["productType"], transactionType=o["transactionType"],
+                tradedQuantity=o["filledQty"], tradedPrice=o["averageTradedPrice"],
+                exchangeTime=o["exchangeTime"],
+            ) for o in [*self.orders, *self.supers] if o.get("filledQty")])
         if path == "/fundlimit":
             return httpx.Response(200, json={"availabelBalance": self.balance})
         if path == "/orders":

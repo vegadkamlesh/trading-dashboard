@@ -89,12 +89,52 @@ class LiveSyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wrong_account_event_does_not_invalidate(self):
         self.client._read_cache["/positions"] = (0, [])
-        with self.assertRaises(DhanAPIError):
-            self.client._on_order_update({"Type": "order_alert", "Data": {
-                "ClientId": "wrong-account", "Status": "Traded",
-            }})
+        self.client._on_order_update({"Type": "order_alert", "Data": {
+            "ClientId": "wrong-account", "Status": "Traded", "OrderNo": "o-1",
+        }})
         self.assertIn("/positions", self.client._read_cache)
         self.assertFalse(self.client._refresh_event.is_set())
+        self.assertIsNone(self.client.streamed_order(order_id="o-1"))
+
+    async def test_streamed_fill_answers_order_detail_without_rest_in_any_casing(self):
+        signal = self.client.order_signal()
+        for data in (
+            {"OrderNo": "o-1", "Status": "Traded", "TradedQty": 65, "Quantity": 65, "RemainingQuantity": 0,
+             "AvgTradedPrice": 101.5, "TxnType": "S", "CorrelationId": "A2-X-1", "Product": "I"},
+            {"orderNo": "o-2", "status": "TRADED", "tradedQty": 20, "quantity": 20, "avgTradedPrice": 862.3,
+             "correlationId": "A2-X-2"},
+        ):
+            self.client._on_order_update({"Type": "order_alert", "Data": data})
+        self.assertTrue(signal.is_set())
+        first = await self.client.get_order_by_correlation("A2-X-1")
+        self.assertEqual((first["orderId"], first["orderStatus"], first["filledQty"], first["averageTradedPrice"],
+                          first["transactionType"], first["productType"]),
+                         ("o-1", "TRADED", 65, 101.5, "SELL", "INTRADAY"))
+        self.assertEqual((await self.client.get_order_by_id("o-2"))["averageTradedPrice"], 862.3)
+        self.client._request.assert_not_awaited()
+
+    async def test_stream_never_downgrades_terminal_or_trusts_incomplete_fill(self):
+        alert = lambda **data: self.client._on_order_update({"Type": "order_alert", "Data": data})
+        alert(OrderNo="o-1", Status="Traded", TradedQty=65, Quantity=65, AvgTradedPrice=100)
+        alert(OrderNo="o-1", Status="Pending", TradedQty=0, Quantity=65)
+        self.assertEqual(self.client.streamed_order(order_id="o-1")["orderStatus"], "TRADED")
+        alert(OrderNo="o-2", Status="Traded", TradedQty=65, Quantity=65, AvgTradedPrice=0)
+        alert(OrderNo="o-3", Status="Traded", TradedQty=30, Quantity=65, RemainingQuantity=35, AvgTradedPrice=99)
+        alert(OrderNo="o-4", Status="Pending", TradedQty=0, Quantity=65)
+        for order_id in ("o-2", "o-3", "o-4"):
+            self.assertIsNone(self.client.streamed_order(order_id=order_id), order_id)
+
+    async def test_malformed_alert_does_not_drop_order_stream(self):
+        ws = MagicMock(send=AsyncMock())
+        ws.__aiter__.return_value = ["not-json", json.dumps({"Type": "order_alert", "Data": {
+            "ClientId": self.client._client_id, "OrderNo": "o-9", "Status": "Rejected"}})]
+        context = MagicMock(__aenter__=AsyncMock(return_value=ws), __aexit__=AsyncMock())
+        with patch("app.dhan_client.order_ws_connect", return_value=context), \
+                patch("app.dhan_client.asyncio.sleep", side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.client._order_update_loop()
+        self.assertEqual(self.client.streamed_order(order_id="o-9")["orderStatus"], "REJECTED")
+        self.assertIsNone(self.client._order_error)
 
     async def test_poll_updates_all_resources_even_when_one_fails(self):
         def broker(method, path):

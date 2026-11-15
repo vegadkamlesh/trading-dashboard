@@ -99,6 +99,10 @@ SIGNAL_RETRY_COOLDOWN = 3.0
 # Max-affordable sizing keeps this share of balance usable; the rest covers charges and MARKET slippage.
 AFFORDABLE_BALANCE_PCT = 90.0   # 10% buffer for premium move + Dhan market-order margin
 TERMINAL_ORDERS = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
+# A MARKET exit not TRADED within this many seconds is cancelled and re-sent (Dhan sends options MARKET as LIMIT).
+EXIT_STUCK_SECONDS = 5.0
+# Positions book flat while today's trade book still shows a holding: trust fills once this persists.
+BOOK_MISMATCH_CONFIRM_SECONDS = 3.0
 # Algo's broker-parked disaster SL: trigger when premium has fallen this % from entry.
 # NSE Limit Price Protection rejects option SL prices >40% from LTP (error 17070), so stay inside it.
 ALGO_PROTECTIVE_SL_PCT = 35.0
@@ -272,6 +276,9 @@ class Position:
     partial_exit: bool = False
     protective_cancel_requested: bool = False
     protective_policy_pending: bool = False
+    exit_sent_ts: float = 0.0
+    exit_cancel_requested: bool = False
+    book_mismatch_since: float = 0.0
 
     @property
     def risk_points(self) -> float:
@@ -512,6 +519,79 @@ class AlgoEngine:
             raise DhanAPIError(0, "UNKNOWN_ORDER", "Broker returned no order status; check Dhan.")
         return raw
 
+    async def _trade_book_state(self, pos: Position) -> tuple:
+        """(net qty, average SELL price since entry, qty sold since entry) from today's Dhan trade book."""
+        trades = await get_dhan_client().get_trades()
+        if not isinstance(trades, list):
+            raise DhanAPIError(0, "BAD_TRADES", "Invalid broker trade book; fills unknown.")
+        since = f"{self._day} {pos.entry_time}"
+        net = sold = 0
+        value = 0.0
+        for row in trades:
+            if not isinstance(row, dict) or not (
+                    str(row.get("securityId")) == str(pos.security_id)
+                    and row.get("exchangeSegment") == self._segment_for(pos.index_key)
+                    and row.get("productType") == self.cfg.product_type):
+                continue
+            try:
+                qty = int(row.get("tradedQuantity") or 0)
+            except (TypeError, ValueError) as exc:
+                raise DhanAPIError(0, "BAD_TRADES", "Invalid traded quantity in trade book.") from exc
+            side = str(row.get("transactionType") or "").upper()
+            if side == "BUY":
+                net += qty
+            elif side == "SELL":
+                net -= qty
+                price = _as_float(row.get("tradedPrice"))
+                when = next((str(row[k]).replace("T", " ") for k in ("exchangeTime", "updateTime", "createTime")
+                             if str(row.get(k) or "")[:10] == self._day), "")
+                if when >= since and price:
+                    sold += qty
+                    value += qty * price
+            else:
+                raise DhanAPIError(0, "BAD_TRADES", f"Unknown trade side {side!r} in trade book.")
+        return net, (value / sold if sold else None), sold
+
+    def _release_failed_exit(self, pos: Position, order: Dict[str, Any], status: str,
+                             held: Optional[int] = None) -> None:
+        """Forget a REJECTED/CANCELLED/EXPIRED exit so a fresh SELL is sent for what is still held."""
+        try:
+            filled = max(int(order.get("filledQty") or 0), 0)
+        except (TypeError, ValueError):
+            filled = 0
+        remaining = max(pos.quantity - filled, 0)
+        # The positions book can lag a fill that landed just before the cancel; never re-sell it.
+        new_qty = remaining if held is None else min(held, remaining)
+        own_cancel = pos.exit_cancel_requested
+        pos.execution_error = f"Exit {status}: {order.get('omsErrorDescription') or 'retry after broker sync'}"
+        pos.exit_order_id = pos.exit_correlation_id = None
+        pos.exit_cancel_requested = False
+        pos.execution_state = "open"
+        if new_qty != pos.quantity:
+            pos.entry_quantity = pos.entry_quantity or pos.quantity
+            pos.partial_exit = True
+        pos.quantity = new_qty
+        pos.next_exit_try_at = time.time() + (1.0 if own_cancel and not filled else 3.0)
+        self._log(f"{pos.execution_error[:200]} (filled {filled}) -> exit will be re-sent for {new_qty}",
+                  level="warn")
+
+    async def _cancel_if_exit_stuck(self, pos: Position, status: str) -> None:
+        if (not pos.exit_order_id or pos.exit_cancel_requested or not pos.exit_sent_ts
+                or time.time() - pos.exit_sent_ts < EXIT_STUCK_SECONDS):
+            return
+        pos.exit_cancel_requested = True
+        self._persist()
+        self._log(f"Exit {pos.exit_order_id} still {status} after {EXIT_STUCK_SECONDS:g}s "
+                  f"-> cancelling and re-sending", level="warn")
+        try:
+            await get_dhan_client().cancel_order(str(pos.exit_order_id))
+        except DhanAPIError as exc:
+            # Unconfirmed cancel: allow another attempt after the next stuck window.
+            pos.exit_cancel_requested = False
+            pos.exit_sent_ts = time.time()
+            self._broker_sync_error = exc.error_message
+            self._log(f"Exit cancel failed ({exc.error_message}); will retry", level="warn")
+
     async def _recover_historical_flat(
         self, pos: Position, rows: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
@@ -640,6 +720,8 @@ class AlgoEngine:
         if pos is not None:
             held = net.get(str(pos.security_id), 0)
             self._broker_net_qty = held
+            if held > 0:
+                pos.book_mismatch_since = 0.0
             matching_rows = [
                 row for row in rows if str(row.get("securityId")) == str(pos.security_id)
                 and row.get("exchangeSegment") == self._segment_for(pos.index_key)
@@ -672,6 +754,7 @@ class AlgoEngine:
                 if self._day and self._day < now_ist().date().isoformat() and self.cfg.product_type == "INTRADAY":
                     result["historicalRecovered"] = await self._recover_historical_flat(pos, rows)
                     return result
+                previous_error = pos.execution_error
                 pos.execution_state = "attention"
                 pos.execution_error = "Broker confirms zero holding; verifying outstanding exits/protection. No repeat SELL."
                 # Never clear a position while any SELL may still execute.
@@ -681,26 +764,48 @@ class AlgoEngine:
                 if pos.exit_order_id or pos.exit_correlation_id:
                     try:
                         order = await self._order_state(pos.exit_order_id, pos.exit_correlation_id)
-                        if str(order["orderStatus"]).upper() not in TERMINAL_ORDERS:
+                        status = str(order["orderStatus"]).upper()
+                        if status not in TERMINAL_ORDERS:
+                            await self._cancel_if_exit_stuck(pos, status)
                             pos.execution_error = "Exit still pending at broker; no duplicate SELL will be sent."
                             self._persist()
                             return result
-                        exit_price = _as_float(order.get("averageTradedPrice")) or exit_price
+                        if status == "TRADED":
+                            exit_price = _as_float(order.get("averageTradedPrice")) or exit_price
+                        else:
+                            # Failed exit: release it so the fills check below can drive a fresh SELL.
+                            self._release_failed_exit(pos, order, status)
                     except DhanAPIError as exc:
                         self._broker_sync_error = exc.error_message
                         return result
                 if not exit_price or pos.partial_exit:
-                    matching = [r for r in rows if str(r.get("securityId")) == str(pos.security_id)
-                                and r.get("exchangeSegment") == self._segment_for(pos.index_key)
-                                and r.get("productType") == self.cfg.product_type]
-                    exit_price = next((_as_float(r.get("sellAvg")) for r in matching if r.get("sellAvg")), None) or exit_price
+                    # A flat positions row is not proof of an exit (2026-11-13: it read flat for 4.5h while
+                    # held). Close only on actual SELL fills in today's trade book.
+                    try:
+                        trade_net, sell_avg, sold = await self._trade_book_state(pos)
+                    except DhanAPIError as exc:
+                        self._broker_sync_error = exc.error_message
+                        pos.execution_error = f"Positions show flat but fills unverified ({exc.error_message}); still tracking."
+                        self._persist()
+                        return result
+                    if trade_net != 0 or sold <= 0 or not sell_avg:
+                        message = (f"Dhan positions show 0 but trade book shows net {trade_net} "
+                                   f"(sold since entry {sold}); NOT closing - stop/target/time exit stay active.")
+                        if trade_net > 0:
+                            self._broker_net_qty = trade_net
+                            pos.book_mismatch_since = pos.book_mismatch_since or time.time()
+                        pos.execution_state = "attention"
+                        pos.execution_error = message
+                        if previous_error != message:
+                            self._log(message, level="error")
+                        self._persist()
+                        return result
+                    exit_price = sell_avg
+                pos.book_mismatch_since = 0.0
                 self._log(
-                    f"Reconcile: {pos.index_key} {pos.option_type} no longer held at Dhan "
-                    f"-> marking trade closed", level="warn")
-                self._finalise_position(
-                    pos, exit_price or pos.premium or pos.entry_premium,
-                    pos.exit_reason or "BROKER_CLOSED", estimated=not bool(exit_price),
-                )
+                    f"Reconcile: {pos.index_key} {pos.option_type} flat at Dhan with SELL fill "
+                    f"@ {exit_price:.2f} -> trade closed", level="warn")
+                self._finalise_position(pos, exit_price, pos.exit_reason or "BROKER_CLOSED")
             elif held < 0 or held > pos.quantity:
                 if held < 0:
                     await self._cancel_protective(pos)
@@ -716,14 +821,9 @@ class AlgoEngine:
                     if status in TERMINAL_ORDERS:
                         # A TRADED exit can precede the position book update.
                         if status != "TRADED":
-                            pos.execution_error = f"Exit {status}: {order.get('omsErrorDescription') or 'retry after broker sync'}"
-                            pos.exit_order_id = pos.exit_correlation_id = None
-                            pos.execution_state = "open"
-                            if held != pos.quantity:
-                                pos.entry_quantity = pos.entry_quantity or pos.quantity
-                                pos.partial_exit = True
-                            pos.quantity = held
-                            pos.next_exit_try_at = time.time() + 3.0
+                            self._release_failed_exit(pos, order, status, held)
+                    else:
+                        await self._cancel_if_exit_stuck(pos, status)
                     self._persist()
                 except DhanAPIError as exc:
                     self._broker_sync_error = exc.error_message
@@ -900,6 +1000,13 @@ class AlgoEngine:
 
     # ------------------------------------------------------------ supervisor
     async def _supervisor(self) -> None:
+        try:
+            signal_factory = getattr(get_dhan_client(), "order_signal", None)
+            signal = signal_factory() if callable(signal_factory) else None
+        except DhanAPIError:
+            signal = None
+        if not isinstance(signal, asyncio.Event):
+            signal = None
         while self._running:
             try:
                 await self._tick_supervisor()
@@ -908,7 +1015,16 @@ class AlgoEngine:
             except Exception as exc:  # noqa: BLE001
                 self._last_error = str(exc)
                 logger.exception("account=%s algo supervisor error", self.account_id or current_account())
-            await asyncio.sleep(0.5)
+            if signal is None:
+                await asyncio.sleep(0.5)
+                continue
+            try:
+                await asyncio.wait_for(signal.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            # A broker order alert: reconcile on this tick instead of waiting for the 1s cadence.
+            signal.clear()
+            self._last_reconcile_at = 0.0
 
     async def _tick_supervisor(self) -> None:
         async with self._execution_lock:
@@ -2050,8 +2166,20 @@ class AlgoEngine:
                        and r.get("exchangeSegment") == self._segment_for(pos.index_key)
                        and r.get("productType") == self.cfg.product_type)
             if held == 0:
-                await self._reconcile_locked()
-                return
+                try:
+                    trade_net, _, _ = await self._trade_book_state(pos)
+                except DhanAPIError as exc:
+                    pos.execution_error = f"Exit blocked: positions flat but fills unknown: {exc.error_message}"
+                    self._log(pos.execution_error, level="error")
+                    return
+                confirmed = (pos.book_mismatch_since
+                             and time.time() - pos.book_mismatch_since >= BOOK_MISMATCH_CONFIRM_SECONDS)
+                if trade_net <= 0 or not confirmed:
+                    await self._reconcile_locked()
+                    return
+                self._log(f"Positions book shows 0 but today's fills show {trade_net} held for "
+                          f"{time.time() - pos.book_mismatch_since:.0f}s -> exiting fill quantity", level="error")
+                held = trade_net
             if held < 0 or held > pos.quantity:
                 pos.execution_state = "attention"
                 pos.execution_error = f"Unsafe exit quantity: broker {held}, tracked {pos.quantity}. Check Dhan."
@@ -2071,6 +2199,8 @@ class AlgoEngine:
             correlation_id=pos.exit_correlation_id, tag="exit", dry_run=pos.dry_run,
         )
         pos.exit_order_id = res.get("orderId")
+        pos.exit_sent_ts = time.time()
+        pos.exit_cancel_requested = False
         if not res.get("ok"):
             pos.execution_error = f"Exit not confirmed: {res.get('error')}; position remains tracked."
             self._log(pos.execution_error, level="error")

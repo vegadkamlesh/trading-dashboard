@@ -22,6 +22,7 @@ import math
 import random
 import socket
 import time
+import weakref
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +40,7 @@ logger = logging.getLogger("dhan.client")
 BASE_URL = "https://api.dhan.co/v2"
 
 MOCK_TOKEN_PREFIX = "mock"
+_TERMINAL_STATUSES = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 
 
 def is_mock_token(token: str) -> bool:
@@ -155,6 +157,9 @@ class DhanClient:
         self._order_connected = False
         self._order_error: Optional[str] = None
         self._last_order_event: Optional[float] = None
+        self._order_events: Dict[str, Dict[str, Any]] = {}
+        self._order_events_by_correlation: Dict[str, str] = {}
+        self._order_signals: "weakref.WeakSet[asyncio.Event]" = weakref.WeakSet()
         self._auth_retry_at = 0.0
         self._auth_error: Optional[DhanAPIError] = None
         if self._mock:
@@ -184,20 +189,103 @@ class DhanClient:
             "lastOrderEventAt": self._last_order_event,
         }
 
+    @staticmethod
+    def _event_field(data: Dict[str, Any], *names: str) -> Any:
+        # Dhan's docs show "OrderNo"/"Status" but its own SDK reads "orderNo"/"status": match any casing.
+        lower = {str(key).lower(): value for key, value in data.items()}
+        for name in names:
+            value = lower.get(name.lower())
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _normalise_order_event(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Map a stream alert to the REST order-book field names, or None if identity/status is missing."""
+        field = self._event_field
+        order_id, status = field(data, "OrderNo", "orderId"), field(data, "Status", "orderStatus")
+        if not order_id or not status:
+            return None
+        try:
+            filled = int(float(field(data, "TradedQty", "filledQty") or 0))
+            quantity = int(float(field(data, "Quantity", "quantity") or 0))
+            remaining = int(float(field(data, "RemainingQuantity", "remainingQuantity") or 0))
+            average = float(field(data, "AvgTradedPrice", "averageTradedPrice") or 0)
+        except (TypeError, ValueError):
+            return None
+        status = str(status).strip().upper().replace(" ", "_")
+        if status == "TRADED" and remaining > 0:
+            status = "PART_TRADED"
+        side = str(field(data, "TxnType", "transactionType") or "").upper()
+        product = str(field(data, "Product", "productType") or "").upper()
+        return {
+            "orderId": str(order_id),
+            "correlationId": str(field(data, "CorrelationId", "correlationId") or ""),
+            "orderStatus": status,
+            "transactionType": {"B": "BUY", "S": "SELL"}.get(side, side),
+            "productType": {"I": "INTRADAY", "M": "MARGIN", "C": "CNC"}.get(product, product),
+            "securityId": str(field(data, "SecurityId", "securityId") or ""),
+            "quantity": quantity,
+            "filledQty": filled,
+            "remainingQuantity": remaining,
+            "averageTradedPrice": average,
+            "omsErrorDescription": str(field(data, "ReasonDescription", "omsErrorDescription") or ""),
+            "updateTime": str(field(data, "LastUpdatedTime", "updateTime") or ""),
+            "source": "order_stream",
+            "receivedAt": time.time(),
+        }
+
     def _on_order_update(self, raw: Any) -> None:
-        if not isinstance(raw, dict) or raw.get("Type") != "order_alert":
+        if not isinstance(raw, dict):
             return
         data = raw.get("Data")
-        if not isinstance(data, dict) or str(data.get("ClientId")) != self._client_id:
-            raise DhanAPIError(0, "BAD_ORDER_EVENT", "Order stream identity missing/mismatched; event ignored.")
+        masked = json_codec.dumps(raw, default=str).replace(self._client_id, "<CLIENT>") if self._client_id else \
+            json_codec.dumps(raw, default=str)
+        # Raw payload kept in the account log: the stream schema is verified from real events, not docs.
+        logging.getLogger("dhan.orders").info("account=%s order_stream_raw %s", self.account_id, masked[:4000])
+        if str(raw.get("Type") or "").lower() != "order_alert" or not isinstance(data, dict):
+            return
+        event_client = self._event_field(data, "ClientId", "dhanClientId")
+        if event_client is not None and str(event_client) != self._client_id:
+            logger.warning("account=%s order_stream_event for another client ignored", self.account_id)
+            return
         self._last_order_event = time.time()
         self._read_cache.clear()
         self._refresh_event.set()
         self._order_event.set()
-        logger.info("account=%s external_order_event status=%s; refreshing broker books",
-                    self.account_id, data.get("Status"), extra={
+        order = self._normalise_order_event(data)
+        if order is not None:
+            previous = self._order_events.get(order["orderId"])
+            # Events can arrive out of order: a terminal state is never replaced by an older live state.
+            if not (previous and previous["orderStatus"] in _TERMINAL_STATUSES
+                    and order["orderStatus"] not in _TERMINAL_STATUSES):
+                self._order_events[order["orderId"]] = order
+                if order["correlationId"]:
+                    self._order_events_by_correlation[order["correlationId"]] = order["orderId"]
+                while len(self._order_events) > 500:
+                    self._order_events.pop(next(iter(self._order_events)))
+        for signal in list(self._order_signals):
+            signal.set()
+        logger.info("account=%s order_stream_event order=%s status=%s filled=%s avg=%s",
+                    self.account_id, order and order["orderId"], order and order["orderStatus"],
+                    order and order["filledQty"], order and order["averageTradedPrice"], extra={
                         "telegram_event": "broker_update", "telegram_account": self.account_id,
                     })
+
+    def order_signal(self) -> asyncio.Event:
+        """A private event set on every order-stream alert (one per waiter, so no waiter clears another's)."""
+        signal = asyncio.Event()
+        self._order_signals.add(signal)
+        return signal
+
+    def streamed_order(self, *, order_id: str = "", correlation: str = "") -> Optional[Dict[str, Any]]:
+        """Latest order-stream state with complete terminal fill details, else None (caller uses REST)."""
+        order_id = order_id or self._order_events_by_correlation.get(correlation or "", "")
+        order = self._order_events.get(str(order_id)) if order_id else None
+        if order is None or order["orderStatus"] not in _TERMINAL_STATUSES:
+            return None
+        if order["orderStatus"] == "TRADED" and (order["filledQty"] <= 0 or order["averageTradedPrice"] <= 0):
+            return None
+        return deepcopy(order)
 
     async def _account_poll_once(self) -> None:
         for path, call in (
@@ -243,7 +331,13 @@ class DhanClient:
                     connected_at = time.monotonic()
                     self._refresh_event.set()
                     async for message in ws:
-                        self._on_order_update(json_codec.loads(message))
+                        try:
+                            self._on_order_update(json_codec.loads(message))
+                        except (ValueError, TypeError, KeyError) as exc:
+                            # One malformed alert must never drop the stream (2026-11-13: every alert did).
+                            logger.warning("account=%s order_stream_bad_message type=%s",
+                                           self.account_id, type(exc).__name__)
+                            self._refresh_event.set()
                         if time.monotonic() - connected_at > 30:
                             delay = 1.0
             except asyncio.CancelledError:
@@ -825,6 +919,9 @@ class DhanClient:
         return await self._get_order_detail(f"/orders/external/{correlation_id}", correlation=correlation_id)
 
     async def _get_order_detail(self, path: str, *, order_id: str = "", correlation: str = "") -> Dict[str, Any]:
+        streamed = self.streamed_order(order_id=order_id, correlation=correlation)
+        if streamed is not None:
+            return streamed
         try:
             raw = await self._request("GET", path)
             return self._order_detail(raw, order_id=order_id, correlation=correlation)

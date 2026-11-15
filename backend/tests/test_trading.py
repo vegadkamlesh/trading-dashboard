@@ -358,14 +358,117 @@ class AlgoRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_broker_flat_finalises_even_when_disarmed(self):
         self.engine.enabled = False
         self.client.get_positions.return_value = [{
-            "securityId": "47153", "netQty": 0, "sellAvg": 130,
+            "securityId": "47153", "netQty": 0, "sellAvg": 999,
             "exchangeSegment": "NSE_FNO", "productType": "INTRADAY",
         }]
+        self.client.get_trades = AsyncMock(return_value=[
+            self._fill("BUY", 127.85, "2026-10-14 09:47:08"),
+            self._fill("SELL", 130, "2026-10-14T10:02:00"),
+        ])
         with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 10, tzinfo=algo_module.IST)):
             await self.engine._tick_supervisor()
         self.assertIsNone(self.engine._position)
         self.assertEqual(self.engine._today_trades[0]["exitPremium"], 130)
+        self.assertFalse(self.engine._today_trades[0]["exitPriceEstimated"])
         self.client.place_order.assert_not_awaited()
+
+    @staticmethod
+    def _fill(side, price, when, qty=65):
+        return {"securityId": "47153", "exchangeSegment": "NSE_FNO", "productType": "INTRADAY",
+                "transactionType": side, "tradedQuantity": qty, "tradedPrice": price, "exchangeTime": when}
+
+    async def test_flat_positions_without_sell_fill_never_closes_trade(self):
+        """2026-11-13: positions read flat for 4.5h while held; the trade was closed and SL/15:15 never ran."""
+        pos = self.engine._position
+        self.client.get_positions.return_value = [{
+            "securityId": "47153", "netQty": 0, "exchangeSegment": "NSE_FNO", "productType": "INTRADAY",
+        }]
+        earlier = [self._fill("BUY", 120, "2026-10-14 09:20:00"), self._fill("SELL", 118, "2026-10-14 09:30:00")]
+        self.client.get_trades = AsyncMock(return_value=[*earlier, self._fill("BUY", 127.85, "2026-10-14 09:47:08")])
+        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 10, tzinfo=algo_module.IST)):
+            await self.engine.reconcile()
+            await self.engine.reconcile()
+        self.assertIs(self.engine._position, pos)
+        self.assertEqual(self.engine._today_trades, [])
+        self.assertEqual(pos.execution_state, "attention")
+        self.assertEqual(self.engine._broker_net_qty, 65)
+        self.client.place_order.assert_not_awaited()
+
+        # Stop hits while the positions book is still wrong: sell the quantity today's fills prove is held.
+        pos.book_mismatch_since = time.time() - algo_module.BOOK_MISMATCH_CONFIRM_SECONDS
+        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 10, 58, tzinfo=algo_module.IST)):
+            await self.engine._exit_position(pos, "STOP")
+        self.client.place_order.assert_awaited_once()
+        sell = self.client.place_order.await_args.args[0]
+        self.assertEqual((sell["transactionType"], sell["quantity"]), ("SELL", 65))
+
+    async def test_fresh_book_mismatch_waits_before_selling_on_fills(self):
+        pos = self.engine._position
+        pos.book_mismatch_since = time.time()
+        self.client.get_positions.return_value = []
+        self.client.get_trades = AsyncMock(return_value=[self._fill("BUY", 127.85, "2026-10-14 09:47:08")])
+        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 10, tzinfo=algo_module.IST)):
+            await self.engine._exit_position(pos, "STOP")
+        self.client.place_order.assert_not_awaited()
+        self.assertIs(self.engine._position, pos)
+
+    async def test_stuck_market_exit_is_cancelled_then_resent(self):
+        pos = self.engine._position
+        await self.engine._exit_position(pos, "STOP")
+        self.client.place_order.assert_awaited_once()
+        pos.exit_sent_ts -= algo_module.EXIT_STUCK_SECONDS
+        self.client.get_order_by_id.return_value = {"orderId": "exit-1", "orderStatus": "PENDING"}
+        await self.engine.reconcile()
+        self.client.cancel_order.assert_awaited_once_with("exit-1")
+        self.client.get_order_by_id.return_value = {"orderId": "exit-1", "orderStatus": "CANCELLED", "filledQty": 0}
+        await self.engine.reconcile()
+        self.assertEqual((pos.exit_order_id, pos.execution_state, pos.exit_reason), (None, "open", "STOP"))
+        pos.next_exit_try_at = 0
+        await self.engine._tick_supervisor()
+        self.assertEqual(self.client.place_order.await_count, 2)
+
+    async def test_fill_before_cancel_with_lagging_positions_never_oversells(self):
+        pos = self.engine._position
+        await self.engine._exit_position(pos, "STOP")
+        self.client.get_order_by_id.return_value = {"orderId": "exit-1", "orderStatus": "CANCELLED", "filledQty": 40}
+        await self.engine.reconcile()  # positions still show the stale 65
+        self.assertEqual((pos.quantity, pos.exit_order_id), (25, None))
+        pos.next_exit_try_at = 0
+        await self.engine._exit_position(pos, "STOP")
+        self.assertEqual(self.client.place_order.await_count, 1)
+        self.client.get_positions.return_value[0]["netQty"] = 25
+        await self.engine._exit_position(pos, "STOP")
+        self.assertEqual(self.client.place_order.await_args.args[0]["quantity"], 25)
+
+    async def test_failed_exit_while_positions_flat_is_resent_from_fills(self):
+        pos = self.engine._position
+        pos.exit_order_id, pos.exit_reason = "exit-1", "STOP"
+        self.client.get_order_by_id.return_value = {"orderId": "exit-1", "orderStatus": "REJECTED", "filledQty": 0}
+        self.client.get_positions.return_value = []
+        self.client.get_trades = AsyncMock(return_value=[self._fill("BUY", 127.85, "2026-10-14 09:47:08")])
+        with patch.object(algo_module, "now_ist", return_value=algo_module.datetime(2026, 10, 14, 10, tzinfo=algo_module.IST)):
+            await self.engine.reconcile()
+            self.assertEqual((pos.exit_order_id, pos.execution_state), (None, "attention"))
+            pos.next_exit_try_at = 0
+            pos.book_mismatch_since = time.time() - algo_module.BOOK_MISMATCH_CONFIRM_SECONDS
+            await self.engine._exit_position(pos, "STOP")
+        sell = self.client.place_order.await_args.args[0]
+        self.assertEqual((sell["transactionType"], sell["quantity"]), ("SELL", 65))
+
+    async def test_failed_stuck_exit_cancel_is_retried(self):
+        pos = self.engine._position
+        await self.engine._exit_position(pos, "STOP")
+        self.client.get_order_by_id.return_value = {"orderId": "exit-1", "orderStatus": "PENDING"}
+        self.client.cancel_order.side_effect = [DhanAPIError(500, "DH-905", "timeout"), {"ok": True}]
+        pos.exit_sent_ts -= algo_module.EXIT_STUCK_SECONDS
+        await self.engine.reconcile()
+        self.assertFalse(pos.exit_cancel_requested)
+        await self.engine.reconcile()
+        self.assertEqual(self.client.cancel_order.await_count, 1)
+        pos.exit_sent_ts -= algo_module.EXIT_STUCK_SECONDS
+        await self.engine.reconcile()
+        self.assertEqual(self.client.cancel_order.await_count, 2)
+        self.assertTrue(pos.exit_cancel_requested)
 
     async def test_broker_error_preserves_tracking(self):
         pos = self.engine._position
