@@ -39,7 +39,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
@@ -143,6 +143,11 @@ def _to_min(hhmm: str, default: int) -> int:
 
 def _fmt_min(m: int) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _rs(value: float) -> str:
+    """Signed rupee amount for alerts, e.g. +Rs 2,288 / -Rs 1,150."""
+    return f"{'+' if value >= 0 else '-'}Rs {abs(value):,.0f}"
 
 
 # --------------------------------------------------------------------------- #
@@ -375,20 +380,36 @@ class AlgoEngine:
         return _to_min(self._sess_val("entry_cutoff", now), 15 * 60)
 
     # ------------------------------------------------------------------ log
-    def _log(self, msg: str, level: str = "info", notification: str = "algo_update", **extra: Any) -> None:
+    def _log(self, msg: str, level: str = "info", notification: str = "algo_update", *,
+             telegram: Optional[str] = None, shared: bool = False, **extra: Any) -> None:
+        """Journal + log line; ``telegram`` overrides the Telegram text, ``shared`` sends it once
+        for the whole signal (no master/child label)."""
         msg = f"account={self.account_id or current_account()} {msg}"
         ev = {"kind": "algo", "level": level, "msg": msg, **extra}
         self._events.append(ev)
         if len(self._events) > 400:
             self._events = self._events[-400:]
         self._store.append_event(ev, day=self._day)
+        self._notify(msg, telegram or msg.split(' ', 1)[-1], level=level, notification=notification,
+                     shared=shared)
+
+    def _notify(self, msg: str, detail: str, *, level: str = "info", notification: str = "algo_update",
+                shared: bool = False) -> None:
         getattr(logger, {"warn": "warning"}.get(level, level), logger.info)(msg, extra={
             "telegram_event": notification,
-            "telegram_account": self.account_id or current_account(),
+            "telegram_account": "" if shared else (self.account_id or current_account()),
             "telegram_mode": "DRY-RUN" if self._is_dry() else "LIVE",
-            "telegram_detail": f"{self.ALGO_LABEL} | {msg.split(' ', 1)[-1]}",
+            "telegram_label": self.ALGO_LABEL,
+            "telegram_detail": detail,
             "telegram_level": level,
         })
+
+    def _today_pnl(self) -> Tuple[float, int]:
+        trades = [t for t in self._today_trades if str(t.get("date") or self._day) == str(self._day)]
+        return sum(float(t.get("premiumPnl") or 0) for t in trades), len(trades)
+
+    def _contract_tag(self, leg: Any) -> str:
+        return ""
 
     # ------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -1654,6 +1675,8 @@ class AlgoEngine:
             spot=spot, premium=leg.option_ltp,
         )
         t0 = getattr(self, "_signal_t0", None)
+        ce_pe = "CE" if direction == "CALL" else "PE"
+        tag = self._contract_tag(leg)
         self._log(
             f"BREAKOUT {leg.index_key} {'UP' if direction == 'CALL' else 'DOWN'} @ {spot:,.1f} "
             f"-> BUY {direction} {int(leg.strike)} x{pos.quantity} ({pos.lots} lot) "
@@ -1662,6 +1685,12 @@ class AlgoEngine:
             f"{' [DRY-RUN]' if pos.dry_run else ''}",
             level="success", index=leg.index_key, direction=direction,
             strike=pos.strike, lots=pos.lots, spot=spot, target=pos.target_spot, stop=pos.stop_spot,
+            telegram=(
+                f"⏳ BUY order sending: {leg.index_key} {int(leg.strike)} {ce_pe}{f' ({tag})' if tag else ''}\n"
+                f"Qty {pos.quantity} ({pos.lots} lot{'s' if pos.lots != 1 else ''}) @ ~{leg.option_ltp}\n"
+                f"SL {pos.stop_spot:,.1f} | T1 {pos.target_spot:,.1f} (spot)"
+                + (f"\nFunds: {sizing['reason']}" if sizing.get("reason") else "")
+                + (" [PAPER]" if pos.dry_run else "")),
         )
         leg.status = "active"
         leg.signal = direction
@@ -1808,11 +1837,17 @@ class AlgoEngine:
                 pos.entry_confirmed_ts = time.time()
                 pos.execution_error = ""
                 t0 = getattr(self, "_signal_t0", None)
+                ms = f" (+{(time.perf_counter() - t0) * 1000:.0f}ms since signal)" if t0 else ""
                 self._log(f"Entry confirmed: {pos.index_key} {int(pos.strike)} "
                           f"{'CE' if pos.option_type == 'CALL' else 'PE'} {filled} units @ {average:.2f}"
-                          f"{f' (+{(time.perf_counter() - t0) * 1000:.0f}ms since signal)' if t0 else ''}"
+                          f"{ms}"
                           f" | next: watching profit/loss rule + target, exit {self._sess_val('exit_time')}",
-                          level="success", notification="algo_entry")
+                          level="success", notification="algo_entry",
+                          telegram=(f"✅ BUY FILLED: {pos.index_key} {int(pos.strike)} "
+                                    f"{'CE' if pos.option_type == 'CALL' else 'PE'}\n"
+                                    f"Qty {filled} @ {average:.2f}{ms}\n"
+                                    f"Running: SL {pos.stop_spot:,.1f} | T1 {pos.target_spot:,.1f} (spot) "
+                                    f"| auto-exit {self._sess_val('exit_time')}"))
                 if self.cfg.protective_sl:
                     await self._place_protective_sl(pos)
             elif status != "TRADED" and filled == 0:
@@ -2211,7 +2246,10 @@ class AlgoEngine:
         elif pos.dry_run:
             self._finalise_position(pos, pos.premium or pos.entry_premium, reason)
         else:
-            self._log(f"Exit submitted ({pos.exit_order_id}); waiting for broker flat confirmation.")
+            self._log(f"Exit submitted ({pos.exit_order_id}); waiting for broker flat confirmation.",
+                      telegram=(f"⏳ SELL order sent ({reason}): {pos.index_key} {int(pos.strike)} "
+                                f"{'CE' if pos.option_type == 'CALL' else 'PE'} x{qty}\n"
+                                f"Waiting for the fill at Dhan"))
         self._persist()
 
     def _trade_pnl(self, pos: Position, exit_premium: float) -> float:
@@ -2245,12 +2283,20 @@ class AlgoEngine:
         if pos.dry_run:
             self._paper_balance = getattr(self, "_paper_balance", 100000.0) + gross_premium_pnl
         level = "success" if exit_premium >= pos.entry_premium else "warn"
+        total, count = self._today_pnl()
         self._log(
             f"EXIT {pos.index_key} {pos.option_type} {int(pos.strike)} @ {exit_premium:.2f} "
             f"({reason})  spot {pos.pnl_points:+,.1f} pts  R {pos.r_multiple:+.2f}  "
             f"premium P&L Rs{gross_premium_pnl:,.0f}"
             + ("  [estimated exit price]" if estimated else ""),
             level=level, notification="algo_exit", trade=trade,
+            telegram=(
+                f"{'🟢' if gross_premium_pnl >= 0 else '🔴'} EXIT ({reason}): {pos.index_key} {int(pos.strike)} "
+                f"{'CE' if pos.option_type == 'CALL' else 'PE'}\n"
+                f"Qty {quantity} | Buy {pos.entry_premium:.2f} → Sell {exit_premium:.2f}"
+                + (" (estimated)" if estimated else "") + "\n"
+                f"P/L: {_rs(gross_premium_pnl)} | spot {pos.pnl_points:+,.1f} pts | R {pos.r_multiple:+.2f}\n"
+                f"💰 Today total P/L: {_rs(total)} ({count} trade{'s' if count != 1 else ''})"),
         )
         leg = self._legs.get(pos.index_key)
         if leg:

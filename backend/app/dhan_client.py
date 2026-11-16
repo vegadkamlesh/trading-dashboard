@@ -42,6 +42,25 @@ BASE_URL = "https://api.dhan.co/v2"
 
 MOCK_TOKEN_PREFIX = "mock"
 _TERMINAL_STATUSES = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
+_ORDER_ICONS = {"TRANSIT": "⏳", "PENDING": "⏳", "PART_TRADED": "🟡", "TRADED": "✅",
+                "REJECTED": "❌", "CANCELLED": "✖️", "EXPIRED": "✖️"}
+_ORDER_PURPOSE = {"E": "entry", "X": "exit", "T": "T1 exit", "S": "SL"}
+
+
+def order_alert_text(order: Dict[str, Any]) -> str:
+    """One readable Telegram line for an order-stream update (trading facts only)."""
+    status = str(order.get("orderStatus") or "")
+    parts = str(order.get("correlationId") or "").split("-")
+    purpose = _ORDER_PURPOSE.get(parts[1], "") if len(parts) > 2 else ""
+    purpose = purpose or ("manual" if not parts[0] or parts[0] == "NA" else "")
+    filled, qty = order.get("filledQty") or 0, order.get("quantity") or 0
+    text = (f"{_ORDER_ICONS.get(status, '📡')} Dhan {order.get('transactionType') or ''} "
+            f"{purpose + ' ' if purpose else ''}order: {status.replace('_', '-').title()} | filled {filled}/{qty}")
+    if order.get("averageTradedPrice"):
+        text += f" @ {float(order['averageTradedPrice']):.2f}"
+    if status == "REJECTED" and order.get("omsErrorDescription"):
+        text += f"\nReason: {str(order['omsErrorDescription'])[:200]}"
+    return text.replace("  ", " ")
 
 
 def is_mock_token(token: str) -> bool:
@@ -269,7 +288,8 @@ class DhanClient:
         logger.info("account=%s order_stream_event order=%s status=%s filled=%s avg=%s",
                     self.account_id, order and order["orderId"], order and order["orderStatus"],
                     order and order["filledQty"], order and order["averageTradedPrice"], extra={
-                        "telegram_event": "broker_update", "telegram_account": self.account_id,
+                        "telegram_event": "broker_update" if order else None, "telegram_account": self.account_id,
+                        "telegram_detail": order_alert_text(order) if order else "",
                     })
 
     def order_signal(self) -> asyncio.Event:

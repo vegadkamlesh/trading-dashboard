@@ -141,6 +141,7 @@ def log_order(
 ) -> None:
     account = current_account()
     correlation = (payload or {}).get("correlationId", "-")
+    broker_reason = message
     message = f"account={account} correlation={correlation} {message or ''}"
     try:
         with _connect() as conn:
@@ -166,6 +167,18 @@ def log_order(
     else:
         # Also write a human-readable line to the dedicated orders-*.log file.
         try:
+            pay = payload or {}
+            side = transaction_type or pay.get("transactionType") or ""
+            qty = quantity or pay.get("quantity") or ""
+            what = action.replace("algo_", "").replace("_", " ")
+            if dry_run:
+                alert = f"📝 Paper {side} {what} x{qty} recorded (no real order)"
+            elif success:
+                alert = (f"📨 {side} {what} order placed at Dhan | qty {qty}"
+                         + (f" | id …{str(order_id)[-4:]}" if order_id else "")
+                         + (f" | {status}" if status and status != "None" else ""))
+            else:
+                alert = f"❌ {side} {what} order FAILED | qty {qty}\nReason: {str(broker_reason or status or '-')[:200]}"
             order_logger.info(
                 "%s %s %s %s qty=%s price=%s target=%s sl=%s dryRun=%s success=%s "
                 "orderId=%s status=%s msg=%s",
@@ -179,6 +192,7 @@ def log_order(
                     "telegram_event": "order_success" if success else "order_failed",
                     "telegram_account": account,
                     "telegram_mode": "DRY-RUN" if dry_run else "LIVE",
+                    "telegram_detail": alert.replace("  ", " "),
                 },
             )
         except Exception:

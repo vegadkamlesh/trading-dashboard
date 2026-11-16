@@ -367,7 +367,7 @@ class Algo2Engine(AlgoEngine):
             delta = abs(_as_float((node.get("greeks") or {}).get("delta")) or 0)
             self._log(f"{leg.index_key} contract ready: {int(leg.strike)} {'CE' if side == 'CALL' else 'PE'} "
                       f"(ITM, delta {delta:.2f}) premium ~{leg.option_ltp}",
-                      level="info", index=leg.index_key, side=side, strike=leg.strike)
+                      level="info", notification="journal", index=leg.index_key, side=side, strike=leg.strike)
             return
 
     # ----------------------------------------------------------- levels
@@ -451,9 +451,15 @@ class Algo2Engine(AlgoEngine):
         leg.funds_retries = max(1, leg.funds_retries)   # accepted signal: no breakout recheck
         self._log(f"{leg.index_key} {direction}: ITM {itm} not affordable ({reason.strip()[:140]}) -> "
                   f"buying ATM {int(leg.strike)} {'CE' if direction == 'CALL' else 'PE'} now (max lots)",
-                  level="warn", index=leg.index_key)
+                  level="warn", index=leg.index_key,
+                  telegram=(f"🔁 ITM {itm} not affordable → switching to ATM {int(leg.strike)} "
+                            f"{'CE' if direction == 'CALL' else 'PE'} (max lots)\n"
+                            f"Reason: {reason.strip()[:200]}"))
         await self._enter(leg, direction)
         return True
+
+    def _contract_tag(self, leg: Any) -> str:
+        return "ATM" if getattr(leg, "_atm_tried", False) else "ITM"
 
     async def _retry_after_delayed_reject(self, pos: Position) -> bool:
         if await super()._retry_after_delayed_reject(pos):
@@ -716,10 +722,18 @@ class Algo2Engine(AlgoEngine):
         risk = pos.risk_points
         pos.stop_spot = pos.entry_spot
         pos.target_spot = round(pos.entry_spot + sign * max(2 * risk, sign * (pos.t1_spot - pos.entry_spot) + risk), 2)
+        pnl = (price - pos.entry_premium) * qty
+        booked, _ = self._today_pnl()
         self._log(f"T1 BOOKED {pos.index_key} {pos.option_type} {int(pos.strike)} x{qty} @ {price:.2f} "
-                  f"(Rs{(price - pos.entry_premium) * qty:,.0f}); {pos.quantity} left, stop -> cost "
+                  f"(Rs{pnl:,.0f}); {pos.quantity} left, stop -> cost "
                   f"{pos.stop_spot:,.1f}, T2 {pos.target_spot:,.1f}",
-                  level="success", notification="algo_exit", index=pos.index_key)
+                  level="success", notification="algo_exit", index=pos.index_key,
+                  telegram=(f"🎯 T1 BOOKED: {pos.index_key} {int(pos.strike)} "
+                            f"{'CE' if pos.option_type == 'CALL' else 'PE'}\n"
+                            f"Sold {qty} @ {price:.2f} (buy {pos.entry_premium:.2f}) | P/L {base._rs(pnl)}\n"
+                            f"Running: {pos.quantity} qty | SL → cost {pos.stop_spot:,.1f} | "
+                            f"T2 {pos.target_spot:,.1f} (spot)\n"
+                            f"💰 Today booked P/L: {base._rs(booked + pnl)}"))
         self._persist()
         if pos.quantity > 0 and self.cfg.protective_sl:
             asyncio.ensure_future(self._place_protective_after_t1(pos))
@@ -1049,7 +1063,7 @@ class Algo2Group:
         event = "auto_armed" if on else ("auto_arm_failed" if self.saved_enabled else "algo_disarmed")
         with account_scope("master"):
             self.master._log(msg, level="success" if on else ("error" if self.saved_enabled else "warn"),
-                             notification=event)
+                             notification=event, shared=True)
 
     async def _rearm_after_restart(self) -> None:
         for account in self.entry_accounts:
@@ -1117,7 +1131,7 @@ class Algo2Group:
             raise HTTPException(409, "Turn Algo 2 OFF before switching Paper/Live.")
         self.dry_run = bool(dry_run)
         self.master._log(f"Algo 2 mode -> {'PAPER (dry-run)' if self.dry_run else 'LIVE'}",
-                         level="warn", notification="mode_changed")
+                         level="warn", notification="mode_changed", shared=True)
         self.save_settings()
         return self.status()
 
@@ -1221,21 +1235,65 @@ class Algo2Group:
     def _labels(self) -> Dict[str, str]:
         return dict(model_conditions(self.cfg.score_model))
 
+    def _fail_text(self, key: str) -> str:
+        """Readable reason for a FAILED condition (labels describe the passing state)."""
+        if key == "time_window":
+            return f"outside entry time ({self.cfg.trade_windows})"
+        if key == "expiry_block":
+            return f"expiry-day no-trade time ({self.cfg.expiry_block})"
+        if key == "vix":
+            return "India VIX moving against"
+        if key == "news":
+            return "news freeze"
+        return self._labels().get(key, key).split(" (")[0]
+
     def _index_line(self, key: str) -> Optional[str]:
         m = self.metrics.get(key)
         if not m:
             return None
-        labels = self._labels()
         parts = [f"{key} {m['spot']:,.1f}" if m.get("spot") else key]
         if m.get("triggerUp") is not None:
             parts.append(f"CALL above {m['triggerUp']:,.1f} / PUT below {m['triggerDown']:,.1f}")
         for side in ("CALL", "PUT"):
             s = self.score_summary(m["checks"][side], self.cfg.min_score)
-            gates = ("gates OK" if s["gatesOk"] else "gate fail: "
-                     + ", ".join(labels.get(g, g).split(" (")[0] for g in s["gatesFailed"]))
+            gates = ("gates OK" if s["gatesOk"] else "blocked: "
+                     + ", ".join(self._fail_text(g) for g in s["gatesFailed"]))
             parts.append(f"{side} {gates}, score {s['passed']}/{s['total']} (need {s['need']})"
                          + (" - READY" if s["ready"] else ""))
         return " | ".join(parts)
+
+    def _status_telegram(self) -> str:
+        lines = [f"📊 5-min status", self.next_action_text()]
+        for key in self.cfg.indices:
+            m = self.metrics.get(key)
+            if not m:
+                continue
+            lines += ["", f"{key} {m['spot']:,.1f}" if m.get("spot") else key]
+            if m.get("triggerUp") is not None:
+                lines.append(f"CE buy above {m['triggerUp']:,.1f} | PE buy below {m['triggerDown']:,.1f}")
+            for side, tag in (("CALL", "CE"), ("PUT", "PE")):
+                s = self.score_summary(m["checks"][side], self.cfg.min_score)
+                gates = ("gates OK" if s["gatesOk"] else "❌ " + ", ".join(self._fail_text(g) for g in s["gatesFailed"]))
+                lines.append(f"{tag}: {gates} | score {s['passed']}/{s['total']} (need {s['need']})"
+                             + (" ✅ READY" if s["ready"] else ""))
+        if self._blocked_recent:
+            lines += ["", "Skipped breakouts:"] + [f"• {b}" for b in self._blocked_recent]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _holding_telegram(engine: "Algo2Engine") -> Optional[str]:
+        p = engine._position
+        if p is None:
+            return None
+        ltp = p.premium or p.entry_premium
+        live = engine._trade_pnl(p, ltp)
+        booked, _ = engine._today_pnl()
+        return (f"📍 Holding {p.index_key} {int(p.strike)} {'CE' if p.option_type == 'CALL' else 'PE'} "
+                f"| qty {p.quantity}\n"
+                f"Buy {p.entry_premium:.2f} | LTP {ltp:.2f} | Open P/L {base._rs(live)}\n"
+                f"SL {p.stop_spot:,.1f} | {'T2' if getattr(p, 't1_done', False) else 'T1'} "
+                f"{p.target_spot:,.1f} (spot)\n"
+                f"💰 Today total P/L: {base._rs(booked + live)} (booked {base._rs(booked)})")
 
     def next_actions(self) -> List[str]:
         out = [self.next_action_text()]
@@ -1290,7 +1348,11 @@ class Algo2Group:
         self.history.append(now, "reports", {
             "time": now.isoformat(timespec="seconds"), "mode": "PAPER" if self.dry_run else "LIVE", "text": text,
             "indices": {k: self.history.metrics_row(m) for k, m in self.metrics.items()}})
-        self.master._log(text, level="info")
+        self.master._log(text, level="info", shared=True, telegram=self._status_telegram())
+        for account, engine in self.items.items():
+            holding = self._holding_telegram(engine)
+            if holding:
+                engine._notify(f"account={account} 5-min holding status", holding)
         self._take_snapshot(now)
 
     def _note_blocked(self, key: str, side: str, bar: float, blockers: List[str], m: Dict[str, Any]) -> None:
@@ -1298,8 +1360,7 @@ class Algo2Group:
         if self._blocked_logged.get(key) == (bar, side):
             return
         self._blocked_logged[key] = (bar, side)
-        labels = self._labels()
-        failing = ", ".join(labels.get(b, b).split(" (")[0] for b in blockers[:4])
+        failing = ", ".join(self._fail_text(b) for b in blockers[:4])
         more = f" +{len(blockers) - 4}" if len(blockers) > 4 else ""
         self._blocked_recent.append(f"{key} {side} @ {m.get('spot') or 0:,.1f} (fail: {failing}{more})")
         self._blocked_recent = self._blocked_recent[-6:]
@@ -1341,7 +1402,7 @@ class Algo2Group:
             self.v5ctx.schedule(now)
             warn = self.v5ctx.warning(now)
             if warn:
-                self.master._log(warn, level="warn")
+                self.master._log(warn, level="warn", shared=True)
         for key in indices:
             await self.data.refresh_candles(key, now)
             if v5_on:
@@ -1652,7 +1713,8 @@ class Algo2Group:
         with account_scope("master"):
             await master._prepare_contract(leg, side)
         if leg.prepared_side != side or not leg.security_id:
-            master._log(f"{key} {side} signal skipped: {leg.note or 'contract not ready'}", level="warn", index=key)
+            master._log(f"{key} {side} signal skipped: {leg.note or 'contract not ready'}", level="warn", index=key,
+                        shared=True)
             return
         segment = master._segment_for(key)
         age = feed.age(leg.security_id, segment)
@@ -1665,13 +1727,31 @@ class Algo2Group:
         passed = ", ".join(c["key"] for c in m["checks"][side] if c["enabled"] and c["pass"] and not c.get("gate"))
         self.history.breakout(now_ist(), key, side, m, taken=True, blockers=[])
         limit = f"/{self.cfg.max_trades}" if self.cfg.trade_limit else ""
+        sl_level = sl_from['low'] if side == 'CALL' else sl_from['high']
         sl_text = (f"SL {self.cfg.sl_candle_minutes}-min candle {'low' if side == 'CALL' else 'high'} "
-                   f"{sl_from['low'] if side == 'CALL' else sl_from['high']:,.1f}")
-        master._log(f"SIGNAL {key} {side} (trade {trade_no}{limit}): spot {spot:,.1f} broke 5-min "
+                   f"{sl_level:,.1f}")
+        sign = 1 if side == "CALL" else -1
+        dist = abs(spot - sl_level)
+        wall_ok = bool(self.cfg.oi_wall_target and wall_strike and sign * (wall_strike - spot) >= 2 * dist)
+        t1_level = wall_strike if wall_ok else spot + sign * 2 * dist
+        ce_pe = "CE" if side == "CALL" else "PE"
+        trade_text = f"trade {trade_no}{limit}"
+        master._log(f"SIGNAL {key} {side} ({trade_text}): spot {spot:,.1f} broke 5-min "
                     f"candle {'high' if side == 'CALL' else 'low'} {leg.or_high if side == 'CALL' else leg.or_low:,.1f}; "
                     f"{sl_text}; T1 wall {wall_strike or '1:2 R:R'}; gates OK, score {s['passed']}/{s['total']} "
                     f"(need {s['need']}) [{passed}] -> "
-                    f"{','.join(self.entry_accounts)}", level="success", index=key)
+                    f"{','.join(self.entry_accounts)}", level="success", index=key, shared=True,
+                    telegram=(
+                        f"🚀 {key} {side} BREAKOUT ({trade_text})\n"
+                        f"Spot {spot:,.1f} broke 5-min {'high' if side == 'CALL' else 'low'}\n"
+                        f"5-min candle H {candle['high']:,.1f} / L {candle['low']:,.1f}\n"
+                        f"CE buy above {m['triggerUp']:,.1f} | PE buy below {m['triggerDown']:,.1f}\n"
+                        f"Score {s['passed']}/{s['total']} (need {s['need']}) | gates OK\n"
+                        f"SL {sl_level:,.1f} ({self.cfg.sl_candle_minutes}-min "
+                        f"{'low' if side == 'CALL' else 'high'}) | T1 {t1_level:,.1f} "
+                        f"({'OI wall' if wall_ok else '2R'})\n"
+                        f"Contract: {int(leg.strike)} {ce_pe} (ITM) ~{leg.option_ltp}\n"
+                        f"Orders → {', '.join(a.upper() for a in self.entry_accounts)}"))
         signal = asdict(leg)
         consumed = False
 

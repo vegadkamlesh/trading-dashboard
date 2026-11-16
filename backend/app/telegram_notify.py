@@ -15,9 +15,12 @@ from .config import Settings, get_settings
 logger = logging.getLogger("dhan.telegram")
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DETAIL_MAX = 400
-BATCH_MAX_CHARS = 3500   # Telegram hard limit is 4096
+DETAIL_MAX = 3500
+MESSAGE_MAX_CHARS = 3900   # Telegram hard limit is 4096; longer text is split, never cut
+BATCH_WAIT_SECONDS = 1.5   # gather a burst (order -> broker -> fill) into one message per account
 LEVEL_ICONS = {"success": "✅", "info": "ℹ️", "warn": "⚠️", "warning": "⚠️", "error": "🚨"}
+DETAIL_EVENTS = ("token_expiry", "broker_update", "order_success", "order_failed")
+RULE = "──────────────"
 
 EVENTS = {
     "startup": "Backend starting; verify readiness in dashboard",
@@ -60,23 +63,57 @@ class NotificationHandler(logging.Handler):
             event = "error" if record.levelno >= logging.ERROR else "warning"
         elif event == "algo_update" and record.levelno >= logging.WARNING:
             event = "error" if record.levelno >= logging.ERROR else "warning"
-        # Only algo journal lines carry a detail: trading facts (index, strike, qty, price,
+        # Only algo journal / order lines carry a detail: trading facts (index, strike, qty, price,
         # P&L, broker reason). Other records stay metadata-only.
         detail = getattr(record, "telegram_detail", "") if event.startswith("algo_") or \
-            event == "token_expiry" or getattr(record, "telegram_event", None) == "algo_update" else ""
+            event in DETAIL_EVENTS or getattr(record, "telegram_event", None) == "algo_update" else ""
         level = getattr(record, "telegram_level", "")
         account = getattr(record, "telegram_account", "")
         mode = getattr(record, "telegram_mode", "")
-        self.service.publish(event, account=account, mode=mode, detail=detail, level=level)
+        label = getattr(record, "telegram_label", "") if detail else ""
+        self.service.publish(event, account=account, mode=mode, detail=detail, level=level, label=label)
+
+
+def clean_detail(detail: object) -> str:
+    """Collapse spaces inside each line but keep the line breaks (they carry the layout)."""
+    lines = [" ".join(line.split()) for line in str(detail or "").splitlines()]
+    out: list[str] = []
+    for line in lines:
+        if line or (out and out[-1]):
+            out.append(line)
+    return "\n".join(out).strip()[:DETAIL_MAX]
+
+
+def split_message(text: str, limit: int = MESSAGE_MAX_CHARS) -> list[str]:
+    """Split on line breaks so every part fits Telegram's limit; nothing is dropped."""
+    parts: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts or [""]
 
 
 class TelegramNotifier:
     SEND_INTERVAL_SECONDS = 3.1  # Also respects Telegram's 20 messages/minute group limit.
+    BATCH_WAIT_SECONDS = BATCH_WAIT_SECONDS
     QUEUE_SIZE = 100
     MAX_EVENT_AGE_SECONDS = 600
 
     def __init__(self) -> None:
-        self._queue: queue.Queue[tuple[float, str]] = queue.Queue(self.QUEUE_SIZE)
+        self._queue: queue.Queue[tuple] = queue.Queue(self.QUEUE_SIZE)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -116,7 +153,7 @@ class TelegramNotifier:
             }
 
     def publish(self, event: str, *, account: str = "", mode: str = "", detail: str = "",
-                level: str = "") -> bool:
+                level: str = "", label: str = "") -> bool:
         if event not in EVENTS:
             raise ValueError("Unknown Telegram notification event")
         if (not self._settings or not self._settings.telegram_enabled or self._stop.is_set()
@@ -125,7 +162,8 @@ class TelegramNotifier:
         now = time.monotonic()
         account = account if account in ("master", "child") else ""
         mode = mode if mode in ("DRY-RUN", "LIVE", "PIN REQUIRED", "PIN SKIPPED") else ""
-        detail = " ".join(str(detail or "").split())[:DETAIL_MAX]
+        label = label if label in ("Algo 1", "Algo 2") else ""
+        detail = clean_detail(detail)
         with self._lock:
             if event in ("warning", "error", "api_error", "login_failed"):
                 key = (event, account, detail[:80])
@@ -134,25 +172,24 @@ class TelegramNotifier:
                     self._suppressed += 1
                     return False
                 self._recent[key] = now
+        stamp = datetime.now(IST).strftime("%H:%M:%S")
         if detail:
-            icon = LEVEL_ICONS.get(level) or ("🚨" if event == "error" else "⚠️" if event == "warning" else "ℹ️")
-            stamp = datetime.now(IST).strftime("%H:%M:%S")
-            text = f"{icon} {stamp} {account or '-'} {mode}\n{detail}".strip()
+            first, _, rest = detail.partition("\n")
+            # A detail may bring its own leading emoji (🚀, 🏁, 📡 ...); otherwise use the level icon.
+            own_icon = not first[:1].isascii()
+            icon = "" if own_icon else (
+                LEVEL_ICONS.get(level) or ("🚨" if event == "error" else "⚠️" if event == "warning" else "ℹ️")) + " "
+            text = f"{icon}{first}  · {stamp}" + (f"\n{rest}" if rest else "")
         else:
-            timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            text = f"Trading dashboard | {timestamp}\n{EVENTS[event]}"
+            text = f"ℹ️ {EVENTS[event]}  · {stamp}"
         if event == "heartbeat":
             snapshot = self.status()
             text += (
                 f"\nSent={snapshot['sent']} failed={snapshot['failed']}"
                 f" dropped={snapshot['dropped']} grouped={snapshot['suppressed']}"
             )
-        if account and not detail:
-            text += f"\nAccount: {account}"
-        if mode and not detail:
-            text += f"\nMode: {mode}"
         try:
-            self._queue.put_nowait((now, text))
+            self._queue.put_nowait((now, text, account, label, mode))
         except queue.Full:
             with self._lock:
                 self._dropped += 1
@@ -160,6 +197,27 @@ class TelegramNotifier:
             logger.error("Telegram notification queue full; event dropped (trading unaffected)")
             return False
         return True
+
+    @staticmethod
+    def compose(items: list[tuple]) -> list[str]:
+        """One message per account (master / child / shared), never mixed; each split to fit Telegram."""
+        groups: dict[str, list[tuple]] = {}
+        for item in items:
+            groups.setdefault(item[2] if len(item) > 2 else "", []).append(item)
+        messages: list[str] = []
+        for account, members in groups.items():
+            label = next((m[3] for m in members if len(m) > 3 and m[3]), "")
+            mode = next((m[4] for m in members if len(m) > 4 and m[4]), "")
+            title = [f"👤 {account.upper()}" if account else f"📢 {label or 'Trading dashboard'}"]
+            if account and label:
+                title.append(label)
+            if mode:
+                title.append(mode)
+            header = " · ".join(title)
+            body = "\n\n".join(m[1] for m in members)
+            for part in split_message(f"{header}\n{RULE}\n{body}"):
+                messages.append(part)
+        return messages
 
     def stop(self) -> None:
         logging.getLogger().removeHandler(self._handler)
@@ -239,7 +297,6 @@ class TelegramNotifier:
             raise RuntimeError("Telegram worker started without settings")
         heartbeat_at = time.monotonic() + settings.telegram_heartbeat_seconds
         next_send_at = 0.0
-        carry: tuple[float, str] | None = None
         try:
             while True:
                 if not self._stop.is_set() and time.monotonic() >= heartbeat_at:
@@ -251,54 +308,54 @@ class TelegramNotifier:
                     )
                     heartbeat_at = time.monotonic() + settings.telegram_heartbeat_seconds
                 try:
-                    created_at, text = carry if carry else self._queue.get(timeout=0.2)
-                    fresh_get = carry is None
-                    carry = None
+                    items = [self._queue.get(timeout=0.2)]
                 except queue.Empty:
                     if self._stop.is_set():
                         break
                     continue
-                # Burst (e.g. breakout -> order -> fill): send pending lines as ONE message
-                # instead of one message per 3 s.
-                taken = 1 if fresh_get else 0
+                # Burst (e.g. breakout -> order -> fill): gather briefly, then send ONE message
+                # per account instead of one message per 3 s or a master/child mix.
+                deadline = time.monotonic() + self.BATCH_WAIT_SECONDS
                 while not self._stop.is_set():
+                    remaining = deadline - time.monotonic()
                     try:
-                        more = self._queue.get_nowait()
+                        items.append(self._queue.get(timeout=remaining) if remaining > 0
+                                     else self._queue.get_nowait())
                     except queue.Empty:
                         break
-                    taken += 1
-                    if len(text) + len(more[1]) + 2 > BATCH_MAX_CHARS:
-                        carry = more
-                        break
-                    text = f"{text}\n\n{more[1]}"
                 try:
-                    delay = max(0.0, next_send_at - time.monotonic())
-                    # Preserve pacing during graceful shutdown, too.
-                    if delay:
-                        time.sleep(delay)
-                    if time.monotonic() - created_at > self.MAX_EVENT_AGE_SECONDS:
-                        with self._lock:
-                            self._dropped += 1
-                            self._last_error = "Expired queued notification dropped"
-                        logger.warning("Expired Telegram notification dropped")
-                    else:
+                    fresh = []
+                    for item in items:
+                        if time.monotonic() - item[0] > self.MAX_EVENT_AGE_SECONDS:
+                            with self._lock:
+                                self._dropped += 1
+                                self._last_error = "Expired queued notification dropped"
+                            logger.warning("Expired Telegram notification dropped")
+                        else:
+                            fresh.append(item)
+                    for text in self.compose(fresh):
+                        delay = max(0.0, next_send_at - time.monotonic())
+                        # Preserve pacing during graceful shutdown, too.
+                        if delay:
+                            time.sleep(delay)
                         self._send(text)
-                    next_send_at = time.monotonic() + self.SEND_INTERVAL_SECONDS
+                        next_send_at = time.monotonic() + self.SEND_INTERVAL_SECONDS
                 finally:
-                    for _ in range(taken):
+                    for _ in items:
                         self._queue.task_done()
                 if self._stop.is_set():
                     # Flush at most the shutdown message, not minutes of stale backlog.
                     discarded = 0
                     while True:
                         try:
-                            _, pending = self._queue.get_nowait()
+                            pending = self._queue.get_nowait()
                         except queue.Empty:
                             break
                         self._queue.task_done()
-                        if EVENTS["shutdown"] in pending:
+                        if EVENTS["shutdown"] in pending[1]:
                             time.sleep(self.SEND_INTERVAL_SECONDS)
-                            self._send(pending)
+                            for text in self.compose([pending]):
+                                self._send(text)
                         else:
                             discarded += 1
                     if discarded:

@@ -132,36 +132,61 @@ class TelegramTests(unittest.TestCase):
             for key, value in extra.items():
                 setattr(rec, key, value)
             handler.emit(rec)
-            return service._queue.get_nowait()[1]
+            return service._queue.get_nowait()
 
-        entry = record("dhan.algo", logging.INFO, "x", telegram_event="algo_entry",
-                       telegram_account="child", telegram_mode="LIVE", telegram_level="success",
-                       telegram_detail="Entry confirmed: SENSEX 76800 PE 100 units @ 363.55")
+        _, entry, account, _, mode = record(
+            "dhan.algo", logging.INFO, "x", telegram_event="algo_entry",
+            telegram_account="child", telegram_mode="LIVE", telegram_level="success",
+            telegram_detail="Entry confirmed: SENSEX 76800 PE 100 units @ 363.55")
         self.assertIn("✅", entry)
-        self.assertIn("child LIVE", entry)
+        self.assertEqual((account, mode), ("child", "LIVE"))
         self.assertIn("76800 PE 100 units @ 363.55", entry)
         reject = record("dhan.algo", logging.ERROR, "x", telegram_event="algo_update",
                         telegram_account="child", telegram_mode="LIVE", telegram_level="error",
-                        telegram_detail="Entry REJECTED: insufficient funds; ACTION: check Dhan")
+                        telegram_detail="Entry REJECTED: insufficient funds; ACTION: check Dhan")[1]
         self.assertIn("🚨", reject)
         self.assertIn("insufficient funds", reject)
-        other = record("dhan.client", logging.WARNING, "private broker payload")
+        other = record("dhan.client", logging.WARNING, "private broker payload")[1]
         self.assertNotIn("private broker payload", other)
         self.assertIn(EVENTS["warning"], other)
 
-    def test_burst_of_events_is_sent_as_one_message(self):
+    def test_long_multiline_detail_is_kept_whole(self):
         service = self.service()
-        for i in range(3):
-            service._queue.put_nowait((time.monotonic(), f"line-{i}"))
+        service._thread = MagicMock()
+        service._thread.is_alive.return_value = True
+        detail = "🚀 NIFTY CALL BREAKOUT\nCE buy above 25,229.5 | PE buy below 25,190.0\n" + "x" * 600
+        self.assertTrue(service.publish("algo_update", account="", detail=detail, label="Algo 2", mode="LIVE"))
+        _, text, *_ = service._queue.get_nowait()
+        self.assertTrue(text.startswith("🚀 NIFTY CALL BREAKOUT"))
+        self.assertIn("\nCE buy above 25,229.5 | PE buy below 25,190.0\n", text)
+        self.assertIn("x" * 600, text)
+        parts = TelegramNotifier.compose([(0, "a" * 3000 + "\n" + "b" * 3000, "child", "Algo 2", "LIVE")])
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(len(p) <= 4096 for p in parts))
+        self.assertIn("b" * 3000, parts[1])
+
+    def test_burst_is_sent_as_one_message_per_account(self):
+        service = self.service()
+        now = time.monotonic()
+        for item in ((now, "m-1", "master", "Algo 2", "LIVE"), (now, "c-1", "child", "Algo 2", "LIVE"),
+                     (now, "m-2", "master", "", ""), (now, "signal", "", "Algo 2", "LIVE")):
+            service._queue.put_nowait(item)
         sent = []
         with patch.object(service, "_send", side_effect=lambda text: sent.append(text) or True):
-            import threading
-            worker = threading.Thread(target=service._run)
-            worker.start()
-            service._queue.join()
-            service._stop.set()
-            worker.join(timeout=5)
-        self.assertEqual(sent, ["line-0\n\nline-1\n\nline-2"])
+            with patch("time.sleep"):
+                import threading
+                worker = threading.Thread(target=service._run)
+                worker.start()
+                service._queue.join()
+                service._stop.set()
+                worker.join(timeout=5)
+        self.assertEqual(len(sent), 3)
+        self.assertTrue(sent[0].startswith("👤 MASTER · Algo 2 · LIVE"))
+        self.assertIn("m-1\n\nm-2", sent[0])
+        self.assertNotIn("c-1", sent[0])
+        self.assertTrue(sent[1].startswith("👤 CHILD · Algo 2 · LIVE"))
+        self.assertNotIn("m-", sent[1])
+        self.assertTrue(sent[2].startswith("📢 Algo 2 · LIVE"))
 
     def test_worker_is_nonblocking_idempotent_and_stops(self):
         service = TelegramNotifier()
@@ -195,7 +220,7 @@ class TelegramTests(unittest.TestCase):
         service._thread.is_alive.return_value = True
         service._failed = 2
         self.assertTrue(service.publish("heartbeat"))
-        _, text = service._queue.get_nowait()
+        text = service._queue.get_nowait()[1]
         service._queue.task_done()
         self.assertIn("failed=2", text)
         self.assertIn("not broker/trading readiness", text)
@@ -211,18 +236,17 @@ class TelegramTests(unittest.TestCase):
         record.telegram_account = "master"
         record.telegram_mode = "LIVE"
         handler.emit(record)
-        _, text = service._queue.get_nowait()
+        _, text, account, _, mode = service._queue.get_nowait()
         service._queue.task_done()
         self.assertIn(EVENTS["algo_entry"], text)
-        self.assertIn("Account: master", text)
-        self.assertIn("Mode: LIVE", text)
+        self.assertEqual((account, mode), ("master", "LIVE"))
         self.assertNotIn("private-broker-token", text)
         self.assertNotIn("secret", text)
         record.telegram_event = "not-allowlisted"
         record.telegram_account = "private-client-id"
         record.telegram_mode = "private balance"
         handler.emit(record)
-        _, text = service._queue.get_nowait()
+        text = service._queue.get_nowait()[1]
         service._queue.task_done()
         self.assertIn(EVENTS["error"], text)
         self.assertNotIn("private", text)

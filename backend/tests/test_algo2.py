@@ -320,6 +320,25 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.engine._position, pos)
         self.assertFalse(any("minute rule" in line for line in self.engine._next_actions()))
 
+    async def test_alerts_show_readable_gate_and_today_total(self):
+        checks = [{"key": "time_window", "gate": True, "enabled": True, "pass": False},
+                  {"key": "oi_unwinding", "gate": False, "enabled": True, "pass": True}]
+        self.group.metrics["NIFTY"] = {"spot": 25000.0, "triggerUp": 25010.0, "triggerDown": 24990.0,
+                                       "checks": {"CALL": checks, "PUT": checks}}
+        self.assertIn("CALL blocked: outside entry time (09:45-15:00)", self.group._index_line("NIFTY"))
+        status = self.group._status_telegram()
+        self.assertIn("\nCE buy above 25,010.0 | PE buy below 24,990.0\n", status)
+        self.assertNotIn("Inside a trade window", status)
+        self.engine._today_trades = [{"date": self.engine._day, "premiumPnl": 500.0}]
+        self.engine._position = pos = self.position(lots=1, quantity=65)
+        pos.spot, pos.premium = 23541.0, 120.0
+        with self.assertLogs("dhan.algo", level="INFO") as logs:
+            await self.engine._manage_position()
+        exit_alert = [r.telegram_detail for r in logs.records
+                      if getattr(r, "telegram_event", "") == "algo_exit"][-1]
+        self.assertIn("P/L: +Rs 1,300", exit_alert)
+        self.assertIn("Today total P/L: +Rs 1,800 (2 trades)", exit_alert)
+
     async def test_twenty_minute_rule_exits_when_t1_not_hit(self):
         self.engine.cfg.max_hold_minutes = 20
         self.engine._position = self.position(entry_confirmed_ts=time.time() - 20 * 60 - 1, spot=23510.0)
