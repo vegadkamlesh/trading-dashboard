@@ -25,6 +25,7 @@ import logging
 import math
 import struct
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .config import get_settings
@@ -85,6 +86,17 @@ FEED_URL = "wss://api-feed.dhan.co"
 REST_POLL_SECONDS = 1.0        # /marketfeed/ltp allows 1 request/second
 WS_SILENCE_SECONDS = 20.0      # if the socket goes quiet this long, use REST too
 MAX_RECONNECT_DELAY = 30.0
+# Outside market hours nothing ticks, so every instrument looks stale; poll REST rarely
+# instead of once a second (saves the shared Master data-API quota after the close).
+OFF_HOURS_REST_SECONDS = 60.0
+IST = timezone(timedelta(hours=5, minutes=30))
+MARKET_START_MIN, MARKET_END_MIN = 9 * 60, 15 * 60 + 31
+
+
+def market_hours(now: Optional[datetime] = None) -> bool:
+    t = now or datetime.now(IST)
+    minute = t.hour * 60 + t.minute
+    return t.weekday() < 5 and MARKET_START_MIN <= minute < MARKET_END_MIN
 
 # Response codes
 CODE_TICKER = 2
@@ -146,6 +158,7 @@ class MarketFeed:
         self._mode = "off"                        # websocket | rest | off
         self._last_tick_at = 0.0
         self._last_ws_msg_at = 0.0
+        self._last_rest_at = 0.0
         self._tick_count = 0
         self._error: Optional[str] = None
         self._reconnects = 0
@@ -378,12 +391,16 @@ class MarketFeed:
                 if self._ws_healthy() and not stale:
                     await asyncio.sleep(REST_POLL_SECONDS)
                     continue
+                if not market_hours() and time.time() - self._last_rest_at < OFF_HOURS_REST_SECONDS:
+                    await asyncio.sleep(REST_POLL_SECONDS)
+                    continue
                 if self._mode != "websocket":
                     self._mode = "rest"
                 payload = self._grouped(stale if self._ws_healthy() else None)
                 if not payload:
                     await asyncio.sleep(REST_POLL_SECONDS)
                     continue
+                self._last_rest_at = time.time()
                 data = await client.get_ltp(payload)
                 for seg, rows in (data.get("data") or {}).items():
                     if not isinstance(rows, dict):

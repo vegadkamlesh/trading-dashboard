@@ -4,6 +4,7 @@ import struct
 import time
 import unittest
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1410,6 +1411,35 @@ class PortfolioQuoteTests(unittest.IsolatedAsyncioTestCase):
             await f._rest_loop()
         client.get_ltp.assert_awaited_once_with({"NSE_FNO": [47153]})
         self.assertEqual(f.price(47153, "NSE_FNO"), 100)
+
+    async def test_rest_fallback_is_throttled_outside_market_hours(self):
+        from app import feed as module
+        ist = module.IST
+        self.assertTrue(module.market_hours(datetime(2026, 11, 16, 15, 30, tzinfo=ist)))
+        self.assertFalse(module.market_hours(datetime(2026, 11, 16, 15, 40, tzinfo=ist)))
+        self.assertFalse(module.market_hours(datetime(2026, 11, 14, 11, 0, tzinfo=ist)))
+
+        async def polls(in_market):
+            f = MarketFeed()
+            f.subscribe(13, "IDX_I")
+            f._last_rest_at = time.time()
+            f._running = True
+            loops = 0
+
+            async def tick(_seconds):
+                nonlocal loops
+                loops += 1
+                if loops >= 5:
+                    f._running = False
+            client = MagicMock(get_ltp=AsyncMock(return_value={"data": {"IDX_I": {"13": {"last_price": 23000}}}}))
+            with patch.object(module, "get_dhan_client", return_value=client), \
+                    patch.object(module, "market_hours", return_value=in_market), \
+                    patch.object(module.asyncio, "sleep", side_effect=tick):
+                await f._rest_loop()
+            return client.get_ltp.await_count
+
+        self.assertEqual(await polls(False), 0)
+        self.assertEqual(await polls(True), 5)
 
     async def test_segment_aware_quotes_keep_broker_quantities_and_pnl(self):
         from app import feed as module
