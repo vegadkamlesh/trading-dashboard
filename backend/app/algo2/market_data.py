@@ -27,6 +27,7 @@ import httpx
 from ..dhan_client import DhanAPIError, get_dhan_client as get_data_client
 from ..feed import feed
 from ..instruments import get_index
+from ..opening_range import INTRADAY_FROM_TIME
 from ..optionchain import engine as chain_engine
 from . import calculations as calc
 
@@ -285,7 +286,8 @@ class Algo2MarketData:
         inst = get_index(index_key)
         if inst is None:
             return
-        frm = f"{now.date().isoformat()} 09:15:00"
+        frm = f"{now.date().isoformat()} {INTRADAY_FROM_TIME}"
+        open_ts = now.replace(hour=9, minute=15, second=0, microsecond=0).timestamp()
         to = (bar_end + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
         client = get_data_client()
         try:
@@ -300,8 +302,8 @@ class Algo2MarketData:
             self.candle_error = f"{index_key}: {exc.error_message}"
             self._next_candle_try[index_key] = time.time() + (60 if exc.status_code == 429 or "904" in exc.error_code else 15)
             return
-        spot = [c for c in parse_candles(spot_raw) if c["t"] < boundary]
-        futs = [c for c in parse_candles(fut_raw) if c["t"] < boundary] if fut_raw is not None else []
+        spot = [c for c in parse_candles(spot_raw) if open_ts <= c["t"] < boundary]
+        futs = [c for c in parse_candles(fut_raw) if open_ts <= c["t"] < boundary] if fut_raw is not None else []
         if not spot or spot[-1]["t"] < boundary - 300:
             # Dhan has not published the just-closed bar yet; retry shortly.
             self._next_candle_try[index_key] = time.time() + 5
@@ -321,7 +323,8 @@ class Algo2MarketData:
         if (not fut or self._fut_1m_for.get(index_key) == boundary or now.second < 2
                 or time.time() < self._next_candle_try.get(f"{index_key}:1m", 0.0)):
             return
-        frm = f"{now.date().isoformat()} 09:15:00"
+        frm = f"{now.date().isoformat()} {INTRADAY_FROM_TIME}"
+        open_ts = now.replace(hour=9, minute=15, second=0, microsecond=0).timestamp()
         to = (minute + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
         try:
             self.calls["candles"] += 1
@@ -330,7 +333,7 @@ class Algo2MarketData:
             self.candle_error = f"{index_key} 1m: {exc.error_message}"
             self._next_candle_try[f"{index_key}:1m"] = time.time() + (60 if exc.status_code == 429 or "904" in exc.error_code else 15)
             return
-        rows = [c for c in parse_candles(raw) if c["t"] < boundary]
+        rows = [c for c in parse_candles(raw) if open_ts <= c["t"] < boundary]
         if rows:
             self.fut_1m[index_key] = rows
         if rows and rows[-1]["t"] >= boundary - FUT_1M_SECONDS:

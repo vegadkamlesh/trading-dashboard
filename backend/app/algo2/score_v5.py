@@ -40,12 +40,13 @@ NEG: Tuple[str, ...] = (
     "f22_inr_strong",
 )
 FEATURES: Tuple[str, ...] = POS + NEG
-GATES: Tuple[str, ...] = ("time_window", "vix", "expiry_block")
+GATES: Tuple[str, ...] = ("time_window", "vix", "expiry_block", "expiry_eve")
 
 LABELS: Dict[str, str] = {
     "time_window": "Inside a trade window",
     "vix": "India VIX stable (< 3% intraday move against)",
     "expiry_block": "Not expiry day 10:45-11:45",
+    "expiry_eve": "Not the trading day before expiry",
     "oi_unwinding": "Same-side OI unwinding (5 min)",
     "x_flow_delta": "OI flow x delta with the trade (5 min)",
     "f08_vix_low": "VIX open below its 20-day median",

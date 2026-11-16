@@ -407,6 +407,8 @@ const NUM_FIELDS: Array<[string, string, number]> = [
   ["status_report_minutes", "Status report every (min, 0 = off)", 1],
   ["max_stop_loss_pct", "Capital SL cap % (only if cap ON)", 0.05],
   ["min_score", "Min score to trade (see score total)", 1],
+  ["target_r", "Target (R, normal days)", 0.5],
+  ["expiry_target_r", "Target (R, expiry day)", 0.5],
   ["sl_candle_minutes", "SL candle (5/10/15 min)", 5],
   ["oi_velocity_spike", "OI velocity spike %", 1],
   ["vwap_band_sd", "VWAP band (std dev)", 0.1],
@@ -431,7 +433,7 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
     void call("/api/algo2/config", patch, "Algo 2 settings saved").then(() => setDraft({}));
   };
   const flag = (k: "data_sl" | "partial_booking" | "capital_sl_cap" | "stop_after_sl" | "priority_over_algo1"
-    | "trade_limit" | "oi_wall_target" | "first_touch_only" | "atm_fallback", label: string) => (
+    | "trade_limit" | "oi_wall_target" | "first_touch_only" | "atm_fallback" | "skip_expiry_eve", label: string) => (
     <label className="flex items-center gap-1 text-xs">
       <input type="checkbox" disabled={busy} checked={!!st.config[k]}
         onChange={(e) => call("/api/algo2/config", { [k]: e.target.checked }, `${label} ${e.target.checked ? "ON" : "OFF"}`)} />
@@ -462,12 +464,13 @@ function SettingsCard({ st, busy, call }: { st: Algo2Status; busy: boolean; call
         {flag("trade_limit", `Daily trade limit (max ${st.config.max_trades})`)}
         {flag("stop_after_sl", "1st SL hit → no more trades today")}
         {flag("data_sl", "Data SL (OI trap exit)")}
-        {flag("oi_wall_target", "Target at OI wall (OFF = 2R)")}
+        {flag("oi_wall_target", "Target at OI wall (OFF = R target)")}
         {flag("partial_booking", "T1 partial booking (70%)")}
         {flag("capital_sl_cap", "Cap candle SL at capital %")}
         {flag("priority_over_algo1", "Priority: exit Algo 1 if its margin blocks an Algo 2 entry (LIVE)")}
         {flag("first_touch_only", "First touch per 5-min candle only")}
         {flag("atm_fallback", "ITM unaffordable → buy ATM (max lots)")}
+        {flag("skip_expiry_eve", "No trades on the day before expiry")}
       </div>
       <div className="mt-3 text-xs font-semibold text-slate-300">Values</div>
       <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">

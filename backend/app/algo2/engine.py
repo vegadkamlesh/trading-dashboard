@@ -26,6 +26,7 @@ v5 (default since config version 5, see score_v5.py): NIFTY only, gates =
 trade window + VIX + expiry-day 10:45-11:45 block, 24-feature score >= 17,
 first touch per 5-min candle, stop = last closed 15-min candle, target 2R,
 max lots with an ITM -> ATM fallback when funds fall short.
+v6: no entries on the trading day before expiry; target 1R on expiry day (2R otherwise).
 """
 from __future__ import annotations
 
@@ -53,6 +54,7 @@ from ..config import get_settings
 from ..dhan_client import DhanAPIError
 from ..feed import feed
 from ..instruments import get_index, lot_size_for
+from ..market_calendar import next_trading_day
 from . import calculations as calc
 from . import score_v5 as v5
 from .daily_cache import Algo2DailyCache
@@ -82,11 +84,12 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
 GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required (classic)
-CONFIG_VERSION = 5   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+CONFIG_VERSION = 6   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
 #                      v3: score >= 7, 09:45-15:00, 2R full exit, optional rules off
 #                      v4: software-only stop; Dhan mishandled Algo 2 protective SL-M orders
 #                      v5: NIFTY-only 24-feature score >= 17, VIX gate, expiry 10:45-11:45 block,
 #                          15-min candle SL, first touch only, ITM -> ATM fallback
+#                      v6: skip the day before expiry, 1R target on expiry day
 SCORE_MODELS = ("classic", "v5")
 
 
@@ -138,12 +141,15 @@ class Algo2Config(AlgoConfig):
     score_model: str = "v5"           # "v5" = 24-feature score (backtest May-Nov 2026); "classic" = 10 checks
     sl_candle_minutes: int = 15       # stop = low/high of the last closed N-min candle (aligned 09:15)
     expiry_block: str = "10:45-11:45"  # v5 gate: no entries in these windows on expiry day ("" = off)
+    skip_expiry_eve: bool = True      # v6 gate: no entries on the trading day before expiry
+    target_r: float = 2.0             # target = target_r x stop distance
+    expiry_target_r: float = 1.0      # target on expiry day
     first_touch_only: bool = True     # evaluate each 5-min candle breakout once per side (as backtested)
     atm_fallback: bool = True         # ITM unaffordable / funds-rejected -> buy the ATM strike at once
     config_version: int = 3
     data_sl: bool = False
     data_sl_gap_pct: float = 10.0
-    oi_wall_target: bool = False      # False: target = 2R; True: highest-OI wall if >= 2R away
+    oi_wall_target: bool = False      # False: target = target_r; True: highest-OI wall if >= target_r away
     event_window_minutes: int = 15
     target_delta: float = 0.70
     partial_booking: bool = False
@@ -313,6 +319,11 @@ class Algo2Engine(AlgoEngine):
             self.cfg.conditions = {**(self.cfg.conditions or {}), **{k: True for k in v5.FEATURES}}
             self.cfg.config_version = CONFIG_VERSION
             self._persist()
+        if version < 6:
+            # One-time move to the plan chosen on 2026-11-16 (6-month backtest, owner approved).
+            self.cfg.skip_expiry_eve, self.cfg.target_r, self.cfg.expiry_target_r = True, 2.0, 1.0
+            self.cfg.config_version = CONFIG_VERSION
+            self._persist()
 
     def set_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         patch = dict(patch or {})
@@ -389,8 +400,9 @@ class Algo2Engine(AlgoEngine):
                           index=leg.index_key)
                 dist = cap
         dist = max(dist, 0.05)
+        r = self._group_ref.target_r_for(leg.index_key, now_ist())
         wall = ctx.get("wall") if self.cfg.oi_wall_target else None
-        t1 = wall if wall and sign * (wall - spot) >= 2 * dist else spot + sign * 2 * dist
+        t1 = wall if wall and sign * (wall - spot) >= r * dist else spot + sign * r * dist
         return round(t1, 2), round(spot - sign * dist, 2)
 
     async def _enter(self, leg: DayLeg, direction: str) -> None:
@@ -802,9 +814,11 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         raise HTTPException(400, f"score_model must be one of {SCORE_MODELS}")
     if cfg.get("sl_candle_minutes") not in (5, 10, 15):
         raise HTTPException(400, "sl_candle_minutes must be 5, 10 or 15")
-    for name in ("first_touch_only", "atm_fallback"):
+    for name in ("first_touch_only", "atm_fallback", "skip_expiry_eve"):
         if not isinstance(cfg.get(name), bool):
             raise HTTPException(400, f"{name} must be true/false")
+    for name in ("target_r", "expiry_target_r"):
+        positive(name, 10)
     try:
         parse_windows(cfg.get("expiry_block") or "")
     except ValueError as exc:
@@ -1241,6 +1255,8 @@ class Algo2Group:
             return f"outside entry time ({self.cfg.trade_windows})"
         if key == "expiry_block":
             return f"expiry-day no-trade time ({self.cfg.expiry_block})"
+        if key == "expiry_eve":
+            return "day before expiry - no trades"
         if key == "vix":
             return "India VIX moving against"
         if key == "news":
@@ -1607,6 +1623,20 @@ class Algo2Group:
             "allPass": {s: score[s]["ready"] for s in checks},
         }
 
+    def chain_expiry_date(self, key: str) -> Optional[date]:
+        try:
+            return date.fromisoformat(str(self.data.chain_expiry(key) or "")[:10])
+        except ValueError:
+            return None
+
+    def is_expiry_eve(self, expiry: Optional[date], today: date) -> bool:
+        return bool(self.cfg.skip_expiry_eve and expiry is not None and expiry > today
+                    and next_trading_day(today) == expiry)
+
+    def target_r_for(self, key: str, now: datetime) -> float:
+        expiry = self.chain_expiry_date(key)
+        return float(self.cfg.expiry_target_r if expiry == now.date() else self.cfg.target_r)
+
     def expiry_blocked(self, expiry: Optional[date], now: datetime) -> bool:
         if expiry is None or expiry != now.date():
             return False
@@ -1623,10 +1653,7 @@ class Algo2Group:
                    fmt: Any) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
         """v5: 3 gates + 24 scored features; a feature 'passes' when it earns its point."""
         cfg = self.cfg
-        try:
-            expiry = date.fromisoformat(str(self.data.chain_expiry(key) or "")[:10])
-        except ValueError:
-            expiry = None
+        expiry = self.chain_expiry_date(key)
         if rows and expiry is not None:
             mp_key = (now.date().isoformat(), expiry.isoformat())
             if mp_key not in self._maxpain:
@@ -1637,6 +1664,7 @@ class Algo2Group:
         ctx = self.v5ctx.data if self.v5ctx.day == now.date().isoformat() else {}
         stop = v5.last_closed_candle(spot_candles, now, int(cfg.sl_candle_minutes)) if spot_candles else None
         blocked = self.expiry_blocked(expiry, now)
+        eve = self.is_expiry_eve(expiry, now.date())
         oi_before = self.data.strike_oi_ago(key, VELOCITY_WINDOW)
         bank_now = self.data.series_value("IDX_I", BANKNIFTY_ID)
         bank_15 = self.data.series_value("IDX_I", BANKNIFTY_ID, 900)
@@ -1645,12 +1673,15 @@ class Algo2Group:
         checks: Dict[str, List[Dict[str, Any]]] = {}
         features: Dict[str, Dict[str, Optional[bool]]] = {}
         stop_dist: Dict[str, float] = {}
+        buffer = float(cfg.entry_buffer.get(key) or 0.0)
         for side in ("CALL", "PUT"):
-            entry = spot or 0.0
-            if stop and spot:
-                stop_dist[side] = round(spot - stop["low"] if side == "CALL" else stop["high"] - spot, 2)
+            # Score at the breakout level (as backtested), not the later tick price that crossed it.
+            trigger = (candle["high"] + buffer if side == "CALL" else candle["low"] - buffer) if candle else None
+            entry = trigger or spot or 0.0
+            if stop and entry:
+                stop_dist[side] = round(entry - stop["low"] if side == "CALL" else stop["high"] - entry, 2)
             feats = v5.compute_features(
-                side, now=now, entry=entry, spot=entry, ctx=ctx, candle5=candle, spot_candles=spot_candles,
+                side, now=now, entry=entry, spot=spot or entry, ctx=ctx, candle5=candle, spot_candles=spot_candles,
                 fut1m=fut1m, fut_ltp=fut_ltp, vwap5=vwap, rows=rows, near=near, oi_before=oi_before,
                 maxpain=maxpain, expiry=expiry, vix_open=(vix or {}).get("open") or None, bank_now=bank_now,
                 bank_15=bank_15, base_checks=base_checks[side]) if spot else {k: None for k in v5.FEATURES}
@@ -1665,6 +1696,10 @@ class Algo2Group:
                                                       else vix_move > -cfg.vix_spike_pct), fmt(vix_move, 2, "%")),
                 gate("expiry_block", not blocked,
                      f"expiry {expiry.isoformat() if expiry else 'n/a'} block {cfg.expiry_block or 'off'}"),
+                gate("expiry_eve", not eve,
+                     f"expiry {expiry.isoformat() if expiry else 'n/a'}"
+                     f"{' - day before expiry, no entries' if eve else ''}"
+                     f"{'' if cfg.skip_expiry_eve else ' (rule off)'}"),
             ]
             for k in v5.FEATURES:
                 raw = feats.get(k)
@@ -1675,6 +1710,7 @@ class Algo2Group:
             checks[side] = side_checks
         info = {"stopCandle": stop, "stopDist": stop_dist, "slMinutes": cfg.sl_candle_minutes,
                 "maxPain": maxpain, "expiry": expiry.isoformat() if expiry else None, "expiryBlocked": blocked,
+                "expiryEve": eve, "targetR": self.target_r_for(key, now),
                 "contextComplete": self.v5ctx.complete() if ctx else False,
                 "points": {s: v5.points(features[s]) for s in features}, "features": features}
         return info, checks
@@ -1732,13 +1768,16 @@ class Algo2Group:
                    f"{sl_level:,.1f}")
         sign = 1 if side == "CALL" else -1
         dist = abs(spot - sl_level)
-        wall_ok = bool(self.cfg.oi_wall_target and wall_strike and sign * (wall_strike - spot) >= 2 * dist)
-        t1_level = wall_strike if wall_ok else spot + sign * 2 * dist
+        r = self.target_r_for(key, now_ist())
+        r_text = f"{r:g}R"
+        wall_ok = bool(self.cfg.oi_wall_target and wall_strike and sign * (wall_strike - spot) >= r * dist)
+        t1_level = wall_strike if wall_ok else spot + sign * r * dist
         ce_pe = "CE" if side == "CALL" else "PE"
         trade_text = f"trade {trade_no}{limit}"
         master._log(f"SIGNAL {key} {side} ({trade_text}): spot {spot:,.1f} broke 5-min "
                     f"candle {'high' if side == 'CALL' else 'low'} {leg.or_high if side == 'CALL' else leg.or_low:,.1f}; "
-                    f"{sl_text}; T1 wall {wall_strike or '1:2 R:R'}; gates OK, score {s['passed']}/{s['total']} "
+                    f"{sl_text}; T1 {f'wall {wall_strike:,.0f}' if wall_ok else f'{t1_level:,.1f} ({r_text})'}; "
+                    f"gates OK, score {s['passed']}/{s['total']} "
                     f"(need {s['need']}) [{passed}] -> "
                     f"{','.join(self.entry_accounts)}", level="success", index=key, shared=True,
                     telegram=(
@@ -1749,7 +1788,7 @@ class Algo2Group:
                         f"Score {s['passed']}/{s['total']} (need {s['need']}) | gates OK\n"
                         f"SL {sl_level:,.1f} ({self.cfg.sl_candle_minutes}-min "
                         f"{'low' if side == 'CALL' else 'high'}) | T1 {t1_level:,.1f} "
-                        f"({'OI wall' if wall_ok else '2R'})\n"
+                        f"({'OI wall' if wall_ok else r_text})\n"
                         f"Contract: {int(leg.strike)} {ce_pe} (ITM) ~{leg.option_ltp}\n"
                         f"Orders → {', '.join(a.upper() for a in self.entry_accounts)}"))
         signal = asdict(leg)

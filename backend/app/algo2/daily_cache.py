@@ -32,6 +32,7 @@ from ..algo import session_for
 from ..algo_store import AlgoStore
 from ..dhan_client import DhanAPIError, get_dhan_client as get_data_client
 from ..instruments import get_index
+from ..opening_range import INTRADAY_FROM_TIME
 from .market_data import HEAVYWEIGHT_IDS, INDIA_VIX_ID, Algo2MarketData, parse_candles
 
 logger = logging.getLogger("dhan.algo2.cache")
@@ -181,7 +182,7 @@ class Algo2DailyCache:
                 continue   # resumed run: already saved
             try:
                 raw = await client.get_intraday(sec_id, segment, instrument, "1",
-                                                f"{day} 09:15:00", f"{day} 15:30:00", oi=with_oi)
+                                                f"{day} {INTRADAY_FROM_TIME}", f"{day} 15:30:00", oi=with_oi)
             except DhanAPIError as exc:
                 await self._sleep(CALL_GAP_SECONDS)
                 if exc.status_code == 429 or "904" in str(exc.error_code or ""):

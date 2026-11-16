@@ -17,7 +17,7 @@ from app.algo2 import engine as engine_module
 from app.algo2 import microstructure as micro
 from app.algo2 import score_v5 as v5
 from app.algo2.engine import Algo2Group, Algo2Position, parse_windows, validate_algo2_config
-from app.algo2.market_data import Series, parse_candles, resolve_futures_from_csv
+from app.algo2.market_data import Algo2MarketData, Series, parse_candles, resolve_futures_from_csv
 from app.algo2.news_events import NewsEventFetcher
 from app.dhan_client import DhanAPIError
 
@@ -203,6 +203,28 @@ class MarketDataTests(unittest.TestCase):
         out = resolve_futures_from_csv(csv_text, datetime(2026, 11, 10).date())
         self.assertEqual(out["NIFTY"]["securityId"], 61471)
         self.assertEqual(out["SENSEX"]["segment"], "BSE_FNO")
+
+
+class CandleFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candles_fetch_from_0914_so_the_0915_minute_is_kept(self):
+        # Dhan's fromDate is exclusive: from 09:15:00 the 09:15 bar opened at the 09:16 price (16-Nov).
+        now = datetime(2026, 11, 16, 9, 25, 4, tzinfo=v5.IST)
+        t915 = now.replace(minute=15, second=0).timestamp()
+        bars = {"timestamp": [t915 - 60, t915, t915 + 300], "open": [1, 25206.15, 25250.8],
+                "high": [1, 25310.7, 25268.1], "low": [1, 25195.35, 25237.05], "close": [1, 25250.0, 25260.0]}
+        client = MagicMock()
+        client.get_intraday = AsyncMock(return_value=bars)
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("app.algo2.market_data.get_data_client", return_value=client):
+            data = Algo2MarketData(tmp)
+            data.futures["NIFTY"] = {"securityId": 61471, "segment": "NSE_FNO"}
+            await data.refresh_candles("NIFTY", now)
+            await data.refresh_fut_1m("NIFTY", now)
+        froms = {c.args[4] for c in client.get_intraday.await_args_list}
+        self.assertEqual(froms, {"2026-11-16 09:14:00"})
+        self.assertEqual([c["t"] for c in data.spot_candles["NIFTY"]], [t915, t915 + 300])
+        self.assertEqual(data.spot_candles["NIFTY"][0]["open"], 25206.15)
+        self.assertEqual(data.fut_1m["NIFTY"][0]["t"], t915)
 
 
 class ConfigTests(unittest.TestCase):
@@ -395,6 +417,37 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                                                {"quantity": 65, "balance": 100000})
         self.assertEqual((target, stop), (23560.0, 23470.0))
 
+    async def test_expiry_day_target_is_1r(self):
+        self.group.signal_ctx["NIFTY"] = {"candleLow": 23470.0, "candleHigh": 23510.0, "wall": None}
+        today = algo_module.now_ist().date().isoformat()
+        with patch.object(self.engine, "_delta_for", return_value=0.7), \
+                patch.object(self.group.data, "chain_expiry", return_value=today):
+            target, stop = self.engine._levels(DayLeg("NIFTY"), "CALL", 23500.0, 20.0,
+                                               {"quantity": 65, "balance": 100000})
+        self.assertEqual((target, stop), (23530.0, 23470.0))
+
+    async def test_expiry_eve_uses_trading_days(self):
+        g = self.group
+        self.assertTrue(g.is_expiry_eve(date(2026, 11, 17), date(2026, 11, 16)))    # Mon before Tue expiry
+        self.assertTrue(g.is_expiry_eve(date(2026, 11, 23), date(2026, 11, 20)))    # 24-Nov holiday: Fri before Mon
+        self.assertTrue(g.is_expiry_eve(date(2026, 1, 27), date(2026, 1, 23)))      # 26-Jan Mon holiday
+        self.assertFalse(g.is_expiry_eve(date(2026, 11, 17), date(2026, 11, 17)))   # expiry day itself
+        self.assertFalse(g.is_expiry_eve(date(2026, 11, 24), date(2026, 11, 19)))
+        g.cfg.skip_expiry_eve = False
+        self.assertFalse(g.is_expiry_eve(date(2026, 11, 17), date(2026, 11, 16)))
+
+    async def test_v5_config_moves_to_v6_plan(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "config_version": 5, "min_score": 18}
+        for k in ("skip_expiry_eve", "target_r", "expiry_target_r"):
+            saved.pop(k)
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist") as persist:
+            self.engine._restore()
+        cfg = self.engine.cfg
+        self.assertEqual((cfg.skip_expiry_eve, cfg.target_r, cfg.expiry_target_r, cfg.min_score,
+                          cfg.config_version), (True, 2.0, 1.0, 18, 6))
+        persist.assert_called()
+
     async def test_stop_loss_exit_ends_entries_for_the_day(self):
         today = algo_module.now_ist().date().isoformat()
         self.assertIsNone(self.group.sl_hit_today(today))
@@ -533,7 +586,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.vwap_band_sd, cfg.min_score, cfg.trade_windows,
-                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 17, "09:45-15:00", 0, 5))
+                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 17, "09:45-15:00", 0, 6))
         self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.partial_booking, cfg.trade_limit,
                               cfg.protective_sl)))
         persist.assert_called()
@@ -546,7 +599,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.min_score, cfg.data_sl, cfg.protective_sl,
-                          cfg.config_version), (12.0, 17, False, False, 5))
+                          cfg.config_version), (12.0, 17, False, False, 6))
 
     async def test_v3_saved_config_disables_broker_protective_sl(self):
         saved = {**engine_module.asdict(self.engine.cfg), "config_version": 3, "protective_sl": True}
@@ -554,7 +607,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.engine, "_persist") as persist:
             self.engine._restore()
         self.assertFalse(self.engine.cfg.protective_sl)
-        self.assertEqual(self.engine.cfg.config_version, 5)
+        self.assertEqual(self.engine.cfg.config_version, 6)
         persist.assert_called()
 
     async def test_v4_live_config_moves_to_v5_rules(self):
@@ -568,7 +621,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.indices, cfg.score_model, cfg.min_score, cfg.sl_candle_minutes, cfg.expiry_block,
-                          cfg.exit_time, cfg.config_version), (["NIFTY"], "v5", 17, 15, "10:45-11:45", "15:15", 5))
+                          cfg.exit_time, cfg.config_version), (["NIFTY"], "v5", 17, 15, "10:45-11:45", "15:15", 6))
         self.assertTrue(cfg.first_touch_only and cfg.atm_fallback and cfg.max_affordable)
         self.assertTrue(all(cfg.conditions[k] for k in v5.FEATURES))
         persist.assert_called()
@@ -665,6 +718,43 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(m["score"][side]["passed"], v5.points(feats))
             self.assertEqual(m["score"][side]["total"], 24)
         self.assertEqual(m["v5"]["stopCandle"]["low"], 23390.0)
+        self.assertFalse(m["v5"]["expiryEve"])
+
+    async def test_v5_expiry_eve_gate_blocks_entries(self):
+        g = self.group
+        now = datetime(2026, 11, 16, 10, 0, 5, tzinfo=algo_module.IST)
+        with patch.object(g.data, "spot", return_value=23500.0), \
+                patch.object(g.data, "chain_rows", return_value=CHAIN), \
+                patch.object(g.data, "chain_expiry", return_value="2026-11-17"), \
+                patch.object(g.data, "futures_price", return_value=None):
+            m = g.compute_metrics("NIFTY", now)
+        self.assertTrue(m["v5"]["expiryEve"])
+        self.assertIn("expiry_eve", m["score"]["CALL"]["gatesFailed"])
+        self.assertIn("expiry_eve", Algo2Group.entry_blockers(m, "CALL", 0))
+
+    async def test_market_calendar_matches_start_gate_list(self):
+        import importlib.util
+        from app import market_calendar
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "deployment", "aws", "market_holidays.py")
+        spec = importlib.util.spec_from_file_location("deploy_market_holidays", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(market_calendar.NSE_TRADING_HOLIDAYS, mod.NSE_TRADING_HOLIDAYS)
+
+    async def test_v5_features_are_scored_at_the_trigger_not_the_later_spot(self):
+        # Live 16-Nov 11:01: spot ticked past the trigger; the backtest scores at the trigger level.
+        g = self.group
+        now = datetime(2026, 11, 16, 10, 0, 5, tzinfo=algo_module.IST)
+        t0 = now.replace(hour=9, minute=15, second=0).timestamp()
+        g.data.spot_candles["NIFTY"] = [{"t": t0 + i * 300, "open": 23400.0, "high": 23420.0, "low": 23390.0,
+                                         "close": 23410.0} for i in range(9)]
+        with patch.object(g.data, "spot", return_value=23500.0), \
+                patch.object(g.data, "chain_rows", return_value=CHAIN), \
+                patch.object(g.data, "futures_price", return_value=None):
+            m = g.compute_metrics("NIFTY", now)
+        self.assertEqual(m["triggerUp"], 23420.5)
+        self.assertEqual(m["v5"]["stopDist"]["CALL"], 30.5)           # 23420.5 - 23390, not 23500 - 23390
+        self.assertTrue(m["v5"]["features"]["CALL"]["f10_wall_room"])  # wall 23600 >= 2 x 30.5 from the trigger
 
     async def test_expiry_block_only_on_expiry_day_inside_window(self):
         g = self.group
@@ -937,7 +1027,7 @@ class DailyCacheTests(unittest.IsolatedAsyncioTestCase):
         # NIFTY spot + NIFTY fut + VIX + 6 heavyweights, 1-min candles, 3 s apart
         self.assertEqual(self.client.get_intraday.await_count, 9)
         first = self.client.get_intraday.await_args_list[0].args
-        self.assertEqual(first[2:], ("INDEX", "1", "2026-11-10 09:15:00", "2026-11-10 15:30:00"))
+        self.assertEqual(first[2:], ("INDEX", "1", "2026-11-10 09:14:00", "2026-11-10 15:30:00"))
         fut_call = next(c for c in self.client.get_intraday.await_args_list if c.args[2] == "FUTIDX")
         self.assertTrue(fut_call.kwargs["oi"])
         self.assertEqual(self.sleep.await_count, 9)

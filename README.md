@@ -462,6 +462,8 @@ reconcile and exit code; only the signal, levels and exits below differ.
 
 Saved configs are migrated once (`config_version` 4) to: min score 7, window 09:45–15:00,
 2R target, no Data SL / hold rule / trade cap / stop-after-SL. Later Settings edits are kept.
+Config version 6 adds: no entries on the trading day before NIFTY expiry (`skip_expiry_eve`, holidays from
+`backend/app/market_calendar.py`) and a 1R target on expiry day.
 
 4. Strike: ITM with |delta| closest to 0.70. Size: max affordable (90% of balance).
 
@@ -471,7 +473,7 @@ Saved configs are migrated once (`config_version` 4) to: min score 7, window 09:
 | --- | --- |
 | 1 | **SL = breakout 5-min candle LOW (CALL) / HIGH (PUT)** on spot. No capital cap by default. |
 | 2 | **Software-only stop:** the app checks live index-spot ticks and sends a MARKET exit when the candle stop is hit. Algo 2 does not submit a broker protective SL order because Dhan converted its SL-M SELL into an immediately marketable LIMIT order. This stop depends on the app and live feed running; it cannot protect the position during an app/feed outage. |
-| 3 | **Target = 2R** (2 × candle stop distance on spot) → full exit. Optional (OFF): OI-wall target, 70% partial booking with stop → cost and VWAP / T2 trail. |
+| 3 | **Target = 2R** (2 × candle stop distance on spot) → full exit; **1R on expiry day** (`target_r` / `expiry_target_r`). Optional (OFF): OI-wall target, 70% partial booking with stop → cost and VWAP / T2 trail. |
 | 4 | Data SL (OFF by default): same-side OI velocity > 0 and ≥ 10 pp ahead of the other side (OI trap) → exit. |
 | 5 | Hold-time rule (OFF by default, `max_hold_minutes`): target not reached in N min → exit. |
 | 6 | **15:15 time exit** if neither SL nor target hit (before Dhan's ~15:18 INTRADAY auto square-off). |

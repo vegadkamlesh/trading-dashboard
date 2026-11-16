@@ -37,6 +37,9 @@ class ConfigPatch(BaseModel):
     max_trades: Optional[int] = None
     trade_limit: Optional[bool] = None
     oi_wall_target: Optional[bool] = None
+    skip_expiry_eve: Optional[bool] = None
+    target_r: Optional[float] = None
+    expiry_target_r: Optional[float] = None
     max_lots: Optional[int] = None
     min_lots: Optional[int] = None
     max_affordable: Optional[bool] = None
