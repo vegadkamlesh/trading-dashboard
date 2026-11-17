@@ -4,7 +4,7 @@ import os
 import tempfile
 import time
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
@@ -269,6 +269,15 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                       initial_stop_spot=23480.0, dry_run=True, spot=23500.0, premium=100.0,
                       t1_spot=23540.0, entry_confirmed_ts=time.time())
         return Algo2Position(**(values | changes))
+
+    def test_manual_off_lasts_only_for_the_day_it_was_saved(self):
+        today = algo_module.now_ist().date()
+        path = os.path.join(self.tmp.name, "group.json")
+        for saved_day, expected in ((today.isoformat(), False), ((today - timedelta(days=1)).isoformat(), True),
+                                    (None, True)):
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"dryRun": False, "enabled": False, "savedDay": saved_day}, fh)
+            self.assertEqual(Algo2Group(self.tmp.name).saved_enabled, expected, saved_day)
 
     async def test_paper_t1_partial_then_cost_stop_never_calls_broker(self):
         self.engine.cfg.partial_booking = True

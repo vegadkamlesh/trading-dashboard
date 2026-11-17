@@ -1013,7 +1013,9 @@ class Algo2Group:
         except (OSError, ValueError):
             return
         self.dry_run = bool(data.get("dryRun", False))
-        self.saved_enabled = bool(data.get("enabled", True))
+        # A manual OFF lasts only for the day it was saved; the next day's server start arms Algo 2 again.
+        same_day = data.get("savedDay") == base.now_ist().date().isoformat()
+        self.saved_enabled = bool(data.get("enabled", True)) or not same_day
         accounts = tuple(a for a in data.get("accounts") or self.entry_accounts if a in ACCOUNT_IDS)
         self.entry_accounts = accounts or ("master",)
         self.signal_day = data.get("signalDay")
@@ -1023,7 +1025,8 @@ class Algo2Group:
         tmp = self.settings_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"dryRun": self.dry_run, "enabled": self.enabled, "accounts": list(self.entry_accounts),
-                       "signalDay": self.signal_day, "signalCount": self.signal_count}, fh, indent=2)
+                       "signalDay": self.signal_day, "signalCount": self.signal_count,
+                       "savedDay": base.now_ist().date().isoformat()}, fh, indent=2)
         os.replace(tmp, self.settings_path)
 
     @property

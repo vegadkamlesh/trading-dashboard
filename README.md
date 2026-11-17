@@ -306,7 +306,7 @@ IP for **each** account, then explicitly ARM the intended recipients.
 | Telegram / logs | Same channel and journal; Algo 2 messages start with "Algo 2". Algo 1 journal 7 days; Algo 2 journal + research history kept forever. |
 | Manual EXIT | Positions tab EXIT routes a tracked algo contract to that algo's own exit. |
 | Defaults | Both algos **ON + LIVE**, fast orders ON (no PIN): `APP_DRY_RUN=false`, `APP_FAST_ORDERS=true`, `ALGO_AUTO_ARM=true`; Algo 2 ON + LIVE unless turned OFF on its tab. |
-| Restart | Positions are restored and managed; Algo 1 auto-arms (`ALGO_AUTO_ARM`), Algo 2 re-arms unless it was turned OFF. Telegram gets "Algo 2 ON - LIVE after server start" (or ARM FAILED). |
+| Restart | Positions are restored and managed; Algo 1 auto-arms (`ALGO_AUTO_ARM`), Algo 2 re-arms unless it was turned OFF earlier the same day (an OFF lasts only that day; the next day's start arms it again). Telegram gets "Algo 2 ON - LIVE after server start" (or ARM FAILED). |
 | Server | AWS starts 09:00 and stops 16:00 Mon–Fri (skips NSE holidays). The stop does not square off. |
 
 ## Algo 1 — ORB (`🤖 Algo 1` tab)
