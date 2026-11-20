@@ -513,6 +513,10 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(logs, [])
             self.assertEqual(self.group.snapshot["lines"], snap)   # unchanged until the 5-min slot
             self.group._notify_updates(datetime(2026, 11, 11, 11, 25, 0))
+            self.assertEqual(logs, [])                             # 11:20-11:25 candle not published yet
+            for key in self.group.cfg.indices:
+                self.group.data.candles_for[key] = datetime(2026, 11, 11, 11, 25).timestamp()
+            self.group._notify_updates(datetime(2026, 11, 11, 11, 25, 3))
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0].count("NIFTY CALL @ 23,520.0 (fail: Net GEX negative)"), 1)
         self.assertEqual(self.group._blocked_recent, [])
@@ -779,6 +783,46 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             g.data.spot_candles["NIFTY"].append({"t": t0 + 9 * 300, "open": 23410.0, "high": 23430.0,
                                                  "low": 23400.0, "close": 23420.0})   # 10:00-10:05 arrives
             self.assertEqual(g.compute_metrics("NIFTY", now)["breakout"], "CALL")
+
+    async def test_accepted_breakout_enters_even_if_spot_ticks_back_inside(self):
+        # Live 18-Nov 09:52:05: the signal was sent, then "Breakout no longer valid" dropped it (backtest enters).
+        eng = self.engine
+        eng.enabled = True
+        self.group.signal_ctx["NIFTY"] = {"candleHigh": 23515.0, "candleLow": 23480.0, "wall": None}
+        leg = DayLeg("NIFTY", status="watching", or_high=23515.5, or_low=23499.5, spot=23515.2, security_id=1,
+                     strike=23250.0, prepared_side="CALL", option_ltp=100.0, expiry="2026-11-17")
+        eng._legs = {"NIFTY": leg}
+        with patch.object(algo_module.feed, "price", return_value=100.0), \
+                patch.object(algo_module.feed, "age", return_value=0.1), \
+                patch.object(eng, "_size_position", AsyncMock(return_value={"lots": 1, "quantity": 65})), \
+                patch.object(eng, "_log"):
+            self.assertFalse(eng.RECHECK_BREAKOUT_ON_ENTRY)
+            await eng._enter(leg, "CALL")
+            self.assertIsNotNone(eng._position)
+            eng._position = None
+            with patch.object(eng, "RECHECK_BREAKOUT_ON_ENTRY", True):   # Algo 1 behaviour is unchanged
+                await eng._enter(leg, "CALL")
+        self.assertIsNone(eng._position)
+        self.assertIn("no longer valid", leg.note)
+
+    async def test_fast_wake_once_per_trigger_cross(self):
+        g = self.group
+        g.cfg.indices = ["NIFTY"]
+        g.master.enabled = True
+        now = datetime(2026, 11, 16, 10, 7, 30, tzinfo=algo_module.IST)
+        bar = now.replace(minute=0, second=0).timestamp()
+        g.metrics["NIFTY"] = {"candle": {"t": bar, "high": 23515.0, "low": 23500.0},
+                              "triggerUp": 23515.5, "triggerDown": 23499.5}
+        spot = {"v": 23510.0}
+        with patch.object(g, "_data_needed", return_value=True), \
+                patch.object(g.data, "candle_due", return_value=False), \
+                patch.object(g.data, "spot", side_effect=lambda k: spot["v"]):
+            self.assertFalse(g._tick_needed_now(now))
+            spot["v"] = 23516.0
+            self.assertTrue(g._tick_needed_now(now))
+            self.assertFalse(g._tick_needed_now(now))      # one fast tick per touch; the 1 s tick covers the rest
+            spot["v"] = 23499.0
+            self.assertTrue(g._tick_needed_now(now))       # the other side is a new touch
 
     async def test_expiry_block_only_on_expiry_day_inside_window(self):
         g = self.group

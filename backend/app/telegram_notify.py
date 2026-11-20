@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -17,7 +18,7 @@ logger = logging.getLogger("dhan.telegram")
 IST = timezone(timedelta(hours=5, minutes=30))
 DETAIL_MAX = 3500
 MESSAGE_MAX_CHARS = 3900   # Telegram hard limit is 4096; longer text is split, never cut
-BATCH_WAIT_SECONDS = 1.5   # gather a burst (order -> broker -> fill) into one message per account
+BATCH_WAIT_SECONDS = 0.5   # gather a burst (signal -> orders) into one message per account
 LEVEL_ICONS = {"success": "✅", "info": "ℹ️", "warn": "⚠️", "warning": "⚠️", "error": "🚨"}
 DETAIL_EVENTS = ("token_expiry", "broker_update", "order_success", "order_failed")
 RULE = "──────────────"
@@ -107,7 +108,9 @@ def split_message(text: str, limit: int = MESSAGE_MAX_CHARS) -> list[str]:
 
 
 class TelegramNotifier:
-    SEND_INTERVAL_SECONDS = 3.1  # Also respects Telegram's 20 messages/minute group limit.
+    SEND_INTERVAL_SECONDS = 1.05  # Telegram: about 1 message/second per chat ...
+    WINDOW_SECONDS = 60.0
+    WINDOW_MAX_MESSAGES = 19      # ... and at most 20 messages/minute in a group
     BATCH_WAIT_SECONDS = BATCH_WAIT_SECONDS
     QUEUE_SIZE = 100
     MAX_EVENT_AGE_SECONDS = 600
@@ -297,6 +300,7 @@ class TelegramNotifier:
             raise RuntimeError("Telegram worker started without settings")
         heartbeat_at = time.monotonic() + settings.telegram_heartbeat_seconds
         next_send_at = 0.0
+        sent_at: deque[float] = deque()
         try:
             while True:
                 if not self._stop.is_set() and time.monotonic() >= heartbeat_at:
@@ -334,11 +338,17 @@ class TelegramNotifier:
                         else:
                             fresh.append(item)
                     for text in self.compose(fresh):
-                        delay = max(0.0, next_send_at - time.monotonic())
+                        now = time.monotonic()
+                        while sent_at and now - sent_at[0] >= self.WINDOW_SECONDS:
+                            sent_at.popleft()
+                        delay = max(0.0, next_send_at - now)
+                        if len(sent_at) >= self.WINDOW_MAX_MESSAGES:
+                            delay = max(delay, sent_at[0] + self.WINDOW_SECONDS - now)
                         # Preserve pacing during graceful shutdown, too.
                         if delay:
                             time.sleep(delay)
                         self._send(text)
+                        sent_at.append(time.monotonic())
                         next_send_at = time.monotonic() + self.SEND_INTERVAL_SECONDS
                 finally:
                     for _ in items:

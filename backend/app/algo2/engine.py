@@ -46,7 +46,7 @@ from fastapi import HTTPException
 from .. import algo as base
 from ..accounts import ACCOUNT_IDS, AccountId, account_credentials, account_scope
 from ..algo import (
-    MAX_PRICE_AGE, TERMINAL_ORDERS, AlgoConfig, AlgoEngine, DayLeg, Position,
+    IST, MAX_PRICE_AGE, TERMINAL_ORDERS, AlgoConfig, AlgoEngine, DayLeg, Position,
     _as_float, _as_int, now_ist, session_for,
 )
 from ..algo_store import AlgoStore, base_dir
@@ -66,6 +66,8 @@ logger = logging.getLogger("dhan.algo2")
 
 DATA_DIR = os.path.join(os.path.dirname(base_dir()), "algo2")
 SIGNAL_LOOP_SECONDS = 1.0
+FAST_POLL_SECONDS = 0.1        # between full ticks: wake at once on a trigger cross or a due candle
+STATUS_MAX_WAIT_SECONDS = 20   # 5-min report waits for the just-closed candle at most this long
 
 CONDITIONS: List[Tuple[str, str]] = [
     ("news", "No news/event freeze (+/-15 min)"),
@@ -211,6 +213,8 @@ class Algo2Engine(AlgoEngine):
     ALGO_LABEL = "Algo 2"
     ORDER_TAG = "AL2"
     POSITION_CLS = Algo2Position
+    # The touch already passed the score at the trigger; a tick back inside must not cancel it (backtest).
+    RECHECK_BREAKOUT_ON_ENTRY = False
 
     def __init__(self, group: "Algo2Group", account_id: AccountId) -> None:
         self._group_ref = group
@@ -987,6 +991,7 @@ class Algo2Group:
         self._attempted: Dict[str, Tuple[float, str]] = {}
         self._touched: Dict[str, set] = {}
         self._touched_day: Optional[str] = None
+        self._fast_woke: set = set()
         self._maxpain: Dict[Tuple[str, str], float] = {}
         self._presubscribed_at = 0.0
         self.v5ctx = v5.DailyContext(os.path.join(directory, "v5_context"))
@@ -1288,6 +1293,11 @@ class Algo2Group:
             if not m:
                 continue
             lines += ["", f"{key} {m['spot']:,.1f}" if m.get("spot") else key]
+            c = m.get("candle") or {}
+            if c.get("t"):
+                start = datetime.fromtimestamp(c["t"], IST)
+                lines.append(f"5-min candle {start:%H:%M}-{start + timedelta(minutes=5):%H:%M}: "
+                             f"H {c['high']:,.1f} / L {c['low']:,.1f}")
             if m.get("triggerUp") is not None:
                 lines.append(f"CE buy above {m['triggerUp']:,.1f} | PE buy below {m['triggerDown']:,.1f}")
             for side, tag in (("CALL", "CE"), ("PUT", "PE")):
@@ -1354,10 +1364,18 @@ class Algo2Group:
         if self._snapshot_holding is None or self.has_position() != self._snapshot_holding:
             self._take_snapshot(now)
         every = int(self.cfg.status_report_minutes or 0)
-        if every <= 0 or now.minute % every:
+        if every <= 0:
             return
-        slot = now.strftime("%Y-%m-%d %H:%M")
-        if slot == self._last_report_slot:
+        slot_start = now.replace(second=0, microsecond=0)
+        slot_start -= timedelta(minutes=slot_start.minute % every)
+        slot = slot_start.strftime("%Y-%m-%d %H:%M")
+        elapsed = (now - slot_start).total_seconds()
+        if slot == self._last_report_slot or elapsed >= 60:
+            return
+        # Report the candle that just closed: wait until Dhan publishes it (never past STATUS_MAX_WAIT_SECONDS).
+        indices = [k for k in self.cfg.indices if get_index(k)]
+        ready = all(self.data.candles_for.get(k) == slot_start.timestamp() for k in indices)
+        if not ready and elapsed < STATUS_MAX_WAIT_SECONDS:
             return
         self._last_report_slot = slot
         text = self._situation_text()
@@ -1403,7 +1421,44 @@ class Algo2Group:
             except Exception as exc:  # noqa: BLE001
                 self.loop_error = str(exc)
                 logger.exception("Algo 2 signal loop error")
-            await asyncio.sleep(SIGNAL_LOOP_SECONDS)
+            await self._wait_next_tick()
+
+    async def _wait_next_tick(self) -> None:
+        end = time.monotonic() + SIGNAL_LOOP_SECONDS
+        while self._running:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(FAST_POLL_SECONDS, left))
+            try:
+                if self._tick_needed_now(now_ist()):
+                    return
+            except Exception:  # noqa: BLE001 - the 1 s tick still runs
+                logger.exception("Algo 2 fast wake check failed")
+                return
+
+    def _tick_needed_now(self, now: datetime) -> bool:
+        """Cheap check between ticks: an untouched trigger was crossed or a closed candle can be fetched."""
+        if not self._data_needed(now):
+            return False
+        bar_start = now.replace(second=0, microsecond=0)
+        bar_start -= timedelta(minutes=bar_start.minute % 5)
+        for key in self.cfg.indices:
+            if self.data.candle_due(key, now):
+                return True
+            m = self.metrics.get(key) or {}
+            candle, up, down = m.get("candle") or {}, m.get("triggerUp"), m.get("triggerDown")
+            if up is None or down is None or not candle or candle["t"] + 300 < bar_start.timestamp():
+                continue
+            if not self.enabled or self.has_position() or self._dispatching:
+                continue
+            spot = self.data.spot(key)
+            side = "CALL" if spot and spot > up else "PUT" if spot and spot < down else None
+            touch = (key, float(candle["t"]), side)
+            if side and touch not in self._fast_woke and (touch[1], side) not in self._touched.get(key, set()):
+                self._fast_woke = {w for w in self._fast_woke if w[1] >= touch[1]} | {touch}   # once per touch
+                return True
+        return False
 
     async def tick(self) -> None:
         now = now_ist()

@@ -750,7 +750,8 @@ in access-controlled AWS storage. Telegram must not be the trading audit databas
 
 The worker does not block trading on network I/O. Delivery is best-effort: bounded
 100-event in-memory queue, 10-minute event expiry, at most three attempts, 429
-backoff and minimum 3.1 seconds between sends (including group pacing).
+backoff, about 1 second between sends and at most 19 sends per rolling minute
+(Telegram group pacing); a burst is gathered for 0.5 seconds into one message per account.
 Generic warning/error categories are grouped for 60 seconds, not sent for every
 tick/API poll. Queue drops, failures and grouping counters are visible in Settings.
 Network retries may duplicate a notification; crashes can lose queued events.

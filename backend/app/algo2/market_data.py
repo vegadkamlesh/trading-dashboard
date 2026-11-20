@@ -41,6 +41,8 @@ HISTORY_SECONDS = 1200.0     # > 15 min so the v5 BANKNIFTY 15-minute move has a
 MAX_SPOT_AGE = 5.0
 BANKNIFTY_ID = 25
 FUT_1M_SECONDS = 60.0
+CANDLE_FIRST_TRY_SECONDS = 2.0   # Dhan publishes a closed 5-min bar ~3 s after the boundary
+CANDLE_RETRY_SECONDS = 1.0
 
 # Verified from the Dhan scrip master (NSE_EQ security ids).
 HEAVYWEIGHT_IDS: Dict[str, int] = {
@@ -274,14 +276,25 @@ class Algo2MarketData:
         return None
 
     # ---------------------------------------------------------- candles
+    def _bar_end(self, now: datetime) -> datetime:
+        bar_end = now.replace(second=0, microsecond=0)
+        return bar_end - timedelta(minutes=bar_end.minute % 5)
+
+    def candle_due(self, index_key: str, now: datetime) -> bool:
+        """True when the just-closed 5-min bar is not loaded yet and a fetch may be tried now."""
+        bar_end = self._bar_end(now)
+        return (self.candles_for.get(index_key) != bar_end.timestamp()
+                and (now - bar_end).total_seconds() >= CANDLE_FIRST_TRY_SECONDS
+                and time.time() >= self._next_candle_try.get(index_key, 0.0))
+
     async def refresh_candles(self, index_key: str, now: datetime) -> None:
         """Fetch today's 5-minute spot + futures candles once per closed 5-minute bar."""
-        bar_end = now.replace(second=0, microsecond=0)
-        bar_end -= timedelta(minutes=bar_end.minute % 5)
+        bar_end = self._bar_end(now)
         boundary = bar_end.timestamp()
         if self.candles_for.get(index_key) == boundary:
             return
-        if time.time() < self._next_candle_try.get(index_key, 0.0) or (now - bar_end).total_seconds() < 3:
+        if (time.time() < self._next_candle_try.get(index_key, 0.0)
+                or (now - bar_end).total_seconds() < CANDLE_FIRST_TRY_SECONDS):
             return
         inst = get_index(index_key)
         if inst is None:
@@ -306,7 +319,7 @@ class Algo2MarketData:
         futs = [c for c in parse_candles(fut_raw) if open_ts <= c["t"] < boundary] if fut_raw is not None else []
         if not spot or spot[-1]["t"] < boundary - 300:
             # Dhan has not published the just-closed bar yet; retry shortly.
-            self._next_candle_try[index_key] = time.time() + 5
+            self._next_candle_try[index_key] = time.time() + CANDLE_RETRY_SECONDS
             self.spot_candles[index_key] = spot or self.spot_candles.get(index_key, [])
             self.fut_candles[index_key] = futs or self.fut_candles.get(index_key, [])
             return
@@ -314,6 +327,10 @@ class Algo2MarketData:
         self.fut_candles[index_key] = futs
         self.candles_for[index_key] = boundary
         self.candle_error = None
+        last = spot[-1]
+        logger.info("Algo 2 %s 5-min candle %s-%s loaded at +%.1fs: H %.2f L %.2f", index_key,
+                    (bar_end - timedelta(minutes=5)).strftime("%H:%M"), bar_end.strftime("%H:%M"),
+                    time.time() - boundary, last["high"], last["low"])
 
     async def refresh_fut_1m(self, index_key: str, now: datetime) -> None:
         """Closed 1-minute futures candles (with volume) for the v5 1-min VWAP, once per minute."""

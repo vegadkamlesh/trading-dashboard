@@ -118,7 +118,7 @@ class TelegramTests(unittest.TestCase):
                     self.assertFalse(service._send("test"))
         self.assertEqual(send.call_count, 3)
         self.assertEqual(wait.call_count, 2)
-        self.assertTrue(all(call.args[0] >= 3.1 for call in wait.call_args_list))
+        self.assertTrue(all(call.args[0] >= service.SEND_INTERVAL_SECONDS for call in wait.call_args_list))
         self.assertNotIn("offline-test-token", "\n".join(logs.output))
 
     def test_algo_lines_carry_short_detail_other_records_stay_metadata_only(self):
@@ -209,7 +209,8 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(service.status()["sent"], 1)
         service.stop()
         self.assertEqual(len(sent_at), 2)
-        self.assertTrue(all(second - first >= 3.1 for first, second in zip(sent_at, sent_at[1:])))
+        self.assertTrue(all(second - first >= service.SEND_INTERVAL_SECONDS
+                            for first, second in zip(sent_at, sent_at[1:])))
         self.assertFalse(service.status()["running"])
         self.assertFalse(service.publish("test"))
         self.assertNotIn(service._handler, logging.getLogger().handlers)
@@ -293,6 +294,24 @@ class TelegramTests(unittest.TestCase):
                 service._run()
         send.assert_not_called()
         self.assertEqual(service.status()["dropped"], 1)
+
+    def test_burst_is_paced_by_the_per_minute_group_limit(self):
+        service = self.service()
+        service.SEND_INTERVAL_SECONDS, service.WINDOW_MAX_MESSAGES, service.BATCH_WAIT_SECONDS = 0, 2, 0
+        for account in ("master", "child", ""):
+            service._queue.put((time.monotonic(), f"alert {account}", account, "", ""))
+        sleeps = []
+
+        def deliver(text):
+            if "alert" in text and sum("alert" in c.args[0] for c in send.call_args_list) == 3:
+                service._stop.set()
+            return True
+        with patch.object(service, "_send", side_effect=deliver) as send, \
+                patch("app.telegram_notify.time.sleep", side_effect=sleeps.append):
+            service._run()
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreater(sleeps[0], 59)                    # the 3rd message waits for the 60 s window
 
     def test_worker_unexpected_failure_visible_and_publish_rejected(self):
         service = self.service()

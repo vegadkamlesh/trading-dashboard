@@ -314,6 +314,8 @@ class AlgoEngine:
     ALGO_LABEL = "Algo 1"
     ORDER_TAG = "ORB"   # correlation-id prefix of this algo's orders
     POSITION_CLS = Position
+    # Re-check spot vs the breakout level right before the order (Algo 2 enters like its backtest).
+    RECHECK_BREAKOUT_ON_ENTRY = True
 
     def _is_dry(self) -> bool:
         return runtime.is_dry_run()
@@ -1655,11 +1657,16 @@ class AlgoEngine:
         spot_age = feed.age(inst.sec_id, "IDX_I") if inst else None
         live_spot = leg.spot or 0.0
         # A funds retry re-sends an already accepted signal immediately; no breakout recheck.
-        if not leg.funds_retries and (spot_age is None or spot_age > MAX_PRICE_AGE or (
-            direction == "CALL" and live_spot <= (leg.or_high or 0)
-        ) or (direction == "PUT" and live_spot >= (leg.or_low or 0))):
-            leg.note = "Breakout no longer valid on a fresh spot quote; waiting."
-            return
+        if not leg.funds_retries:
+            if spot_age is None or spot_age > MAX_PRICE_AGE:
+                leg.note = "Spot feed is stale (no tick in 5s); entry not sent."
+                return
+            if self.RECHECK_BREAKOUT_ON_ENTRY and (
+                (direction == "CALL" and live_spot <= (leg.or_high or 0))
+                or (direction == "PUT" and live_spot >= (leg.or_low or 0))
+            ):
+                leg.note = "Breakout no longer valid on a fresh spot quote; waiting."
+                return
         if self.account_id is None:
             spot = live_spot
         target, stop = self._levels(leg, direction, spot, rng, sizing)
