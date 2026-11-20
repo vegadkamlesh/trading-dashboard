@@ -20,7 +20,7 @@ DETAIL_MAX = 3500
 MESSAGE_MAX_CHARS = 3900   # Telegram hard limit is 4096; longer text is split, never cut
 BATCH_WAIT_SECONDS = 0.5   # gather a burst (signal -> orders) into one message per account
 LEVEL_ICONS = {"success": "✅", "info": "ℹ️", "warn": "⚠️", "warning": "⚠️", "error": "🚨"}
-DETAIL_EVENTS = ("token_expiry", "broker_update", "order_success", "order_failed")
+DETAIL_EVENTS = ("token_expiry", "broker_update", "order_success", "order_failed", "data_source")
 RULE = "──────────────"
 
 EVENTS = {
@@ -42,6 +42,7 @@ EVENTS = {
     "fast_changed": "Order PIN safety setting changed by operator",
     "broker_update": "Broker order update received; holdings require reconciliation",
     "feed_connected": "Market feed connected (not trading readiness)",
+    "data_source": "Market data source switched (Master/Child)",
     "login_failed": "Dashboard broker-token validation failed",
     "api_error": "Dashboard API returned a server error",
     "warning": "Application warning; inspect local logs",

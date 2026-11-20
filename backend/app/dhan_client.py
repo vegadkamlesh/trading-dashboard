@@ -86,7 +86,7 @@ def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 def source_ip_for(account_id: str) -> str:
     """Local IPv4 this account's Dhan traffic must leave from ("" = OS default)."""
     s = get_settings()
-    if account_id == "child":
+    if account_id in ("child", "child-data"):
         return s.dhan_child_source_ip.strip()
     if account_id in ("master", "master-data"):
         return s.dhan_master_source_ip.strip()
@@ -111,6 +111,18 @@ _HEAVY_PATHS = ("/charts/historical", "/charts/rollingoption", "/charts/intraday
 # Minimum gap between two heavy calls. Dhan's data API is strict; ~1.1s keeps us
 # comfortably under the per-second limits even with several panels loading.
 _HEAVY_MIN_GAP_SECONDS = 1.1
+
+# Market-data endpoints the Child token can serve while Master's data API is failing.
+_DATA_PATHS = ("/charts/", "/marketfeed/", "/optionchain")
+# Account/infra failures (not bad input like DH-905/907, which would fail on Child too).
+_FAILOVER_CODES = {"DH-901", "DH-902", "DH-903", "DH-904", "DH-908", "DH-909"}
+DATA_PROBE_SECONDS = 30.0
+
+
+def is_data_failover_error(exc: "DhanAPIError") -> bool:
+    return (exc.error_code in _FAILOVER_CODES or exc.status_code in (0, 401, 403, 429)
+            or exc.status_code >= 500)
+
 
 # Dhan error codes we surface specially in the UI (see Annexure).
 ERROR_HINTS = {
@@ -182,6 +194,10 @@ class DhanClient:
         self._order_signals: "weakref.WeakSet[asyncio.Event]" = weakref.WeakSet()
         self._auth_retry_at = 0.0
         self._auth_error: Optional[DhanAPIError] = None
+        # Master-data only: True while market data is served by the Child token.
+        self.on_backup_data = False
+        self._next_master_probe = 0.0
+        self._probe_task: Optional[asyncio.Task] = None
         if self._mock:
             logger.warning("DhanClient running in MOCK mode (synthetic data, no network)")
 
@@ -397,6 +413,68 @@ class DhanClient:
 
     # ---------------- low level ----------------
     async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Optional[Dict[str, Any]] = None,
+        throttle: bool = True,
+    ) -> Any:
+        if self.account_id != "master-data" or self._mock or not path.startswith(_DATA_PATHS):
+            return await self._send(method, path, json=json, throttle=throttle)
+        if self.on_backup_data:
+            backup = get_data_backup_client()
+            if backup is not None:
+                self._maybe_probe_master(method, path, json)
+                try:
+                    return await backup._send(method, path, json=json, throttle=throttle)
+                except DhanAPIError as exc:
+                    if not is_data_failover_error(exc):
+                        raise
+                    result = await self._send(method, path, json=json, throttle=throttle)
+                    self._switch_data_source(False)
+                    return result
+        try:
+            return await self._send(method, path, json=json, throttle=throttle)
+        except DhanAPIError as exc:
+            backup = get_data_backup_client() if is_data_failover_error(exc) else None
+            if backup is None:
+                raise
+            self._switch_data_source(True, exc)
+            return await backup._send(method, path, json=json, throttle=throttle)
+
+    def _switch_data_source(self, to_backup: bool, exc: Optional["DhanAPIError"] = None) -> None:
+        if self.on_backup_data == to_backup:
+            return
+        self.on_backup_data = to_backup
+        if to_backup:
+            self._next_master_probe = time.monotonic() + DATA_PROBE_SECONDS
+            text = (f"📡 Market data switched: MASTER → CHILD\nMaster data API failed: {exc}\n"
+                    f"Retrying Master every {DATA_PROBE_SECONDS:.0f}s; trading continues on Child data")
+        else:
+            text = "📡 Market data switched back: CHILD → MASTER\nMaster data API is working again"
+        logger.warning(text.replace("\n", " | "), extra={"telegram_event": "data_source", "telegram_detail": text})
+
+    def _maybe_probe_master(self, method: str, path: str, json: Optional[Dict[str, Any]]) -> None:
+        now = time.monotonic()
+        if now < self._next_master_probe or (self._probe_task is not None and not self._probe_task.done()):
+            return
+        self._next_master_probe = now + DATA_PROBE_SECONDS
+        self._probe_task = asyncio.create_task(self._probe_master(method, path, json))
+
+    async def _probe_master(self, method: str, path: str, json: Optional[Dict[str, Any]]) -> None:
+        """Repeat one real data request on Master (outside the heavy gate); success switches back."""
+        try:
+            await self._send(method, path, json=json, throttle=False)
+        except DhanAPIError as exc:
+            if is_data_failover_error(exc):
+                logger.info("Master data API still failing (%s); staying on Child data", exc)
+                return
+        except Exception:  # noqa: BLE001 - a probe must never break data flow
+            return
+        self._switch_data_source(False)
+
+    async def _send(
         self,
         method: str,
         path: str,
@@ -1046,11 +1124,29 @@ def get_dhan_client() -> DhanClient:
     return _client
 
 
+_backup_client: Optional[DhanClient] = None
+
+
+def get_data_backup_client() -> Optional[DhanClient]:
+    """Child-token client used only for market data while Master's data API fails."""
+    global _backup_client
+    if _backup_client is None:
+        s = get_settings()
+        if not s.dhan_child_client_id or not s.dhan_child_access_token:
+            return None
+        _backup_client = DhanClient(client_id=s.dhan_child_client_id, access_token=s.dhan_child_access_token,
+                                    account_id="child-data")
+    return _backup_client
+
+
 async def close_dhan_client() -> None:
-    global _client
+    global _client, _backup_client
     if _client is not None:
         await _client.aclose()
         _client = None
+    if _backup_client is not None:
+        await _backup_client.aclose()
+        _backup_client = None
     for client in _trading_clients.values():
         await client.aclose()
     _trading_clients.clear()

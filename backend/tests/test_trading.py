@@ -1237,6 +1237,72 @@ class RateAndCacheTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.aclose()
 
+    async def _failover_pair(self, master_handler, child_handler):
+        import httpx
+        master, child = DhanClient(), DhanClient(account_id="child-data")
+        for client, handler in ((master, master_handler), (child, child_handler)):
+            await client._client.aclose()
+            client._mock = False
+            client._client = httpx.AsyncClient(base_url="https://api.dhan.co/v2",
+                                               transport=httpx.MockTransport(handler))
+        return master, child
+
+    async def test_master_data_rate_limit_fails_over_to_child_then_back(self):
+        import httpx
+        master_ok = {"value": False}
+
+        def master(request):
+            if master_ok["value"]:
+                return httpx.Response(200, json={"src": "master"})
+            return httpx.Response(429, json={"errorCode": "DH-904", "errorMessage": "rate limited"})
+
+        master_client, child_client = await self._failover_pair(
+            master, lambda request: httpx.Response(200, json={"src": "child"}))
+        try:
+            with patch("app.dhan_client.get_data_backup_client", return_value=child_client), \
+                    patch("app.dhan_client.gate_for", return_value=MagicMock(acquire=AsyncMock())), \
+                    self.assertLogs("dhan.client", "WARNING") as logs:
+                self.assertEqual(await master_client._request("POST", "/charts/intraday", json={}),
+                                 {"src": "child"})
+                self.assertTrue(master_client.on_backup_data)
+                self.assertTrue(any("MASTER → CHILD" in line for line in logs.output))
+                # Still failing: stays on Child.
+                master_client._next_master_probe = 0
+                self.assertEqual(await master_client._request("POST", "/charts/intraday", json={}),
+                                 {"src": "child"})
+                await master_client._probe_task
+                self.assertTrue(master_client.on_backup_data)
+                # Master recovers: the background probe switches back.
+                master_ok["value"] = True
+                master_client._next_master_probe = 0
+                await master_client._request("POST", "/charts/intraday", json={})
+                await master_client._probe_task
+                self.assertFalse(master_client.on_backup_data)
+                self.assertEqual(await master_client._request("POST", "/charts/intraday", json={}),
+                                 {"src": "master"})
+        finally:
+            await master_client.aclose()
+            await child_client.aclose()
+
+    async def test_bad_input_and_order_paths_do_not_fail_over(self):
+        import httpx
+        child_handler = MagicMock(return_value=httpx.Response(200, json={}))
+        master_client, child_client = await self._failover_pair(
+            lambda request: httpx.Response(400, json={"errorCode": "DH-905", "errorMessage": "bad input"}),
+            child_handler)
+        try:
+            with patch("app.dhan_client.get_data_backup_client", return_value=child_client), \
+                    patch("app.dhan_client.gate_for", return_value=MagicMock(acquire=AsyncMock())):
+                with self.assertRaises(DhanAPIError):
+                    await master_client._request("POST", "/charts/intraday", json={})
+                with self.assertRaises(DhanAPIError):
+                    await master_client._request("GET", "/positions")
+            child_handler.assert_not_called()
+            self.assertFalse(master_client.on_backup_data)
+        finally:
+            await master_client.aclose()
+            await child_client.aclose()
+
 
 class ManualOrderAuditTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
