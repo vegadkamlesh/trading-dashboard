@@ -15,7 +15,9 @@ payload length uint16) followed by the raw WebSocket message bytes, exactly as r
 may hold several packets; split them with ``split_feed``/``split_depth``. ``instruments.jsonl``
 logs every subscription (what each security id is) and ``events.jsonl`` logs connects/errors.
 
-Nothing here is ever deleted. If free disk space drops below ``MIN_FREE_BYTES`` recording pauses
+Nothing here is ever lost: the daily S3 archive (``app/archive.py``) keeps every day permanently
+and only then frees old days from the small server disk. If free disk space drops below
+``MIN_FREE_BYTES`` recording pauses
 (trading keeps its disk headroom) and resumes once space is available again.
 """
 from __future__ import annotations

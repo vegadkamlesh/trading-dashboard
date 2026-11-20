@@ -16,6 +16,7 @@ import zipfile
 from collections.abc import Callable
 from datetime import datetime, time
 from pathlib import Path
+from time import sleep
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -1705,6 +1706,138 @@ def enable_cost_report(profile: str, stack: str, confirmed: bool) -> None:
     print("Weekday 15:55 IST AWS usage report enabled")
 
 
+LOG_GROUPS = {
+    "AppLogGroup", "SystemLogGroup", "AlertLambdaLogGroup", "MonitorLambdaLogGroup",
+    "CostReportLogGroup", "StartGateLogGroup",
+}
+
+
+def assert_safe_log_archive_update(changes: list[dict]) -> None:
+    """Allow: the new bucket, log-group retention removal, the instance role's archive grant, and
+    the in-place ARN-reference cascade CloudFormation reports for resources using those log groups."""
+    assert_safe_changes(changes, forbid_instance_change=True)
+    for change in changes:
+        resource = change["ResourceChange"]
+        name, action = resource["LogicalResourceId"], resource["Action"]
+        if name == "ArchiveBucket" and action == "Add" and resource.get("ResourceType") == "AWS::S3::Bucket":
+            continue
+        if action == "Modify" and resource.get("Replacement") == "Conditional":
+            continue  # dependents already validated by assert_safe_changes
+        if action != "Modify" or resource.get("Replacement") != "False":
+            raise RuntimeError(f"Refusing an unexpected log-archive change to {name}")
+        for detail in resource.get("Details", []):
+            target = detail.get("Target", {}).get("Name")
+            if detail.get("ChangeSource") in ("ResourceAttribute", "ResourceReference") and \
+                    detail.get("CausingEntity") != "DashboardInstance":
+                continue
+            if detail.get("ChangeSource") == "DirectModification" and (
+                    (name in LOG_GROUPS and target == "RetentionInDays")
+                    or (name == "InstanceRole" and target == "Policies")):
+                continue
+            raise RuntimeError(f"Refusing an unreviewed log-archive change to {name}.{target}")
+
+
+def archive_env_command(bucket: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+        raise ValueError("Invalid archive bucket name")
+    return f"""set -euo pipefail
+python3.11 - <<'PY'
+import os, tempfile
+path = "/opt/trading/backend/.env"
+st = os.stat(path)
+lines = [l for l in open(path, encoding="utf-8").read().splitlines() if not l.startswith("ARCHIVE_BUCKET=")]
+lines.append("ARCHIVE_BUCKET={bucket}")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write("\\n".join(lines) + "\\n")
+os.chown(tmp, st.st_uid, st.st_gid)
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+print("ARCHIVE_BUCKET set")
+PY
+systemctl restart trading-dashboard
+for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/api/health && exit 0; sleep 2; done
+echo "dashboard did not become healthy" >&2; exit 1
+"""
+
+
+def enable_log_archive(profile: str, stack: str, approved: bool, preview: bool) -> None:
+    """Keep every log forever: never-expiring CloudWatch groups + an append-only S3 archive bucket."""
+    if not approved and not preview:
+        raise ValueError("Confirm the permanent log archive was approved, or use --preview")
+    if not STACK_NAME.fullmatch(stack):
+        raise ValueError("Invalid stack name")
+    session = boto3.Session(profile_name=profile, region_name=REGION)
+    cloudformation = session.client("cloudformation")
+    current = cloudformation.describe_stacks(StackName=stack)["Stacks"][0]
+    if current["StackStatus"] not in UPDATABLE_STACK_STATES:
+        raise RuntimeError("Stack is not in an updateable state")
+    template = (HERE / "stack.yaml").read_text(encoding="utf-8")
+    deployed = cloudformation.get_template(StackName=stack, TemplateStage="Original")["TemplateBody"]
+    if deployed != template:
+        cloudformation.validate_template(TemplateBody=template)
+        params = [{"ParameterKey": item["ParameterKey"], "UsePreviousValue": True} for item in current["Parameters"]]
+        # ImageId resolves the *latest* AMI; pin it to the running instance's AMI so the
+        # instance is never replaced by this update.
+        instance_id = {o["OutputKey"]: o["OutputValue"] for o in current["Outputs"]}["InstanceId"]
+        ami = session.client("ec2").describe_instances(InstanceIds=[instance_id])[
+            "Reservations"][0]["Instances"][0]["ImageId"]
+        pinned = f"/{stack}/pinned-ami"
+        ssm_client = session.client("ssm")
+        ssm_client.put_parameter(Name=pinned, Value=ami, Type="String", DataType="aws:ec2:image",
+                                 Overwrite=True, Description="AMI of the running dashboard instance")
+        for _ in range(30):  # aws:ec2:image values are validated asynchronously
+            try:
+                if ssm_client.get_parameter(Name=pinned)["Parameter"]["Value"] == ami:
+                    break
+            except ClientError:
+                pass
+            sleep(2)
+        else:
+            raise RuntimeError("Pinned AMI parameter did not become available")
+        params = [{"ParameterKey": "ImageId", "ParameterValue": pinned} if p["ParameterKey"] == "ImageId" else p
+                  for p in params]
+        execute_reviewed_update(
+            cloudformation, stack, params, template=template,
+            review=assert_safe_log_archive_update, preview_only=preview,
+        )
+        if preview:
+            return
+    current = cloudformation.describe_stacks(StackName=stack)["Stacks"][0]
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in current["Outputs"]}
+    bucket = outputs["ArchiveBucketName"]
+    logs = session.client("logs")
+    for group in logs.describe_log_groups(logGroupNamePrefix=f"/trading-dashboard/{stack}/")["logGroups"] + \
+            logs.describe_log_groups(logGroupNamePrefix=f"/aws/lambda/{stack}-")["logGroups"]:
+        if group.get("retentionInDays"):
+            logs.delete_retention_policy(logGroupName=group["logGroupName"])
+        print(f"  {group['logGroupName']}: never expires")
+    print(f"Archive bucket: {bucket}")
+    instance_id = outputs["InstanceId"]
+    state = session.client("ec2").describe_instances(InstanceIds=[instance_id])[
+        "Reservations"][0]["Instances"][0]["State"]["Name"]
+    if state != "running":
+        print("Instance is stopped: run this command again while it is running to set ARCHIVE_BUCKET")
+        return
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    if now.weekday() < 5 and time(9, 0) <= now.time() < time(15, 40):
+        raise RuntimeError("Refusing to restart the dashboard during market hours; rerun after 15:40 IST")
+    ssm = session.client("ssm")
+    command_id = ssm.send_command(
+        InstanceIds=[instance_id], DocumentName="AWS-RunShellScript", TimeoutSeconds=120,
+        Comment="Enable the daily S3 archive", Parameters={"commands": [archive_env_command(bucket)]},
+    )["Command"]["CommandId"]
+    try:
+        ssm.get_waiter("command_executed").wait(
+            CommandId=command_id, InstanceId=instance_id, WaiterConfig={"Delay": 5, "MaxAttempts": 40})
+    finally:
+        result = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+        print(result.get("StandardOutputContent", "").strip())
+        if result.get("Status") != "Success":
+            print(result.get("StandardErrorContent", "").strip())
+    print("Daily S3 archive enabled; the app uploads after 15:37 IST and keeps everything permanently")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="trading-deploy")
@@ -1754,6 +1887,9 @@ def main() -> None:
     enable.add_argument("--verified-private-mock-alerts-and-restore", action="store_true")
     cost = subparsers.add_parser("enable-cost-report")
     cost.add_argument("--verified-cost-report", action="store_true")
+    archive = subparsers.add_parser("enable-log-archive")
+    archive.add_argument("--approved-log-archive", action="store_true")
+    archive.add_argument("--preview", action="store_true", help="Review the AWS change set without applying it")
     args = parser.parse_args()
     if args.command == "create":
         create_deployment(args.profile, args.stack)
@@ -1793,6 +1929,8 @@ def main() -> None:
         prepare_mock_release(args.profile, args.stack, args.data_recovery_point, args.approved_mock_release)
     elif args.command == "enable-automation":
         enable_automation(args.profile, args.stack, args.verified_private_mock_alerts_and_restore)
+    elif args.command == "enable-log-archive":
+        enable_log_archive(args.profile, args.stack, args.approved_log_archive, args.preview)
     else:
         enable_cost_report(args.profile, args.stack, args.verified_cost_report)
 

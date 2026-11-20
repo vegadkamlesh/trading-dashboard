@@ -722,6 +722,22 @@ startup and once a day, so disk usage stays bounded. Order history also lives in
 `backend/audit.sqlite3` (powers the EOD Summary). Exception: Algo 2's
 `data/algo2/` journals and `history/` research data are never deleted.
 
+**Permanent archive (AWS):** with `ARCHIVE_BUCKET` set (done by
+`python deploy.py enable-log-archive --approved-log-archive`), the app syncs
+`backend/data`, the log directory and SQLite snapshots of the audit DBs to the
+private S3 bucket `<stack>-archive-<account>` every weekday after 15:37 IST
+(retried every 15 min; Telegram confirms). The bucket is append-only (the server
+can only list/put). While the archive is on, audit rows and Algo 1 journals are
+never pruned, a log file is deleted only once an archive newer than it succeeded,
+and raw microstructure days older than `ARCHIVE_LOCAL_MICRO_DAYS` (3) are removed
+from the 4 GB disk only after a dry-run sync proves S3 has them (moved to
+Glacier IR after 30 days). CloudWatch log groups never expire.
+
+**Market-data failover:** if Master's data API fails (rate limit DH-904, auth,
+network, Dhan 5xx), chart/quote/option-chain calls automatically retry on the
+Child token and Telegram reports the switch. Master is re-probed every 30 s and
+used again as soon as it answers. Bad-input errors (DH-905) never fail over.
+
 ### Telegram updates (optional, private, outbound-only)
 
 1. Telegram mein verified **@BotFather** ko `/newbot` bhejo. Token sirf local
@@ -791,8 +807,8 @@ forwarding/alarms, consistent SQLite/state backups and a tested restore.
 The external watchdog checks scheduled host and local service health, not
 broker-feed freshness or order safety; additional live checks remain necessary.
 The app cannot send an outage alert after its own server dies.
-Trading audit/journal retention must be decided separately from the current
-7-day debug-log retention. Do not restore old trading state blindly: reconcile
+With the S3 archive enabled, trading audit rows and journals are kept permanently
+(see Logs above). Do not restore old trading state blindly: reconcile
 broker positions/orders before resuming; do not run two active engines.
 
 Adding 2-4 strategies requires account-level order/rate/capital/risk coordination,

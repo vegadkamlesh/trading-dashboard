@@ -1572,5 +1572,62 @@ class ExpirySyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.engine.snapshot("NIFTY"))
 
 
+class ArchiveTests(unittest.IsolatedAsyncioTestCase):
+    def test_runs_only_outside_market_hours_once_per_day(self):
+        from app import archive
+        day = datetime(2026, 11, 23)  # Monday
+        old = -archive.RETRY_SECONDS
+        self.assertFalse(archive.due(day.replace(hour=11), None, old))
+        self.assertTrue(archive.due(day.replace(hour=15, minute=40), None, old))
+        self.assertFalse(archive.due(day.replace(hour=15, minute=40), day.date(), old))
+        self.assertFalse(archive.due(day.replace(hour=15, minute=40), None, time.monotonic()))
+        self.assertTrue(archive.due(datetime(2026, 11, 21, 11), None, old))  # Saturday
+
+    async def test_archive_deletes_old_microstructure_only_after_verified_upload(self):
+        from app import archive
+        with tempfile.TemporaryDirectory() as tmp:
+            data, logs = Path(tmp) / "data", Path(tmp) / "logs"
+            micro = data / "algo2" / "microstructure"
+            for day in ("2026-11-10", "2026-11-11", "2026-11-22"):
+                (micro / day).mkdir(parents=True)
+            logs.mkdir()
+            calls = []
+
+            async def aws(*args):
+                calls.append(args)
+                pending = "--dryrun" in args and "2026-11-11" in args[2]
+                return 0, "(dryrun) upload: x" if pending else ""
+
+            settings = MagicMock(archive_bucket="bkt", archive_local_micro_days=3)
+            with patch.object(archive, "_data_dir", return_value=data), \
+                    patch.object(archive, "_log_dir", return_value=logs), \
+                    patch.object(archive, "BACKEND", Path(tmp)), \
+                    patch.object(archive, "get_settings", return_value=settings), \
+                    patch.object(archive, "_aws", side_effect=aws):
+                self.assertTrue(await archive.archive_once(datetime(2026, 11, 23).date()))
+                self.assertEqual(archive.last_success_day(), datetime(2026, 11, 23).date())
+            self.assertFalse((micro / "2026-11-10").exists())
+            self.assertTrue((micro / "2026-11-11").exists())  # dry-run still had files to upload
+            self.assertTrue((micro / "2026-11-22").exists())  # recent days stay local
+            self.assertIn(("s3", "sync", str(data), "s3://bkt/data/", "--only-show-errors", "--no-progress"), calls)
+            self.assertFalse(any("rm" in c or "--delete" in c for c in calls))
+
+    async def test_failed_archive_keeps_everything(self):
+        from app import archive
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            (data / "algo2" / "microstructure" / "2026-11-01").mkdir(parents=True)
+            settings = MagicMock(archive_bucket="bkt", archive_local_micro_days=3)
+            with patch.object(archive, "_data_dir", return_value=data), \
+                    patch.object(archive, "_log_dir", return_value=Path(tmp) / "none"), \
+                    patch.object(archive, "BACKEND", Path(tmp)), \
+                    patch.object(archive, "get_settings", return_value=settings), \
+                    patch.object(archive, "_aws", AsyncMock(return_value=(1, "AccessDenied"))), \
+                    self.assertLogs("dhan.archive", "WARNING"):
+                self.assertFalse(await archive.archive_once(datetime(2026, 11, 23).date()))
+                self.assertIsNone(archive.last_success_day())
+            self.assertTrue((data / "algo2" / "microstructure" / "2026-11-01").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

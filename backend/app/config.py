@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     log_retention_days: int = 7
     # DEBUG / INFO / WARNING / ERROR
     log_level: str = "INFO"
+    # Private S3 bucket for the daily append-only archive (logs, journals, research, DBs).
+    # When set, nothing is pruned locally until it is safely archived.
+    archive_bucket: str = ""
+    # Days of raw microstructure kept on the small server disk once archived to S3.
+    archive_local_micro_days: int = Field(3, ge=1)
 
     # --- Optional, outbound-only operational notifications ---
     telegram_enabled: bool = False

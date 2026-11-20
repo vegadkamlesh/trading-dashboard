@@ -202,6 +202,8 @@ def log_order(
 def prune_old_logs(retention_days: int | None = None) -> int:
     """Delete audit rows older than `retention_days` (default from settings)."""
     s = get_settings()
+    if s.archive_bucket.strip():
+        return 0  # S3 archive enabled: audit rows are kept permanently
     days = retention_days if retention_days is not None else s.log_retention_days
     cutoff = time.time() - max(1, days) * 86400
     try:

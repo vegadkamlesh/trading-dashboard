@@ -88,6 +88,14 @@ def cleanup_old_logs(retention_days: int | None = None) -> int:
     s = get_settings()
     days = retention_days if retention_days is not None else s.log_retention_days
     cutoff = date.today() - timedelta(days=max(1, days))
+    if s.archive_bucket.strip():
+        # Never delete a log file the S3 archive may not have yet.
+        from .archive import last_success_day
+
+        archived = last_success_day()
+        if archived is None:
+            return 0
+        cutoff = min(cutoff, archived)
     removed = 0
     try:
         directory = _log_dir()

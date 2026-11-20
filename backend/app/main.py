@@ -81,6 +81,9 @@ async def trading_lifespan(app: FastAPI):
     from .token_watch import token_watch_loop
     token_stop = threading.Event()
     threading.Thread(target=token_watch_loop, args=(token_stop,), daemon=True, name="token-watch").start()
+    import asyncio
+    from .archive import archive_loop
+    archive_task = asyncio.create_task(archive_loop(), name="s3-archive")
 
     logger.info(
         "SAFETY: dryRun=%s (true=simulate, false=REAL orders) | fastOrders=%s "
@@ -101,6 +104,7 @@ async def trading_lifespan(app: FastAPI):
         yield
     finally:
         token_stop.set()
+        archive_task.cancel()
         await algo2_group.stop()
         await engines.stop()
         await engine.stop()

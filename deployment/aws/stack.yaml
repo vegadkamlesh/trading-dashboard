@@ -78,37 +78,67 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/trading-dashboard/${AWS::StackName}/app"
-      RetentionInDays: 30
 
   SystemLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/trading-dashboard/${AWS::StackName}/system"
-      RetentionInDays: 30
 
   AlertLambdaLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-alerts"
-      RetentionInDays: 30
 
   MonitorLambdaLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-monitor"
-      RetentionInDays: 30
 
   CostReportLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-cost-report"
-      RetentionInDays: 30
 
   StartGateLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-start-gate"
-      RetentionInDays: 30
+
+  # Permanent, append-only archive of app logs, journals, research data and audit DBs.
+  # The instance may only list/put; nothing in the stack can delete objects.
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-archive-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-microstructure-to-glacier-ir
+            Status: Enabled
+            Prefix: data/algo2/microstructure/
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 30
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Application
+          Value: trading-dashboard
 
   DataVolume:
     Type: AWS::EC2::Volume
@@ -194,6 +224,12 @@ Resources:
               - Effect: Allow
                 Action: logs:DescribeLogGroups
                 Resource: "*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArchiveBucket.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArchiveBucket.Arn}/*"
               - Effect: Allow
                 Action: cloudwatch:PutMetricData
                 Resource: "*"
@@ -1182,6 +1218,8 @@ Outputs:
     Value: !Ref DataVolume
   BackupVaultName:
     Value: !Ref BackupVault
+  ArchiveBucketName:
+    Value: !Ref ArchiveBucket
   BackupRoleArn:
     Value: !GetAtt BackupRole.Arn
   OperatorRoleArn:

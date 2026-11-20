@@ -129,6 +129,10 @@ class AlgoStore:
 
     def prune_journals(self, keep_days: int = JOURNAL_KEEP_DAYS) -> int:
         """Delete journal files older than `keep_days`. Returns files removed."""
+        from .config import get_settings
+
+        if get_settings().archive_bucket.strip():
+            return 0  # S3 archive enabled: journals are kept permanently
         cutoff = (date.today() - timedelta(days=keep_days)).isoformat()
         removed = 0
         try:
