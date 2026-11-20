@@ -38,7 +38,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
@@ -1537,8 +1537,12 @@ class Algo2Group:
         buffer = float(cfg.entry_buffer.get(key) or 0.0)
         trigger_up = candle["high"] + buffer if candle else None
         trigger_down = candle["low"] - buffer if candle else None
+        bar_start = now.replace(second=0, microsecond=0)
+        bar_start -= timedelta(minutes=bar_start.minute % 5)
+        # Until Dhan publishes the just-closed bar, candle is two bars old: never trigger on it.
+        candle_fresh = bool(candle) and candle["t"] + 300 >= bar_start.timestamp()
         breakout = None
-        if spot and candle:
+        if spot and candle_fresh:
             breakout = "CALL" if spot > trigger_up else "PUT" if spot < trigger_down else None
         freeze, freeze_name = self.news.is_news_freeze_active(now)
         minute = now.hour * 60 + now.minute

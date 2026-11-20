@@ -765,6 +765,21 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m["v5"]["stopDist"]["CALL"], 30.5)           # 23420.5 - 23390, not 23500 - 23390
         self.assertTrue(m["v5"]["features"]["CALL"]["f10_wall_room"])  # wall 23600 >= 2 x 30.5 from the trigger
 
+    async def test_no_breakout_on_previous_candle_before_new_bar_is_published(self):
+        # Live 11-Nov 09:45:01: Dhan had not published 09:40-09:45 yet, so 09:35-09:40 high triggered a trade.
+        g = self.group
+        now = datetime(2026, 11, 16, 10, 5, 2, tzinfo=algo_module.IST)
+        t0 = now.replace(hour=9, minute=15, second=0).timestamp()
+        g.data.spot_candles["NIFTY"] = [{"t": t0 + i * 300, "open": 23400.0, "high": 23420.0, "low": 23390.0,
+                                         "close": 23410.0} for i in range(9)]   # last bar 09:55-10:00
+        with patch.object(g.data, "spot", return_value=23500.0), \
+                patch.object(g.data, "chain_rows", return_value=CHAIN), \
+                patch.object(g.data, "futures_price", return_value=None):
+            self.assertIsNone(g.compute_metrics("NIFTY", now)["breakout"])
+            g.data.spot_candles["NIFTY"].append({"t": t0 + 9 * 300, "open": 23410.0, "high": 23430.0,
+                                                 "low": 23400.0, "close": 23420.0})   # 10:00-10:05 arrives
+            self.assertEqual(g.compute_metrics("NIFTY", now)["breakout"], "CALL")
+
     async def test_expiry_block_only_on_expiry_day_inside_window(self):
         g = self.group
         exp = date(2026, 11, 17)
