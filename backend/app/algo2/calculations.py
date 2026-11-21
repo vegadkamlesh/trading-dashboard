@@ -50,6 +50,15 @@ def compute_net_delta(rows: Iterable[Mapping[str, Any]]) -> float:
     return total
 
 
+def atm_iv(rows: Sequence[Mapping[str, Any]], spot: Optional[float]) -> Optional[float]:
+    """(CE IV + PE IV) / 2 at the strike nearest spot among rows quoting both IVs (Dhan sends 0 for no IV)."""
+    quoted = [r for r in rows if _num(_leg(r, "ce").get("iv")) > 0 and _num(_leg(r, "pe").get("iv")) > 0]
+    if not quoted or not spot:
+        return None
+    row = min(quoted, key=lambda r: abs(_num(r.get("strike")) - spot))
+    return (_num(_leg(row, "ce").get("iv")) + _num(_leg(row, "pe").get("iv"))) / 2
+
+
 def compute_net_gex(rows: Iterable[Mapping[str, Any]]) -> float:
     """Sum(PE_OI * PE_gamma) - Sum(CE_OI * CE_gamma). Negative = gamma-squeeze/expansion zone."""
     total = 0.0

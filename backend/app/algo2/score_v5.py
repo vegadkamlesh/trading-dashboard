@@ -46,7 +46,13 @@ GATES: Tuple[str, ...] = ("time_window", "vix", "expiry_block", "expiry_eve")
 # inputs as v5 but VIX is inverted (a point when the VIX open is NOT below its 20-day median).
 V7_POS: Tuple[str, ...] = ("oi_unwinding", "x_flow_delta")
 V7_NEG: Tuple[str, ...] = ("f08_vix_low", "basis", "f09_exp_pm", "f10_wall_room", "f19_bank_15m")
-MODELS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {"v5": (POS, NEG), "v7": (V7_POS, V7_NEG)}
+# v8 (2026-11-23, 2-year Greek study of 16 IV/gamma/theta/vega metrics): v7 + one vega point, the only
+# metric that beat v7 in every fold, beat 20 random-point placebos and held out of sample; need 6/8.
+IV_WINDOW_SECONDS = 900.0
+IV_RISE_MIN = -0.1   # ATM IV points: "not falling" over IV_WINDOW_SECONDS
+V8_POS: Tuple[str, ...] = V7_POS + ("x_iv_rising",)
+MODELS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "v5": (POS, NEG), "v7": (V7_POS, V7_NEG), "v8": (V8_POS, V7_NEG)}
 
 LABELS: Dict[str, str] = {
     "time_window": "Inside a trade window",
@@ -55,6 +61,7 @@ LABELS: Dict[str, str] = {
     "expiry_eve": "Not the trading day before expiry",
     "oi_unwinding": "Same-side OI unwinding (5 min)",
     "x_flow_delta": "OI flow x delta with the trade (5 min)",
+    "x_iv_rising": "ATM IV not falling (15 min change > -0.1)",
     "f08_vix_low": "VIX open below its 20-day median",
     "f16_toward_maxpain": "Max pain lies in the trade direction",
     "vwap_band": "NOT: futures beyond VWAP +/-1 sd band",
@@ -87,7 +94,7 @@ _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
                      "Chrome/124.0 Safari/537.36", "Accept": "*/*", "Referer": "https://www.nseindia.com/"}
 
 
-V7_LABELS: Dict[str, str] = {**{k: LABELS[k] for k in V7_POS + V7_NEG},
+V7_LABELS: Dict[str, str] = {**{k: LABELS[k] for k in V8_POS + V7_NEG},
                              "f08_vix_low": "NOT: VIX open below its 20-day median"}
 
 
@@ -97,7 +104,7 @@ def model_features(model: str = "v5") -> Tuple[str, ...]:
 
 
 def model_label(key: str, model: str = "v5") -> str:
-    return (V7_LABELS if model == "v7" else LABELS).get(key) or LABELS[key]
+    return (V7_LABELS if model in ("v7", "v8") else LABELS).get(key) or LABELS[key]
 
 
 def points(features: Dict[str, Optional[bool]], model: str = "v5") -> int:
@@ -223,8 +230,9 @@ def compute_features(side: str, *, now: datetime, entry: float, spot: float, ctx
                      rows: List[Dict[str, Any]], near: List[Dict[str, Any]],
                      oi_before: Optional[Dict[float, Tuple[float, float]]], maxpain: Optional[float],
                      expiry: Optional[date], vix_open: Optional[float], bank_now: Optional[float],
-                     bank_15: Optional[float], base_checks: Dict[str, Optional[bool]]) -> Dict[str, Optional[bool]]:
-    """All 24 features for one side; None = data not available (earns no point)."""
+                     bank_15: Optional[float], base_checks: Dict[str, Optional[bool]],
+                     iv_now: Optional[float] = None, iv_before: Optional[float] = None) -> Dict[str, Optional[bool]]:
+    """All 24 features (+ the v8 IV point) for one side; None = data not available (earns no point)."""
     sign = 1 if side == "CALL" else -1
     today = now.astimezone(IST).date()
     minute = now.hour * 60 + now.minute
@@ -232,6 +240,8 @@ def compute_features(side: str, *, now: datetime, entry: float, spot: float, ctx
 
     flow = flow_delta(near, oi_before)
     f["x_flow_delta"] = None if flow is None else sign * flow > 0
+    # Same for both sides: a long option gains when IV holds or expands.
+    f["x_iv_rising"] = None if not iv_now or not iv_before else iv_now - iv_before > IV_RISE_MIN
     vix_hist = ctx.get("vixOpens") or []
     f["f08_vix_low"] = (None if not vix_open or len(vix_hist) < 10
                         else vix_open < statistics.median(vix_hist[-20:]))

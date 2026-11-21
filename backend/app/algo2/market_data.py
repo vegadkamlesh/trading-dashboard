@@ -157,6 +157,7 @@ class Algo2MarketData:
         self.oi_series: Dict[str, Dict[str, Series]] = {}
         self.delta_series: Dict[str, Series] = {}
         self.basis_series: Dict[str, Series] = {}
+        self.iv_series: Dict[str, Series] = {}   # ATM IV per chain sample (v8 "IV not falling" point)
         self.fut_1m: Dict[str, List[Dict[str, float]]] = {}
         self._fut_1m_for: Dict[str, float] = {}
         self.strike_oi: Dict[str, Deque[Tuple[float, Dict[float, Tuple[Optional[float], Optional[float]]]]]] = {}
@@ -408,6 +409,7 @@ class Algo2MarketData:
         self.delta_series.setdefault(index_key, Series()).add(calc.compute_net_delta(near), now)
         self.basis_series.setdefault(index_key, Series()).add(
             calc.compute_basis(spot, self.futures_price(index_key)), now)
+        self.iv_series.setdefault(index_key, Series()).add(calc.atm_iv(rows, spot), now)
         hist = self.strike_oi.setdefault(index_key, deque())
         hist.append((now, {float(r["strike"]): ((r.get("ce") or {}).get("oi"), (r.get("pe") or {}).get("oi"))
                            for r in calc.near_rows(rows, spot, 10)}))

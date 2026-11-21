@@ -478,6 +478,16 @@ scores only 7 conditions from `backend/app/algo2/score_v5.py` (`V7_POS` / `V7_NE
 | `f10_wall_room` | an OI wall is closer than 2× the stop distance |
 | `f19_bank_15m` | BANKNIFTY has not risen over 15 min |
 
+Config version 8 (default `score_model` **v8**, `min_score` **6**) adds one vega point to those 7, entry at
+**6 of 8** (paper mode once on upgrade):
+
+| Condition | Point when (CALL and PUT) |
+| --- | --- |
+| `x_iv_rising` | ATM IV ((CE IV + PE IV)/2 at the strike nearest spot) now − 15 min ago > −0.1 |
+
+In the 2-year Greek study (16 IV / skew / GEX / gamma / theta / vega metrics) it was the only metric that beat
+v7 in all 5 folds, beat 20 random-point placebos and held out of sample. The v7 score stays selectable.
+
 The 24-feature v5 score stays selectable (`score_model: "v5"`). Missing data earns no point.
 
 4. Strike: ITM with |delta| closest to 0.70. Size: max affordable (90% of balance).

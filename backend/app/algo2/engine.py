@@ -29,6 +29,7 @@ max lots with an ITM -> ATM fallback when funds fall short.
 v6: no entries on the trading day before expiry; target 1R on expiry day (2R otherwise).
 v7 (default since config version 7): same data, gates and trade management as v5/v6, but the score
 is the 7 conditions that held up in the 2-year study (score_v5.V7_POS/V7_NEG, VIX inverted), need 5/7.
+v8 (default since config version 8): v7 + "ATM IV not falling over 15 min" (score_v5.x_iv_rising), need 6/8.
 """
 from __future__ import annotations
 
@@ -88,15 +89,16 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
 GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required (classic)
-CONFIG_VERSION = 7   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+CONFIG_VERSION = 8   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
 #                      v3: score >= 7, 09:45-15:00, 2R full exit, optional rules off
 #                      v4: software-only stop; Dhan mishandled Algo 2 protective SL-M orders
 #                      v5: NIFTY-only 24-feature score >= 17, VIX gate, expiry 10:45-11:45 block,
 #                          15-min candle SL, first touch only, ITM -> ATM fallback
 #                      v6: skip the day before expiry, 1R target on expiry day
 #                      v7: lean 7-condition score >= 5 (VIX inverted), paper mode once on upgrade
-SCORE_MODELS = ("classic", "v5", "v7")
-FEATURE_MODELS = ("v5", "v7")   # models built on score_v5 features, gates and the 15-min candle stop
+#                      v8: v7 + ATM IV point, score >= 6/8, paper mode once on upgrade
+SCORE_MODELS = ("classic", "v5", "v7", "v8")
+FEATURE_MODELS = ("v5", "v7", "v8")   # models built on score_v5 features, gates and the 15-min candle stop
 
 
 def model_conditions(model: str) -> List[Tuple[str, str]]:
@@ -144,8 +146,8 @@ class Algo2Config(AlgoConfig):
     status_report_minutes: int = 5
     max_hold_minutes: int = 0         # 0 = off; else exit if T1 not reached within this many minutes
     oi_velocity_spike: float = 10.0
-    min_score: int = 5                # entry needs every gate + at least this many score conditions
-    score_model: str = "v7"           # "v7" = lean 7 conditions (2-year study); "v5" = 24 features; "classic"
+    min_score: int = 6                # entry needs every gate + at least this many score conditions
+    score_model: str = "v8"           # "v8" = v7 + ATM IV point (Greek study); "v7" = lean 7; "v5" = 24; "classic"
     sl_candle_minutes: int = 15       # stop = low/high of the last closed N-min candle (aligned 09:15)
     expiry_block: str = "10:45-11:45"  # v5 gate: no entries in these windows on expiry day ("" = off)
     skip_expiry_eve: bool = True      # v6 gate: no entries on the trading day before expiry
@@ -337,6 +339,12 @@ class Algo2Engine(AlgoEngine):
             # One-time move to the lean score chosen on 2026-11-22 (2-year study, owner approved).
             self.cfg.score_model, self.cfg.min_score = "v7", 5
             self.cfg.conditions = {**(self.cfg.conditions or {}), **{k: True for k in v5.model_features("v7")}}
+            self.cfg.config_version = CONFIG_VERSION
+            self._persist()
+        if version < 8:
+            # One-time move to v7 + the ATM IV point chosen on 2026-11-23 (2-year Greek study, owner request).
+            self.cfg.score_model, self.cfg.min_score = "v8", 6
+            self.cfg.conditions = {**(self.cfg.conditions or {}), **{k: True for k in v5.model_features("v8")}}
             self.cfg.config_version = CONFIG_VERSION
             self._persist()
 
@@ -1029,9 +1037,9 @@ class Algo2Group:
         except (OSError, ValueError):
             return
         self.dry_run = bool(data.get("dryRun", False))
-        if int(data.get("configVersion") or 0) < 7:
-            # v7 score starts in PAPER (owner request 2026-11-22) until the next save records version 7,
-            # e.g. the operator switching to LIVE.
+        if int(data.get("configVersion") or 0) < 8:
+            # A new score model (v7 2026-11-22, v8 2026-11-23) starts in PAPER (owner request) until the next
+            # save records the current version, e.g. the operator switching to LIVE.
             self.dry_run = True
         # A manual OFF lasts only for the day it was saved; the next day's server start arms Algo 2 again.
         same_day = data.get("savedDay") == base.now_ist().date().isoformat()
@@ -1745,6 +1753,9 @@ class Algo2Group:
         oi_before = self.data.strike_oi_ago(key, VELOCITY_WINDOW)
         bank_now = self.data.series_value("IDX_I", BANKNIFTY_ID)
         bank_15 = self.data.series_value("IDX_I", BANKNIFTY_ID, 900)
+        iv_series = self.data.iv_series.get(key)
+        iv_now = iv_series.latest() if iv_series else None
+        iv_before = iv_series.ago(v5.IV_WINDOW_SECONDS) if iv_series else None
         fut1m = self.data.fut_1m.get(key) or []
         model = cfg.score_model
         labels = dict(model_conditions(model))
@@ -1762,7 +1773,8 @@ class Algo2Group:
                 side, now=now, entry=entry, spot=spot or entry, ctx=ctx, candle5=candle, spot_candles=spot_candles,
                 fut1m=fut1m, fut_ltp=fut_ltp, vwap5=vwap, rows=rows, near=near, oi_before=oi_before,
                 maxpain=maxpain, expiry=expiry, vix_open=(vix or {}).get("open") or None, bank_now=bank_now,
-                bank_15=bank_15, base_checks=base_checks[side]) if spot else {k: None for k in v5.FEATURES}
+                bank_15=bank_15, base_checks=base_checks[side], iv_now=iv_now, iv_before=iv_before,
+            ) if spot else {k: None for k in v5.FEATURES}
             features[side] = feats
 
             def gate(name: str, ok: bool, value: str) -> Dict[str, Any]:
