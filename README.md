@@ -418,7 +418,7 @@ reconcile and exit code; only the signal, levels and exits below differ.
 | Switch | Default | Notes |
 | --- | --- | --- |
 | ON / OFF | **ON** | Own switch. Saved in `data/algo2/group.json`; re-arms after restart unless turned OFF. |
-| PAPER / LIVE | **LIVE** | Own mode (Algo 1 has its own). Change only while OFF and flat. |
+| PAPER / LIVE | **LIVE** | Own mode (Algo 1 has its own). Change only while OFF and flat. Moving to config version 7 starts PAPER until the operator switches to LIVE. |
 | Priority over Algo 1 | ON | `priority_over_algo1`, LIVE only; see "Algo 2: trade count". |
 | Accounts | `TRADING_DEFAULT_ACCOUNTS` | Master / Child ticks, change only while OFF and flat. |
 | Product | INTRADAY | Forced. Arm is refused if Algo 1 is also INTRADAY (Algo 1 stays MARGIN) so broker positions never mix. |
@@ -464,6 +464,21 @@ Saved configs are migrated once (`config_version` 4) to: min score 7, window 09:
 2R target, no Data SL / hold rule / trade cap / stop-after-SL. Later Settings edits are kept.
 Config version 6 adds: no entries on the trading day before NIFTY expiry (`skip_expiry_eve`, holidays from
 `backend/app/market_calendar.py`) and a 1R target on expiry day.
+Config version 7 (default `score_model` **v7**, `min_score` **5**) keeps the v5/v6 NIFTY gates (09:45–15:00,
+India VIX, expiry-day 10:45–11:45 block, day-before-expiry skip), 15-min candle stop and 2R/1R targets, but
+scores only 7 conditions from `backend/app/algo2/score_v5.py` (`V7_POS` / `V7_NEG`), entry at **5 of 7**:
+
+| Condition | CALL point when (PUT mirrors) |
+| --- | --- |
+| `oi_unwinding` | CE OI of ATM±5 fell over 5 min |
+| `x_flow_delta` | Σ(ΔPE OI × delta) − Σ(ΔCE OI × delta) over 5 min > 0 |
+| `f08_vix_low` (inverted) | India VIX open is **not** below its 20-day median |
+| `basis` | futures basis does not confirm (negative) |
+| `f09_exp_pm` | not expiry day after 13:00 |
+| `f10_wall_room` | an OI wall is closer than 2× the stop distance |
+| `f19_bank_15m` | BANKNIFTY has not risen over 15 min |
+
+The 24-feature v5 score stays selectable (`score_model: "v5"`). Missing data earns no point.
 
 4. Strike: ITM with |delta| closest to 0.70. Size: max affordable (90% of balance).
 

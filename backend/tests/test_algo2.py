@@ -54,6 +54,16 @@ class ScoreV5Tests(unittest.TestCase):
         self.assertEqual(v5.points(feats), 2)
         self.assertEqual(len(v5.FEATURES), 24)
 
+    def test_v7_scores_only_seven_conditions_with_vix_inverted(self):
+        feats = {k: None for k in v5.FEATURES}
+        self.assertEqual(v5.points(feats, "v7"), 0)
+        feats.update(f08_vix_low=True, x_day_trend=False, f22_inr_strong=False)   # dropped features earn nothing
+        self.assertEqual(v5.points(feats, "v7"), 0)
+        feats.update(f08_vix_low=False, oi_unwinding=True, f10_wall_room=False)
+        self.assertEqual(v5.points(feats, "v7"), 3)
+        self.assertEqual(len(v5.model_features("v7")), 7)
+        self.assertTrue(v5.model_label("f08_vix_low", "v7").startswith("NOT"))
+
     def test_fifteen_minute_stop_candle_needs_all_parts(self):
         day = date(2026, 11, 16)
         c = self.candles(day, 12)                       # 09:15 .. 10:10 closed 5-min candles
@@ -279,6 +289,15 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                 json.dump({"dryRun": False, "enabled": False, "savedDay": saved_day}, fh)
             self.assertEqual(Algo2Group(self.tmp.name).saved_enabled, expected, saved_day)
 
+    def test_pre_v7_group_settings_start_in_paper_until_saved(self):
+        path = os.path.join(self.tmp.name, "group.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"dryRun": False, "enabled": True}, fh)
+        self.assertTrue(Algo2Group(self.tmp.name).dry_run)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"dryRun": False, "enabled": True, "configVersion": 7}, fh)
+        self.assertFalse(Algo2Group(self.tmp.name).dry_run)   # operator chose LIVE after the v7 move
+
     async def test_paper_t1_partial_then_cost_stop_never_calls_broker(self):
         self.engine.cfg.partial_booking = True
         pos = self.position()
@@ -454,7 +473,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.skip_expiry_eve, cfg.target_r, cfg.expiry_target_r, cfg.min_score,
-                          cfg.config_version), (True, 2.0, 1.0, 18, 6))
+                          cfg.config_version), (True, 2.0, 1.0, 5, 7))   # then on to the v7 score
         persist.assert_called()
 
     async def test_stop_loss_exit_ends_entries_for_the_day(self):
@@ -561,9 +580,9 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_defaults_and_min_score_setting(self):
         cfg = self.engine.cfg
-        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (17, 10.0, 1.0))
+        self.assertEqual((cfg.min_score, cfg.oi_velocity_spike, cfg.vwap_band_sd), (5, 10.0, 1.0))
         self.assertEqual((cfg.score_model, cfg.indices, cfg.sl_candle_minutes, cfg.expiry_block),
-                         ("v5", ["NIFTY"], 15, "10:45-11:45"))
+                         ("v7", ["NIFTY"], 15, "10:45-11:45"))
         self.assertTrue(cfg.first_touch_only and cfg.atm_fallback and cfg.max_affordable)
         self.assertEqual((cfg.trade_windows, cfg.entry_cutoff, cfg.exit_time), ("09:45-15:00", "15:00", "15:15"))
         self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.trade_limit, cfg.oi_wall_target,
@@ -573,15 +592,16 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.group.trades_done(today))
             self.engine.set_config({"trade_limit": True})
             self.assertTrue(self.group.trades_done(today))
-        self.engine.set_config({"min_score": 18, "conditions": {"expiry_block": False, "f19_bank_15m": False}})
-        self.assertEqual(self.engine.cfg.min_score, 18)
+        self.engine.set_config({"min_score": 6, "conditions": {"expiry_block": False, "f19_bank_15m": False}})
+        self.assertEqual(self.engine.cfg.min_score, 6)
         self.engine.set_config({"protective_sl": True})
         self.assertFalse(self.engine.cfg.protective_sl)
         self.assertTrue(self.engine.cfg.conditions["expiry_block"])   # gates cannot be switched off
         self.assertFalse(self.engine.cfg.conditions["f19_bank_15m"])
-        for bad in (25, -1, 2.5):
+        for bad in (8, -1, 2.5):                                      # v7 scores 7 conditions
             with self.assertRaises(HTTPException):
                 self.engine.set_config({"min_score": bad})
+        self.engine.set_config({"score_model": "v5", "min_score": 18})   # the 24-feature model stays available
         for bad in ({"sl_candle_minutes": 7}, {"score_model": "x"}, {"expiry_block": "11:45-10:45"}):
             with self.assertRaises(HTTPException):
                 self.engine.set_config(bad)
@@ -599,7 +619,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.vwap_band_sd, cfg.min_score, cfg.trade_windows,
-                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 17, "09:45-15:00", 0, 6))
+                          cfg.max_hold_minutes, cfg.config_version), (10.0, 1.0, 5, "09:45-15:00", 0, 7))
         self.assertFalse(any((cfg.data_sl, cfg.stop_after_sl, cfg.partial_booking, cfg.trade_limit,
                               cfg.protective_sl)))
         persist.assert_called()
@@ -612,7 +632,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.oi_velocity_spike, cfg.min_score, cfg.data_sl, cfg.protective_sl,
-                          cfg.config_version), (12.0, 17, False, False, 6))
+                          cfg.config_version), (12.0, 5, False, False, 7))
 
     async def test_v3_saved_config_disables_broker_protective_sl(self):
         saved = {**engine_module.asdict(self.engine.cfg), "config_version": 3, "protective_sl": True}
@@ -620,7 +640,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.engine, "_persist") as persist:
             self.engine._restore()
         self.assertFalse(self.engine.cfg.protective_sl)
-        self.assertEqual(self.engine.cfg.config_version, 6)
+        self.assertEqual(self.engine.cfg.config_version, 7)
         persist.assert_called()
 
     async def test_v4_live_config_moves_to_v5_rules(self):
@@ -634,17 +654,29 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             self.engine._restore()
         cfg = self.engine.cfg
         self.assertEqual((cfg.indices, cfg.score_model, cfg.min_score, cfg.sl_candle_minutes, cfg.expiry_block,
-                          cfg.exit_time, cfg.config_version), (["NIFTY"], "v5", 17, 15, "10:45-11:45", "15:15", 6))
+                          cfg.exit_time, cfg.config_version), (["NIFTY"], "v7", 5, 15, "10:45-11:45", "15:15", 7))
         self.assertTrue(cfg.first_touch_only and cfg.atm_fallback and cfg.max_affordable)
-        self.assertTrue(all(cfg.conditions[k] for k in v5.FEATURES))
+        self.assertTrue(all(cfg.conditions[k] for k in v5.model_features("v7")))
         persist.assert_called()
         persist.reset_mock()
-        saved = {**engine_module.asdict(cfg), "min_score": 18}
+        saved = {**engine_module.asdict(cfg), "min_score": 6}
         with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
                 patch.object(self.engine, "_persist") as persist:
             self.engine._restore()
-        self.assertEqual(self.engine.cfg.min_score, 18)   # operator edits after v5 are kept
+        self.assertEqual(self.engine.cfg.min_score, 6)   # operator edits after v7 are kept
         persist.assert_not_called()
+
+    async def test_v6_live_config_moves_to_v7_score(self):
+        saved = {**engine_module.asdict(self.engine.cfg), "config_version": 6, "score_model": "v5",
+                 "min_score": 17, "conditions": {"f10_wall_room": False, "x_day_trend": True}}
+        with patch.object(self.engine._store, "load_state", return_value={"config": saved}), \
+                patch.object(self.engine, "_persist") as persist:
+            self.engine._restore()
+        cfg = self.engine.cfg
+        self.assertEqual((cfg.score_model, cfg.min_score, cfg.config_version, cfg.skip_expiry_eve),
+                         ("v7", 5, 7, True))
+        self.assertTrue(cfg.conditions["f10_wall_room"])
+        persist.assert_called()
 
     def v5_metrics(self, side="CALL", points=17, stop_low=23480.0, bar=1000.0):
         feats = [{"key": k, "gate": False, "enabled": True, "pass": i < points} for i, k in enumerate(v5.FEATURES)]
@@ -687,6 +719,7 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         dispatch.assert_not_awaited()
 
     async def test_v5_blocked_first_touch_is_not_retried(self):
+        self.group.cfg.min_score = 17
         dispatch, blocked = await self.run_tick(self.v5_metrics(points=16))
         dispatch.assert_not_awaited()
         self.assertIn("score 16/24 < 17", blocked.call_args.args[3])
@@ -728,8 +761,8 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         for side in ("CALL", "PUT"):
             feats = m["v5"]["features"][side]
             self.assertEqual((feats["vwap_band"], feats["basis"], feats["oi_unwinding"]), (None, None, None))
-            self.assertEqual(m["score"][side]["passed"], v5.points(feats))
-            self.assertEqual(m["score"][side]["total"], 24)
+            self.assertEqual(m["score"][side]["passed"], v5.points(feats, "v7"))
+            self.assertEqual([c["key"] for c in m["checks"][side] if not c["gate"]], list(v5.model_features("v7")))
         self.assertEqual(m["v5"]["stopCandle"]["low"], 23390.0)
         self.assertFalse(m["v5"]["expiryEve"])
 

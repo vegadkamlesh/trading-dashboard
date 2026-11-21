@@ -27,6 +27,8 @@ trade window + VIX + expiry-day 10:45-11:45 block, 24-feature score >= 17,
 first touch per 5-min candle, stop = last closed 15-min candle, target 2R,
 max lots with an ITM -> ATM fallback when funds fall short.
 v6: no entries on the trading day before expiry; target 1R on expiry day (2R otherwise).
+v7 (default since config version 7): same data, gates and trade management as v5/v6, but the score
+is the 7 conditions that held up in the 2-year study (score_v5.V7_POS/V7_NEG, VIX inverted), need 5/7.
 """
 from __future__ import annotations
 
@@ -86,23 +88,26 @@ CONDITIONS: List[Tuple[str, str]] = [
     ("vix", "India VIX stable (< 3% intraday move against)"),
 ]
 GATE_CONDITIONS = frozenset({"news", "time_window", "heavyweight_divergence", "vix"})   # always required (classic)
-CONFIG_VERSION = 6   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
+CONFIG_VERSION = 7   # v2: gate + score entry, OI velocity 10%, VWAP band 1.0 sd
 #                      v3: score >= 7, 09:45-15:00, 2R full exit, optional rules off
 #                      v4: software-only stop; Dhan mishandled Algo 2 protective SL-M orders
 #                      v5: NIFTY-only 24-feature score >= 17, VIX gate, expiry 10:45-11:45 block,
 #                          15-min candle SL, first touch only, ITM -> ATM fallback
 #                      v6: skip the day before expiry, 1R target on expiry day
-SCORE_MODELS = ("classic", "v5")
+#                      v7: lean 7-condition score >= 5 (VIX inverted), paper mode once on upgrade
+SCORE_MODELS = ("classic", "v5", "v7")
+FEATURE_MODELS = ("v5", "v7")   # models built on score_v5 features, gates and the 15-min candle stop
 
 
 def model_conditions(model: str) -> List[Tuple[str, str]]:
-    if model == "v5":
-        return [(k, v5.LABELS[k]) for k in (*v5.GATES, *v5.FEATURES)]
+    if model in FEATURE_MODELS:
+        return [(k, v5.LABELS[k]) for k in v5.GATES] + [(k, v5.model_label(k, model))
+                                                        for k in v5.model_features(model)]
     return CONDITIONS
 
 
 def model_gates(model: str) -> frozenset:
-    return frozenset(v5.GATES) if model == "v5" else GATE_CONDITIONS
+    return frozenset(v5.GATES) if model in FEATURE_MODELS else GATE_CONDITIONS
 TRIO = ("RELIANCE", "HDFCBANK", "ICICIBANK")
 SL_REASONS = {"STOP", "DATA_SL", "PROTECTIVE_SL", "PROTECTIVE_LEVEL", "LOSS_RS"}
 GROUP_PHASES = ("scanning", "waiting_window", "news_freeze", "trades_done", "sl_stop", "market_closed")
@@ -139,8 +144,8 @@ class Algo2Config(AlgoConfig):
     status_report_minutes: int = 5
     max_hold_minutes: int = 0         # 0 = off; else exit if T1 not reached within this many minutes
     oi_velocity_spike: float = 10.0
-    min_score: int = 17               # entry needs every gate + at least this many score conditions
-    score_model: str = "v5"           # "v5" = 24-feature score (backtest May-Nov 2026); "classic" = 10 checks
+    min_score: int = 5                # entry needs every gate + at least this many score conditions
+    score_model: str = "v7"           # "v7" = lean 7 conditions (2-year study); "v5" = 24 features; "classic"
     sl_candle_minutes: int = 15       # stop = low/high of the last closed N-min candle (aligned 09:15)
     expiry_block: str = "10:45-11:45"  # v5 gate: no entries in these windows on expiry day ("" = off)
     skip_expiry_eve: bool = True      # v6 gate: no entries on the trading day before expiry
@@ -326,6 +331,12 @@ class Algo2Engine(AlgoEngine):
         if version < 6:
             # One-time move to the plan chosen on 2026-11-16 (6-month backtest, owner approved).
             self.cfg.skip_expiry_eve, self.cfg.target_r, self.cfg.expiry_target_r = True, 2.0, 1.0
+            self.cfg.config_version = CONFIG_VERSION
+            self._persist()
+        if version < 7:
+            # One-time move to the lean score chosen on 2026-11-22 (2-year study, owner approved).
+            self.cfg.score_model, self.cfg.min_score = "v7", 5
+            self.cfg.conditions = {**(self.cfg.conditions or {}), **{k: True for k in v5.model_features("v7")}}
             self.cfg.config_version = CONFIG_VERSION
             self._persist()
 
@@ -1018,6 +1029,10 @@ class Algo2Group:
         except (OSError, ValueError):
             return
         self.dry_run = bool(data.get("dryRun", False))
+        if int(data.get("configVersion") or 0) < 7:
+            # v7 score starts in PAPER (owner request 2026-11-22) until the next save records version 7,
+            # e.g. the operator switching to LIVE.
+            self.dry_run = True
         # A manual OFF lasts only for the day it was saved; the next day's server start arms Algo 2 again.
         same_day = data.get("savedDay") == base.now_ist().date().isoformat()
         self.saved_enabled = bool(data.get("enabled", True)) or not same_day
@@ -1031,7 +1046,7 @@ class Algo2Group:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"dryRun": self.dry_run, "enabled": self.enabled, "accounts": list(self.entry_accounts),
                        "signalDay": self.signal_day, "signalCount": self.signal_count,
-                       "savedDay": base.now_ist().date().isoformat()}, fh, indent=2)
+                       "savedDay": base.now_ist().date().isoformat(), "configVersion": CONFIG_VERSION}, fh, indent=2)
         os.replace(tmp, self.settings_path)
 
     @property
@@ -1206,7 +1221,7 @@ class Algo2Group:
             return "sl_stop"
         if self.trades_done(now.date().isoformat()):
             return "trades_done"
-        if self.cfg.score_model != "v5" and self.news.is_news_freeze_active(now)[0]:
+        if self.cfg.score_model not in FEATURE_MODELS and self.news.is_news_freeze_active(now)[0]:
             return "news_freeze"
         if not self.in_window(minute) or minute >= self.master._cutoff_min(now):
             return "waiting_window"
@@ -1471,7 +1486,7 @@ class Algo2Group:
         await self.data.ensure_futures(today)
         await self.news.refresh_nse(HEAVYWEIGHT_IDS.keys(), today)
         await self.data.poll_quotes(indices)
-        v5_on = self.cfg.score_model == "v5"
+        v5_on = self.cfg.score_model in FEATURE_MODELS
         if v5_on:
             self.v5ctx.schedule(now)
             warn = self.v5ctx.warning(now)
@@ -1653,7 +1668,7 @@ class Algo2Group:
                       fmt(vix_move, 2, "%")),
             ]
         v5_info = None
-        if cfg.score_model == "v5":
+        if cfg.score_model in FEATURE_MODELS:
             # Tri-state (None = input missing -> no point), unlike the classic pass/fail booleans.
             base_checks: Dict[str, Dict[str, Optional[bool]]] = {}
             for side in ("CALL", "PUT"):
@@ -1713,7 +1728,7 @@ class Algo2Group:
                    rows: List[Dict[str, Any]], near: List[Dict[str, Any]], vix: Optional[Dict[str, float]],
                    vix_move: Optional[float], in_window: bool, base_checks: Dict[str, Dict[str, Optional[bool]]],
                    fmt: Any) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
-        """v5: 3 gates + 24 scored features; a feature 'passes' when it earns its point."""
+        """v5/v7: gates + the model's scored features; a feature 'passes' when it earns its point."""
         cfg = self.cfg
         expiry = self.chain_expiry_date(key)
         if rows and expiry is not None:
@@ -1731,7 +1746,8 @@ class Algo2Group:
         bank_now = self.data.series_value("IDX_I", BANKNIFTY_ID)
         bank_15 = self.data.series_value("IDX_I", BANKNIFTY_ID, 900)
         fut1m = self.data.fut_1m.get(key) or []
-        labels = dict(model_conditions("v5"))
+        model = cfg.score_model
+        labels = dict(model_conditions(model))
         checks: Dict[str, List[Dict[str, Any]]] = {}
         features: Dict[str, Dict[str, Optional[bool]]] = {}
         stop_dist: Dict[str, float] = {}
@@ -1763,18 +1779,18 @@ class Algo2Group:
                      f"{' - day before expiry, no entries' if eve else ''}"
                      f"{'' if cfg.skip_expiry_eve else ' (rule off)'}"),
             ]
-            for k in v5.FEATURES:
+            for k in v5.model_features(model):
                 raw = feats.get(k)
-                want = "want yes" if k in v5.POS else "want no"
+                want = "want yes" if k in v5.MODELS[model][0] else "want no"
                 side_checks.append({"key": k, "label": labels[k], "gate": False,
-                                    "enabled": bool(cfg.conditions.get(k, True)), "pass": v5.earned(k, raw),
+                                    "enabled": bool(cfg.conditions.get(k, True)), "pass": v5.earned(k, raw, model),
                                     "value": f"{'n/a' if raw is None else 'yes' if raw else 'no'} ({want})"})
             checks[side] = side_checks
         info = {"stopCandle": stop, "stopDist": stop_dist, "slMinutes": cfg.sl_candle_minutes,
                 "maxPain": maxpain, "expiry": expiry.isoformat() if expiry else None, "expiryBlocked": blocked,
                 "expiryEve": eve, "targetR": self.target_r_for(key, now),
                 "contextComplete": self.v5ctx.complete() if ctx else False,
-                "points": {s: v5.points(features[s]) for s in features}, "features": features}
+                "points": {s: v5.points(features[s], model) for s in features}, "features": features}
         return info, checks
 
     @staticmethod
@@ -1805,7 +1821,7 @@ class Algo2Group:
                      spot=round(spot, 2))
         rows = self.data.chain_rows(key)
         wall_strike = calc.oi_wall(rows, spot, side, self.cfg.oi_strikes * 2)
-        stop_candle = (m.get("v5") or {}).get("stopCandle") if self.cfg.score_model == "v5" else None
+        stop_candle = (m.get("v5") or {}).get("stopCandle") if self.cfg.score_model in FEATURE_MODELS else None
         sl_from = stop_candle or candle
         self.signal_ctx[key] = {"candleHigh": sl_from["high"], "candleLow": sl_from["low"], "wall": wall_strike}
         with account_scope("master"):

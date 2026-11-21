@@ -42,6 +42,12 @@ NEG: Tuple[str, ...] = (
 FEATURES: Tuple[str, ...] = POS + NEG
 GATES: Tuple[str, ...] = ("time_window", "vix", "expiry_block", "expiry_eve")
 
+# v7 (2026-11-22, 2-year per-condition study): only the 7 conditions with a steady edge; same feature
+# inputs as v5 but VIX is inverted (a point when the VIX open is NOT below its 20-day median).
+V7_POS: Tuple[str, ...] = ("oi_unwinding", "x_flow_delta")
+V7_NEG: Tuple[str, ...] = ("f08_vix_low", "basis", "f09_exp_pm", "f10_wall_room", "f19_bank_15m")
+MODELS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {"v5": (POS, NEG), "v7": (V7_POS, V7_NEG)}
+
 LABELS: Dict[str, str] = {
     "time_window": "Inside a trade window",
     "vix": "India VIX stable (< 3% intraday move against)",
@@ -81,13 +87,27 @@ _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
                      "Chrome/124.0 Safari/537.36", "Accept": "*/*", "Referer": "https://www.nseindia.com/"}
 
 
-def points(features: Dict[str, Optional[bool]]) -> int:
+V7_LABELS: Dict[str, str] = {**{k: LABELS[k] for k in V7_POS + V7_NEG},
+                             "f08_vix_low": "NOT: VIX open below its 20-day median"}
+
+
+def model_features(model: str = "v5") -> Tuple[str, ...]:
+    pos, neg = MODELS[model]
+    return pos + neg
+
+
+def model_label(key: str, model: str = "v5") -> str:
+    return (V7_LABELS if model == "v7" else LABELS).get(key) or LABELS[key]
+
+
+def points(features: Dict[str, Optional[bool]], model: str = "v5") -> int:
     """Score: pos features True + neg features False. Missing (None) earns nothing."""
-    return sum(features.get(k) is True for k in POS) + sum(features.get(k) is False for k in NEG)
+    pos, neg = MODELS[model]
+    return sum(features.get(k) is True for k in pos) + sum(features.get(k) is False for k in neg)
 
 
-def earned(key: str, value: Optional[bool]) -> bool:
-    return value is True if key in POS else value is False
+def earned(key: str, value: Optional[bool], model: str = "v5") -> bool:
+    return value is True if key in MODELS[model][0] else value is False
 
 
 def ist_date(ts: float) -> date:
