@@ -116,6 +116,10 @@ chmod 0640 /opt/trading/backend/.env
 install -m 0644 /opt/trading/aws/nginx.conf /etc/nginx/nginx.conf
 nginx -t
 install -m 0644 /opt/trading/aws/trading-dashboard.service /etc/systemd/system/trading-dashboard.service
+install -d -m 0755 /etc/trading-dashboard
+printf 'DHAN_PARAMETER=%s/dhan\nAWS_REGION=%s\n' "${TELEGRAM_PARAMETER%/*}" "$AWS_REGION" \
+    > /etc/trading-dashboard/dhan-sync.env
+chmod 0644 /etc/trading-dashboard/dhan-sync.env
 sed -e "s|__APP_LOG_GROUP__|${APP_LOG_GROUP}|g" \
     -e "s|__SYSTEM_LOG_GROUP__|${SYSTEM_LOG_GROUP}|g" \
     /opt/trading/aws/cloudwatch-agent.json > /opt/aws/amazon-cloudwatch-agent/etc/trading.json

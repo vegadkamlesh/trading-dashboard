@@ -23,6 +23,8 @@ def notification_text(subject: str, message: str) -> str:
             return "AWS ALERT: dashboard storage is nearly full. Check CloudWatch and disk usage."
         if "cpu-credit" in lowered:
             return "AWS ALERT: server CPU burst credits are low. Check latency and possible extra charges."
+        if "token-refresh" in lowered:
+            return "AWS ALERT: the 07:00 Dhan token refresh failed. Update the token before 09:15."
         if "cost-report" in lowered:
             return "AWS ALERT: the daily usage report failed. Check its CloudWatch logs."
         if "scheduler" in lowered:

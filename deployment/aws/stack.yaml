@@ -104,6 +104,11 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-start-gate"
 
+  TokenRefreshLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-token-refresh"
+
   # Permanent, append-only archive of app logs, journals, research data and audit DBs.
   # The instance may only list/put; nothing in the stack can delete objects.
   ArchiveBucket:
@@ -607,6 +612,145 @@ Resources:
         RetryPolicy:
           MaximumEventAgeInSeconds: 900
           MaximumRetryAttempts: 10
+
+  TokenRefreshRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: refresh-dhan-tokens
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/dhan"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/dhan-totp"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/dhan"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:EncryptionContext:PARAMETER_ARN:
+                      - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/dhan-totp"
+                      - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramParameter}"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt TokenRefreshLogGroup.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  TokenRefreshFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-token-refresh"
+      Description: Generate fresh Dhan access tokens with TOTP every trading morning.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: token_refresh.handler
+      Role: !GetAtt TokenRefreshRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      DeadLetterConfig:
+        TargetArn: !GetAtt SchedulerDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DHAN_PARAMETER: !Sub "/${AWS::StackName}/dhan"
+          TOTP_PARAMETER: !Sub "/${AWS::StackName}/dhan-totp"
+          TELEGRAM_PARAMETER: !Ref TelegramParameter
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  TokenRefreshAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref TokenRefreshFunction
+      Qualifier: "$LATEST"
+      MaximumEventAgeInSeconds: 900
+      MaximumRetryAttempts: 1
+
+  TokenRefreshSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-token-refresh
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt TokenRefreshFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+  WeekdayTokenRefresh:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-token-refresh"
+      Description: Generate fresh Dhan tokens Monday to Friday at 07:00 India time (holidays skipped).
+      State: !If [AutomationOn, ENABLED, DISABLED]
+      ScheduleExpression: "cron(0 7 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TokenRefreshFunction.Arn
+        RoleArn: !GetAtt TokenRefreshSchedulerRole.Arn
+        Input: "{}"
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 900
+          MaximumRetryAttempts: 10
+
+  TokenRefreshFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-token-refresh"
+      AlarmDescription: The 07:00 Dhan token refresh failed; check its CloudWatch logs.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TokenRefreshFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
 
   WeekdayStop:
     Type: AWS::Scheduler::Schedule

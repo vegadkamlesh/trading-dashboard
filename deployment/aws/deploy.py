@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.resources
 import io
@@ -72,7 +73,8 @@ def application_archive() -> bytes:
             files[f"backend/app/{path.relative_to(app_dir).as_posix()}"] = linux_text(path)
     for name in ("requirements.txt", "run.py"):
         files[f"backend/{name}"] = linux_text(ROOT / "backend" / name)
-    for name in ("nginx.conf", "trading-dashboard.service", "cloudwatch-agent.json", "write_config.py"):
+    for name in ("nginx.conf", "trading-dashboard.service", "cloudwatch-agent.json", "write_config.py",
+                 "sync_dhan_env.py"):
         files[f"aws/{name}"] = linux_text(HERE / name)
     dist = ROOT / "frontend" / "dist"
     if not (dist / "index.html").is_file():
@@ -86,7 +88,8 @@ def application_archive() -> bytes:
 def lambda_archive() -> bytes:
     files = {
         name: linux_text(HERE / name)
-        for name in ("alerts.py", "monitor.py", "cost_report.py", "start_gate.py", "market_holidays.py")
+        for name in ("alerts.py", "monitor.py", "cost_report.py", "start_gate.py", "market_holidays.py",
+                     "token_refresh.py")
     }
     tzdata = importlib.resources.files("tzdata")
     for name in ("__init__.py", "zoneinfo/__init__.py", "zoneinfo/Asia/__init__.py", "zoneinfo/Asia/Kolkata"):
@@ -969,7 +972,8 @@ AUTOMATION_INFRA_CHANGES = {
     "StartGateLogGroup", "StartGateRole", "StartGateFunction", "StartGateAsyncConfig",
     "StartGateSchedulerRole", "WeekdayStart", "AlertFunction", "AlertSubscription", "MonitorFunction",
     "MonitorSchedule", "MonitorInvocationPermission", "CostReportFunction", "CostReportSchedulerRole",
-    "WeekdayCostReport",
+    "WeekdayCostReport", "TokenRefreshLogGroup", "TokenRefreshRole", "TokenRefreshFunction",
+    "TokenRefreshAsyncConfig", "TokenRefreshSchedulerRole", "WeekdayTokenRefresh", "TokenRefreshFailureAlarm",
 }
 
 
@@ -1397,6 +1401,11 @@ def live_credentials(path: Path) -> dict[str, str]:
     tokens = [credentials[key] for key in LIVE_CREDENTIAL_KEYS if key.endswith("TOKEN") and credentials[key]]
     if any(token.lower().startswith("mock") for token in tokens):
         raise ValueError("Mock tokens cannot be pushed as live credentials")
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    for key in ("DHAN_ACCESS_TOKEN", "DHAN_CHILD_ACCESS_TOKEN"):
+        expiry = jwt_expiry(credentials[key]) if credentials[key] else None
+        if expiry and expiry <= now:
+            raise ValueError(f"{key} expired at {expiry:%d-%b %H:%M}; run refresh-dhan-token first")
     if not re.fullmatch(r"[0-9]{4,12}", credentials["APP_ORDER_PIN"]) or credentials["APP_ORDER_PIN"] == "000000":
         raise ValueError("Set a private numeric APP_ORDER_PIN before enabling real orders")
     return {key: value for key, value in credentials.items() if value}
@@ -1838,6 +1847,124 @@ def enable_log_archive(profile: str, stack: str, approved: bool, preview: bool) 
     print("Daily S3 archive enabled; the app uploads after 15:37 IST and keeps everything permanently")
 
 
+def jwt_expiry(token: str) -> datetime | None:
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return datetime.fromtimestamp(int(claims["exp"]), ZoneInfo("Asia/Kolkata"))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def update_env_file(path: Path, updates: dict[str, str]) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    remaining = dict(updates)
+    for index, line in enumerate(lines):
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            lines[index] = f"{key}={remaining.pop(key)}"
+    lines += [f"{key}={value}" for key, value in remaining.items()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def set_dhan_totp(profile: str, stack: str) -> None:
+    """Store Dhan PIN + TOTP secrets (typed privately, never echoed) for the 07:00 refresh."""
+    import getpass
+
+    from token_refresh import ACCOUNTS, totp
+
+    if not STACK_NAME.fullmatch(stack):
+        raise ValueError("Invalid stack name")
+    values = dotenv_values(ROOT / "backend" / ".env")
+    session = boto3.Session(profile_name=profile, region_name=REGION)
+    ssm = session.client("ssm")
+    name = f"/{stack}/dhan-totp"
+    try:
+        config = json.loads(ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"])
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ParameterNotFound":
+            raise
+        config = {}
+    for account, (id_key, _token_key) in ACCOUNTS.items():
+        client_id = str(values.get(id_key) or "").strip()
+        if not client_id:
+            print(f"{account.title()}: {id_key} missing in backend/.env; skipped")
+            continue
+        state = "already stored" if account in config else "not stored"
+        print(f"\n{account.title()} account {client_id} ({state}). Press Enter to keep/skip.")
+        pin = getpass.getpass("  Dhan PIN (6 digits, hidden): ").strip()
+        if not pin:
+            continue
+        secret = getpass.getpass("  TOTP secret key from Dhan's 'Setup TOTP' (hidden): ").replace(" ", "").upper()
+        if not re.fullmatch(r"[0-9]{4,8}", pin):
+            raise ValueError("The Dhan PIN must be numeric")
+        if not re.fullmatch(r"[A-Z2-7]{16,128}=*", secret):
+            raise ValueError("The TOTP secret must be the base32 key shown by Dhan (letters A-Z, digits 2-7)")
+        totp(secret, 0)
+        config[account] = {"client_id": client_id, "pin": pin, "totp_secret": secret}
+        print(f"  {account.title()} TOTP saved (current code check: {totp(secret, datetime.now().timestamp())})"
+              " - compare with your authenticator app")
+    if not config:
+        raise RuntimeError("Nothing to store")
+    ssm.put_parameter(
+        Name=name, Description="Dhan PIN and TOTP secrets for the automatic daily token refresh",
+        Type="SecureString", Value=json.dumps(config, separators=(",", ":")), Overwrite=True,
+    )
+    print(f"\nStored TOTP login for {', '.join(sorted(config))} in encrypted {name}. "
+          "Next: deploy.py refresh-dhan-token")
+
+
+def refresh_dhan_token(profile: str, stack: str, restart_server: bool) -> None:
+    """Run the token-refresh Lambda now, then copy the new tokens to backend/.env (and the server)."""
+    if not STACK_NAME.fullmatch(stack):
+        raise ValueError("Invalid stack name")
+    session = boto3.Session(profile_name=profile, region_name=REGION)
+    response = session.client("lambda").invoke(
+        FunctionName=f"{stack}-token-refresh", Payload=json.dumps({"force": True}).encode(),
+    )
+    result = json.loads(response["Payload"].read() or b"null")
+    if response.get("FunctionError"):
+        raise RuntimeError(f"Token refresh failed: {result.get('errorMessage') if isinstance(result, dict) else result}")
+    print(f"Lambda result: {result}")
+    ssm = session.client("ssm")
+    parameter = f"/{stack}/dhan"
+    creds = json.loads(ssm.get_parameter(Name=parameter, WithDecryption=True)["Parameter"]["Value"])
+    keys = ("DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN", "DHAN_CHILD_CLIENT_ID", "DHAN_CHILD_ACCESS_TOKEN")
+    update_env_file(ROOT / "backend" / ".env", {key: creds[key] for key in keys if creds.get(key)})
+    for key in ("DHAN_ACCESS_TOKEN", "DHAN_CHILD_ACCESS_TOKEN"):
+        expiry = jwt_expiry(creds.get(key, ""))
+        print(f"{key}: valid till {expiry:%d-%b %H:%M IST}" if expiry else f"{key}: not set")
+    print("Local backend/.env updated")
+    current = session.client("cloudformation").describe_stacks(StackName=stack)["Stacks"][0]
+    instance_id = {item["OutputKey"]: item["OutputValue"] for item in current["Outputs"]}["InstanceId"]
+    state = session.client("ec2").describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+    if state["State"]["Name"] != "running":
+        print("Server is stopped; it loads the new tokens automatically when it starts")
+        return
+    if not restart_server:
+        print("Server is running with the old token; re-run with --restart-server to apply now")
+        return
+    command = (
+        "set -euo pipefail\nset -a; . /etc/trading-dashboard/dhan-sync.env; set +a\n"
+        "python3.11 /opt/trading/aws/sync_dhan_env.py\nsystemctl restart trading-dashboard\n"
+        "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/api/health && exit 0; sleep 2; done\n"
+        "echo 'dashboard did not become healthy' >&2; exit 1\n"
+    )
+    command_id = ssm.send_command(
+        InstanceIds=[instance_id], DocumentName="AWS-RunShellScript", TimeoutSeconds=120,
+        Comment="Apply refreshed Dhan tokens (no secret values in this command)",
+        Parameters={"commands": [command]},
+    )["Command"]["CommandId"]
+    try:
+        ssm.get_waiter("command_executed").wait(
+            CommandId=command_id, InstanceId=instance_id, WaiterConfig={"Delay": 5, "MaxAttempts": 40})
+    finally:
+        result = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+        print(result.get("StandardOutputContent", "").strip())
+        if result.get("Status") != "Success":
+            print(result.get("StandardErrorContent", "").strip())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="trading-deploy")
@@ -1890,6 +2017,9 @@ def main() -> None:
     archive = subparsers.add_parser("enable-log-archive")
     archive.add_argument("--approved-log-archive", action="store_true")
     archive.add_argument("--preview", action="store_true", help="Review the AWS change set without applying it")
+    subparsers.add_parser("set-dhan-totp", help="Privately store Dhan PIN/TOTP for the daily 07:00 token refresh")
+    refresh = subparsers.add_parser("refresh-dhan-token", help="Generate fresh Dhan tokens now")
+    refresh.add_argument("--restart-server", action="store_true", help="Apply to a running server (restarts the app)")
     args = parser.parse_args()
     if args.command == "create":
         create_deployment(args.profile, args.stack)
@@ -1931,6 +2061,10 @@ def main() -> None:
         enable_automation(args.profile, args.stack, args.verified_private_mock_alerts_and_restore)
     elif args.command == "enable-log-archive":
         enable_log_archive(args.profile, args.stack, args.approved_log_archive, args.preview)
+    elif args.command == "set-dhan-totp":
+        set_dhan_totp(args.profile, args.stack)
+    elif args.command == "refresh-dhan-token":
+        refresh_dhan_token(args.profile, args.stack, args.restart_server)
     else:
         enable_cost_report(args.profile, args.stack, args.verified_cost_report)
 

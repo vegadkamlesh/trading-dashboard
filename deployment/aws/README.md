@@ -114,6 +114,29 @@ enabled (`APP_DRY_RUN=false`). Existing `APP_FAST_ORDERS`,
 are preserved (fast orders default to `false` only when absent).
 Stop the local backend first: never run two engines against one Dhan account.
 
+### Automatic daily Dhan token (TOTP)
+
+Dhan tokens last 24 hours. The `<stack>-token-refresh` Lambda runs Monday to
+Friday at 07:00 IST (NSE holidays skipped). It logs in with Dhan's TOTP API
+(`auth.dhan.co/app/generateAccessToken`), checks each token with `/v2/profile`,
+writes only the token keys into `/<stack>/dhan` and posts the result to Telegram
+(never the token). An account that fails keeps its old token; the run raises
+the `<stack>-token-refresh` alarm. At 09:00 the service's `ExecStartPre` runs
+`sync_dhan_env.py` (as root, non-fatal), which copies the Dhan keys from
+`/<stack>/dhan` into `/opt/trading/backend/.env` before the app starts.
+
+One-time setup per account: Dhan Web → My Profile → DhanHQ Trading APIs →
+Setup TOTP; keep the secret key and add it to an authenticator app. Then:
+
+```powershell
+.\deployment\aws\.venv\Scripts\python.exe .\deployment\aws\deploy.py set-dhan-totp        # hidden prompts, stores /<stack>/dhan-totp
+.\deployment\aws\.venv\Scripts\python.exe .\deployment\aws\deploy.py refresh-dhan-token   # run now; updates local backend\.env
+.\deployment\aws\.venv\Scripts\python.exe .\deployment\aws\deploy.py refresh-dhan-token --restart-server   # also apply to a running server
+```
+
+`push-live-credentials` refuses expired tokens. Logs:
+`/aws/lambda/<stack>-token-refresh`.
+
 The app refuses to start when saved algo state belongs to another Dhan client
 ID. Mock state from the first deployment was archived on the instance under
 `/var/lib/trading/mock-archive-20261102`. Mock-only commands (`apply-mock-release`)

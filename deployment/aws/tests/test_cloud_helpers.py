@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import json
 import sys
 import tempfile
@@ -30,6 +31,8 @@ alerts = load_module("alerts")
 monitor = load_module("monitor")
 start_gate = load_module("start_gate")
 write_config = load_module("write_config")
+token_refresh = load_module("token_refresh")
+sync_dhan_env = load_module("sync_dhan_env")
 deploy = load_module("deploy")
 
 
@@ -388,6 +391,7 @@ class CloudHelpersTest(unittest.TestCase):
             self.assertIn("cost_report.py", archive.namelist())
             self.assertIn("start_gate.py", archive.namelist())
             self.assertIn("market_holidays.py", archive.namelist())
+            self.assertIn("token_refresh.py", archive.namelist())
             self.assertIn("tzdata/zoneinfo/Asia/Kolkata", archive.namelist())
 
     def test_lambda_pointer_review_allows_only_function_codes_and_expected_dependents(self):
@@ -880,6 +884,100 @@ class CloudHelpersTest(unittest.TestCase):
                 with self.subTest(bad=bad), self.assertRaises(ValueError):
                     deploy.live_credentials(env)
 
+    def test_totp_matches_rfc6238_vectors(self):
+        secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # base32("12345678901234567890")
+        for at, code in ((59, "287082"), (1111111109, "081804"), (2000000000, "279037")):
+            with self.subTest(at=at):
+                self.assertEqual(token_refresh.totp(secret, at), code)
+        self.assertEqual(token_refresh.totp(secret.lower()[:16] + " " + secret[16:].lower(), 59), "287082")
+
+    def test_token_generation_retries_next_window_then_gives_up(self):
+        calls = []
+
+        def fake(request):
+            calls.append(request.full_url)
+            raise RuntimeError("HTTP 400 Invalid TOTP")
+
+        with patch.object(token_refresh, "_json_request", side_effect=fake):
+            with self.assertRaisesRegex(RuntimeError, "Invalid TOTP"):
+                token_refresh.generate_token("1100", "123456", "GEZDGNBVGY3TQOJQ", now=lambda: 59.0, sleep=lambda s: None)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("dhanClientId=1100", calls[0])
+        ok = {"dhanClientId": "1100", "accessToken": "tok", "expiryTime": "x"}
+        with patch.object(token_refresh, "_json_request", return_value=ok):
+            self.assertEqual(token_refresh.generate_token("1100", "1", "GEZDGNBVGY3TQOJQ")["accessToken"], "tok")
+
+    def test_token_refresh_keeps_old_token_for_a_failed_account(self):
+        config = {"master": {"client_id": "11", "pin": "1", "totp_secret": "A"},
+                  "child": {"client_id": "22", "pin": "2", "totp_secret": "B"}}
+        current = {"DHAN_CLIENT_ID": "11", "DHAN_ACCESS_TOKEN": "old-m", "DHAN_CHILD_CLIENT_ID": "22",
+                   "DHAN_CHILD_ACCESS_TOKEN": "old-c", "APP_ORDER_PIN": "4829"}
+
+        def generate(client_id, pin, secret):
+            if client_id == "22":
+                raise RuntimeError("HTTP 401 bad pin")
+            return {"accessToken": "new-m", "expiryTime": "2026-11-23T07:00"}
+
+        updated, results = token_refresh.refresh(config, current, generate=generate, validate=lambda c, t: None)
+        self.assertEqual(updated["DHAN_ACCESS_TOKEN"], "new-m")
+        self.assertEqual(updated["DHAN_CHILD_ACCESS_TOKEN"], "old-c")
+        self.assertEqual(updated["APP_ORDER_PIN"], "4829")
+        self.assertTrue(results["master"].startswith("OK") and results["child"].startswith("FAILED"))
+
+        ssm = Mock()
+        ssm.get_parameter.side_effect = lambda Name, WithDecryption: {"Parameter": {"Value": json.dumps(
+            config if Name.endswith("totp") else current)}}
+        env = {"DHAN_PARAMETER": "/s/dhan", "TOTP_PARAMETER": "/s/dhan-totp", "TELEGRAM_PARAMETER": "/s/telegram"}
+        with patch.dict("os.environ", env), patch.object(token_refresh.boto3, "client", return_value=ssm), \
+                patch.object(token_refresh, "refresh", return_value=(updated, results)), \
+                patch.object(token_refresh, "notify") as notify:
+            with self.assertRaisesRegex(RuntimeError, "child"):
+                token_refresh.handler({"force": True}, None)
+        stored = json.loads(ssm.put_parameter.call_args.kwargs["Value"])
+        self.assertEqual(stored["DHAN_ACCESS_TOKEN"], "new-m")
+        self.assertNotIn("new-m", notify.call_args.args[0])
+        self.assertIn("PROBLEM", notify.call_args.args[0])
+
+    def test_token_refresh_skips_weekends_and_holidays(self):
+        tz = ZoneInfo("Asia/Kolkata")
+        fake_now = Mock(wraps=datetime)
+        for day in (datetime(2026, 11, 21, 7, tzinfo=tz), datetime(2026, 11, 24, 7, tzinfo=tz)):
+            fake_now.now.return_value = day
+            with self.subTest(day=day), patch.object(token_refresh, "datetime", fake_now), \
+                    patch.object(token_refresh.boto3, "client") as client:
+                self.assertEqual(token_refresh.handler({}, None), {"skipped": True})
+                client.assert_not_called()
+
+    def test_boot_sync_replaces_only_dhan_keys(self):
+        text = "APP_FAST_ORDERS=true\nDHAN_ACCESS_TOKEN=old\nTELEGRAM_CHAT_ID=-1\n"
+        merged = sync_dhan_env.merge(text, {"DHAN_ACCESS_TOKEN": "new", "DHAN_CHILD_ACCESS_TOKEN": "c",
+                                            "APP_DRY_RUN": "false", "DHAN_MASTER_TRADING_TOKEN": ""})
+        self.assertEqual(merged.splitlines(), [
+            "APP_FAST_ORDERS=true", "TELEGRAM_CHAT_ID=-1", "DHAN_ACCESS_TOKEN=new", "DHAN_CHILD_ACCESS_TOKEN=c"])
+        self.assertEqual(sync_dhan_env.merge(merged, {"DHAN_ACCESS_TOKEN": "new", "DHAN_CHILD_ACCESS_TOKEN": "c"}),
+                         merged)
+        with self.assertRaises(ValueError):
+            sync_dhan_env.merge(text, {"DHAN_ACCESS_TOKEN": "x\nAPP_DRY_RUN=false"})
+
+    def test_expired_dhan_token_is_never_pushed(self):
+        def jwt(exp):
+            payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+            return f"eyJhbGciOiJIUzUxMiJ9.{payload}.sig"
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            for exp, ok in ((4102444800, True), (1700000000, False)):
+                env.write_text(f"DHAN_CLIENT_ID=11\nDHAN_ACCESS_TOKEN={jwt(exp)}\nAPP_ORDER_PIN=482913\n")
+                with self.subTest(exp=exp):
+                    if ok:
+                        self.assertIn("DHAN_ACCESS_TOKEN", deploy.live_credentials(env))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "expired"):
+                            deploy.live_credentials(env)
+            env.write_text("A=1\nDHAN_ACCESS_TOKEN=old\n")
+            deploy.update_env_file(env, {"DHAN_ACCESS_TOKEN": "new", "DHAN_CHILD_ACCESS_TOKEN": "c"})
+            self.assertEqual(env.read_text().splitlines(), ["A=1", "DHAN_ACCESS_TOKEN=new", "DHAN_CHILD_ACCESS_TOKEN=c"])
+
     def test_live_config_command_has_no_secrets_and_valid_python(self):
         command = deploy.live_config_command("ap-south-1", "/trading-dashboard/dhan", False)
         self.assertIn("APP_DRY_RUN=false", command)
@@ -933,6 +1031,7 @@ class CloudHelpersTest(unittest.TestCase):
                 "aws/nginx.conf",
                 "aws/cloudwatch-agent.json",
                 "aws/write_config.py",
+                "aws/sync_dhan_env.py",
             ):
                 with self.subTest(name=name):
                     self.assertFalse(b"\r\n" in archive.read(name), name)

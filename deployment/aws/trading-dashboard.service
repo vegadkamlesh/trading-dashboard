@@ -14,7 +14,10 @@ WorkingDirectory=/opt/trading/backend
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Environment=TZ=Asia/Kolkata
+EnvironmentFile=-/etc/trading-dashboard/dhan-sync.env
 ExecStartPre=/usr/bin/mountpoint -q /var/lib/trading
+# Pull the 07:00 auto-refreshed Dhan tokens from Parameter Store (root, unsandboxed; failure is non-fatal).
+ExecStartPre=-+/usr/bin/python3.11 /opt/trading/aws/sync_dhan_env.py
 ExecStart=/opt/trading/venv/bin/python run.py
 Restart=on-failure
 RestartSec=10

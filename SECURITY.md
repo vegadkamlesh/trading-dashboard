@@ -69,7 +69,12 @@ This app **places real orders with real money**. Treat it accordingly.
 
 ## What this app deliberately does NOT do
 
-- It does not store your Dhan password or TOTP secret.
+- It does not store your Dhan password. If you opt into automatic daily token
+  refresh, your Dhan PIN and TOTP secret are stored only in the encrypted AWS
+  SecureString `/<stack>/dhan-totp`, readable solely by the token-refresh
+  Lambda role (not the EC2 instance). Anyone with that pair can log in to the
+  Dhan API, so treat AWS account access as broker access; delete the parameter
+  and reset TOTP in Dhan Web to revoke it.
 - It does not enable new algo entries on startup. Explicit operator ARM is
   required; an armed algo can place background orders, and restored positions
   continue to be managed even while new entries are disarmed.
