@@ -155,6 +155,7 @@ class Algo2Config(AlgoConfig):
     expiry_target_r: float = 1.0      # target on expiry day
     first_touch_only: bool = True     # evaluate each 5-min candle breakout once per side (as backtested)
     atm_fallback: bool = True         # ITM unaffordable / funds-rejected -> buy the ATM strike at once
+    strike_mode: str = "itm"          # "itm" = strike nearest target_delta; "atm" = strike nearest spot
     config_version: int = 3
     data_sl: bool = False
     data_sl_gap_pct: float = 10.0
@@ -382,10 +383,17 @@ class Algo2Engine(AlgoEngine):
             return
         leg.expiry = snap.get("expiry")
         sides = (direction,) if direction in ("CALL", "PUT") else ("CALL", "PUT")
+        atm = self.cfg.strike_mode == "atm"
         for side in sides:
-            row = calc.pick_delta_strike(snap["rows"], spot, side, self.cfg.target_delta)
+            if atm:
+                priced = [r for r in snap["rows"] if _as_int((r.get("ce" if side == "CALL" else "pe")
+                                                              or {}).get("securityId"))]
+                row = min(priced, key=lambda r: abs(float(r["strike"]) - spot)) if priced else None
+            else:
+                row = calc.pick_delta_strike(snap["rows"], spot, side, self.cfg.target_delta)
             if row is None:
-                leg.note = f"no ITM {side} strike with delta near {self.cfg.target_delta}"
+                leg.note = (f"no ATM {side} strike" if atm
+                            else f"no ITM {side} strike with delta near {self.cfg.target_delta}")
                 continue
             node = row["ce" if side == "CALL" else "pe"] or {}
             sec = _as_int(node.get("securityId"))
@@ -400,7 +408,7 @@ class Algo2Engine(AlgoEngine):
             leg.prepared_side = side
             delta = abs(_as_float((node.get("greeks") or {}).get("delta")) or 0)
             self._log(f"{leg.index_key} contract ready: {int(leg.strike)} {'CE' if side == 'CALL' else 'PE'} "
-                      f"(ITM, delta {delta:.2f}) premium ~{leg.option_ltp}",
+                      f"({'ATM' if atm else 'ITM'}, delta {delta:.2f}) premium ~{leg.option_ltp}",
                       level="info", notification="journal", index=leg.index_key, side=side, strike=leg.strike)
             return
 
@@ -494,7 +502,7 @@ class Algo2Engine(AlgoEngine):
         return True
 
     def _contract_tag(self, leg: Any) -> str:
-        return "ATM" if getattr(leg, "_atm_tried", False) else "ITM"
+        return "ATM" if self.cfg.strike_mode == "atm" or getattr(leg, "_atm_tried", False) else "ITM"
 
     async def _retry_after_delayed_reject(self, pos: Position) -> bool:
         if await super()._retry_after_delayed_reject(pos):
@@ -835,6 +843,8 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
     score_total = len(model_conditions(cfg.get("score_model"))) - len(model_gates(cfg.get("score_model")))
     if cfg.get("score_model") not in SCORE_MODELS:
         raise HTTPException(400, f"score_model must be one of {SCORE_MODELS}")
+    if cfg.get("strike_mode") not in ("itm", "atm"):
+        raise HTTPException(400, "strike_mode must be 'itm' or 'atm'")
     if cfg.get("sl_candle_minutes") not in (5, 10, 15):
         raise HTTPException(400, "sl_candle_minutes must be 5, 10 or 15")
     for name in ("first_touch_only", "atm_fallback", "skip_expiry_eve"):

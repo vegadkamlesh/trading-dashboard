@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -925,6 +926,20 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         broker = DayLeg("NIFTY", status="watching", error="DH-906: Insufficient Funds")
         self.assertTrue(eng.funds_problem(broker))
         self.assertIsNone(eng.funds_problem(DayLeg("NIFTY", status="skipped", note="Contract already held")))
+
+    async def test_atm_strike_mode_buys_strike_nearest_spot(self):
+        eng = self.engine
+        eng.cfg.strike_mode = "atm"
+        rows = [{"strike": s, "ce": {"securityId": int(s), "ltp": 100.0, "greeks": {"delta": d}},
+                 "pe": {"securityId": int(s) + 1}} for s, d in ((23250.0, 0.7), (23500.0, 0.5), (23550.0, 0.4))]
+        leg = DayLeg("NIFTY", spot=23520.0)
+        with patch.object(algo_module.chain_engine, "snapshot", return_value={"rows": rows, "expiry": "2026-11-24"}), \
+                patch.object(engine_module.feed, "subscribe"), patch.object(eng, "_log"):
+            await eng._prepare_contract(leg, "CALL")
+        self.assertEqual((leg.strike, leg.security_id, leg.prepared_side), (23500.0, 23500, "CALL"))
+        self.assertEqual(eng._contract_tag(leg), "ATM")
+        with self.assertRaises(HTTPException):
+            validate_algo2_config({**asdict(eng.cfg), "strike_mode": "otm"})
 
     async def test_dispatch_falls_back_to_atm_after_funds_skip(self):
         g, eng = self.group, self.engine
