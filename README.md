@@ -932,6 +932,169 @@ for you — save it as `backend\.env`. For an instant offline demo, set
 
 ---
 
+## Mac par single user (sirf ek Dhan account, local)
+
+Ye wahi project hai, koi alag code nahi. Bas `.env` me **sirf apna ek Dhan account**
+(Master) daalo, Child khali chhodo. Telegram optional hai: token nahi daala to bhi
+server chalega aur trade hoga (bas Telegram alert nahi aayenge). Sab kuch aapke Mac par
+local chalta hai, AWS ki zaroorat nahi.
+
+| Kya hota hai | Result |
+| --- | --- |
+| `DHAN_CHILD_*` khali | Child "not configured"; order/algo **sirf aapke account** par. Child tab khali dikhega, ignore karo |
+| `TELEGRAM_ENABLED=false` / token khali | Server normal chalta hai, alerts band |
+| `ARCHIVE_BUCKET` khali | S3 nahi, logs/data sirf Mac par |
+
+### 1. Pehle se kya chahiye
+
+1. Mac (macOS 12+), market time me **ON + internet**.
+2. Dhan account + **DhanHQ API access** + **Data API subscription** (live price/option chain ke liye zaroori).
+3. **Static IP:** Dhan order API sirf registered IP se order leta hai. Algo arm hone se pehle
+   app khud Dhan se ye check karta hai; IP registered nahi hai to Algo **ARM REFUSED** dikhega
+   aur trade nahi hoga. Apna public IP dekho: Terminal me `curl -4 ifconfig.me`. Ye IP
+   Dhan web → DhanHQ Trading APIs → Static IP me register karo. Ghar ka IP badalta ho to
+   ISP se static IP lo (ya har baar Dhan me update karo).
+4. (Optional) Telegram bot: @BotFather → `/newbot` → token; apne private channel me bot ko
+   admin banao; channel ka chat ID (`-100...`).
+
+### 2. Software install (ek baar)
+
+Terminal kholo (Spotlight → "Terminal") aur ek-ek line chalao:
+
+```bash
+# Homebrew (Mac ka package manager) - screen par jo 2 "echo ... >> ~/.zprofile" lines bole, wo bhi chalao
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+brew install python@3.12 node git
+
+# check
+python3.12 --version   # 3.12.x
+node --version         # v20+ 
+git --version
+```
+
+### 3. Project download + setup (ek baar)
+
+```bash
+cd ~
+git clone https://github.com/vegadkamlesh/trading-dashboard.git
+cd trading-dashboard
+
+# backend
+cd backend
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp env.example.txt .env
+
+# frontend
+cd ../frontend
+npm install
+```
+
+(Repo private hai to owner aapke GitHub account ko access dega; clone par GitHub login poochega.)
+
+### 4. `.env` bharna (sabse important)
+
+```bash
+open -e ~/trading-dashboard/backend/.env
+```
+
+TextEdit me ye values set karo, baaki lines jaisi hai waisi rehne do:
+
+| Key | Kya daalna hai |
+| --- | --- |
+| `DHAN_CLIENT_ID` | Aapka Dhan Client ID (Dhan web → Profile) |
+| `DHAN_ACCESS_TOKEN` | Dhan web → DhanHQ Trading APIs → **Generate Access Token** (24 ghante valid) |
+| `DHAN_MASTER_TRADING_TOKEN` | **Khali** (upar wala token hi use hoga) |
+| `DHAN_CHILD_CLIENT_ID`, `DHAN_CHILD_ACCESS_TOKEN` | **Khali** - isi se single user mode |
+| `DHAN_MASTER_SOURCE_IP`, `DHAN_CHILD_SOURCE_IP` | **Khali** |
+| `APP_SESSION_SECRET` | Lamba random text. Banane ke liye: `python3.12 -c "import secrets;print(secrets.token_urlsafe(48))"` |
+| `APP_ORDER_PIN` | Apna 6 digit PIN |
+| `APP_DRY_RUN` | `true` = paper (order Dhan ko nahi jayega), `false` = **asli order**. Pehle `true` |
+| `TRADING_DEFAULT_ACCOUNTS` | `master` |
+| `ALGO_AUTO_ARM` | `true` = server start par Algo 1 apne aap ON; nahi chahiye to `false` |
+| `TELEGRAM_ENABLED` | Telegram nahi chahiye to `false` (token/chat ID khali chhodo) |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram chahiye to `TELEGRAM_ENABLED=true` + bot token + chat ID |
+| `ARCHIVE_BUCKET` | Mat daalo / khali |
+| `LOG_DIR`, `LOG_LEVEL`, `APP_HOST`, `APP_PORT` | Default rehne do |
+
+Save karo (`Cmd+S`). `.env` git me kabhi nahi jati, update se overwrite nahi hogi.
+
+Bina Dhan ke sirf UI dekhna ho: `DHAN_ACCESS_TOKEN=mock-token` (nakli data, koi order nahi).
+
+### 5. Roz chalana
+
+**Terminal window 1 - backend** (`caffeinate` Mac ko sleep nahi hone deta):
+
+```bash
+cd ~/trading-dashboard/backend
+PYTHONPATH=. caffeinate -i .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+**Terminal window 2 - frontend** (`Cmd+T` se naya tab):
+
+```bash
+cd ~/trading-dashboard/frontend
+npm run dev
+```
+
+Browser me **http://127.0.0.1:5173** kholo → Login (ye `.env` wala Dhan token check karta hai).
+Band karna: dono windows me `Ctrl+C`.
+
+Server market se pehle (~09:00) start karo aur 15:30 ke baad band karo.
+
+### 6. Roz subah token
+
+Dhan token 24 ghante chalta hai. Roz market se pehle:
+Dhan web se naya token → `.env` me `DHAN_ACCESS_TOKEN=` update → backend `Ctrl+C` → upar wali
+command se dobara start.
+
+### 7. Paper / Live - 2 alag switch (dhyan se)
+
+| Switch | Kis par | Default |
+| --- | --- | --- |
+| `.env` `APP_DRY_RUN` | Manual orders + Algo 1 | `.env` jaisa |
+| Algo 2 tab ka **Paper/Live** button | Sirf Algo 2 | Naye install par **LIVE + ON** |
+
+Algo 2 `APP_DRY_RUN` ko **nahi** maanta. Pehle din: dashboard → 🤖 Algo 2 → **OFF → PAPER → ON**
+(choice save rehti hai). Asli trading shuru karni ho: `APP_DRY_RUN=false` + restart, aur
+Algo 2 tab me **OFF → LIVE → ON**.
+
+### 8. Update lena (owner ne naya code push kiya)
+
+```bash
+cd ~/trading-dashboard
+git pull
+backend/.venv/bin/pip install -r backend/requirements.txt
+cd frontend && npm install
+```
+
+Phir backend + frontend restart. Aapki `.env` aur `backend/data/` (algo state/journal) safe rehte hain.
+
+### 9. Logs / problem aaye to
+
+| Kya | Kaha |
+| --- | --- |
+| Live log | Backend wali Terminal window |
+| Saved logs (roz ki file) | `~/trading-dashboard/backend/logs/` |
+| Algo state, trade journal | `~/trading-dashboard/backend/data/` |
+| Dashboard | 🤖 Algo / 🤖 Algo 2 tab ka log section |
+
+Help chahiye to `backend/logs` folder zip karke bhejo (`.env` **kabhi mat bhejo** - usme token hai).
+
+| Dikkat | Kya karo |
+| --- | --- |
+| `ARM REFUSED ... static IP` | Static IP Dhan me register nahi / IP badal gaya (step 1.3) |
+| Login fail / 401 / token expired | Naya Dhan token `.env` me + backend restart |
+| `command not found: brew` | Homebrew install ke end wali 2 `echo` lines chalao, Terminal band karke kholo |
+| `Address already in use` | Purana backend chal raha hai: us window me `Ctrl+C`, ya `lsof -i :8000` → `kill <PID>` |
+| Live price nahi aa raha | Dhan Data API subscription active hai? |
+
+⚠️ Mac band / sleep / internet gaya to algo ruk jayega aur khuli position ka exit/SL app
+nahi laga payega. Market time me Mac charger par aur ON rakho.
+
+---
+
 ## Project layout
 
 Copy-Item backend\env.example.txt backend\.env
