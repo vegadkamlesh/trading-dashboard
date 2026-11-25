@@ -510,6 +510,20 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.engine.cfg.stop_after_sl = False
         self.assertIsNone(self.group.sl_hit_today(today))
 
+    async def test_losing_trade_ends_entries_when_stop_after_loss(self):
+        today = algo_module.now_ist().date().isoformat()
+        self.engine.cfg.stop_after_loss = True
+        self.engine._today_trades = [{"date": today, "index": "NIFTY", "direction": "CALL",
+                                      "exitReason": "TARGET", "exitTime": "10:05:00", "premiumPnl": 1200.0},
+                                     {"date": today, "index": "NIFTY", "direction": "PUT",
+                                      "exitReason": "TARGET", "exitTime": "11:05:00", "premiumPnl": 800.0}]
+        self.assertIsNone(self.group.sl_hit_today(today))
+        self.engine._today_trades.append({"date": today, "index": "NIFTY", "direction": "CALL",
+                                          "exitReason": "TIME", "exitTime": "15:15:00", "premiumPnl": -150.0})
+        self.assertIn("P/L -150.0", self.group.sl_hit_today(today))
+        self.engine.cfg.stop_after_loss = False
+        self.assertIsNone(self.group.sl_hit_today(today))
+
     async def test_five_minute_report_once_per_slot_and_phase_text(self):
         self.engine.enabled = True
         self.group.metrics["NIFTY"] = {

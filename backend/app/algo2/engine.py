@@ -142,6 +142,7 @@ class Algo2Config(AlgoConfig):
     max_stop_loss_pct: float = 0.75
     capital_sl_cap: bool = False      # operator choice: SL = breakout candle low/high only
     stop_after_sl: bool = False       # True: no more entries today once a trade exits on a stop
+    stop_after_loss: bool = False     # True: no more entries today once any trade closes at a loss
     priority_over_algo1: bool = True  # LIVE: exit Algo 1's position when its margin blocks an Algo 2 entry
     status_report_minutes: int = 5
     max_hold_minutes: int = 0         # 0 = off; else exit if T1 not reached within this many minutes
@@ -263,7 +264,7 @@ class Algo2Engine(AlgoEngine):
             "waiting_window": "Outside the trade windows - waiting",
             "news_freeze": "News/event freeze active - no entries",
             "trades_done": "Max trades for today done",
-            "sl_stop": "Stop-loss hit today - no more entries today",
+            "sl_stop": "Stop-loss / losing trade today - no more entries today",
             "market_closed": "Market closed",
             "in_trade": "In a trade - managing stop, target and enabled exit rules",
         }.get(self.phase) or super()._phase_label()
@@ -833,7 +834,8 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         positive(name, upper)
     if cfg["pcr_chop_low"] >= cfg["pcr_chop_high"]:
         raise HTTPException(400, "pcr_chop_low must be below pcr_chop_high")
-    for name in ("capital_sl_cap", "stop_after_sl", "data_sl", "partial_booking", "trade_limit", "oi_wall_target"):
+    for name in ("capital_sl_cap", "stop_after_sl", "stop_after_loss", "data_sl", "partial_booking", "trade_limit",
+                 "oi_wall_target"):
         if not isinstance(cfg.get(name), bool):
             raise HTTPException(400, f"{name} must be true/false")
     for name, low, high in (("max_hold_minutes", 0, 375), ("event_window_minutes", 0, 240), ("oi_strikes", 1, 40),
@@ -1249,14 +1251,18 @@ class Algo2Group:
         return self.cfg.trade_limit and self.signals_used(today) >= self.cfg.max_trades
 
     def sl_hit_today(self, today: str) -> Optional[str]:
-        """Text of today's first stop-loss exit when ``stop_after_sl`` is on, else None."""
-        if not self.cfg.stop_after_sl:
+        """Text of today's first stop-loss exit (``stop_after_sl``) or losing trade (``stop_after_loss``), else None."""
+        if not (self.cfg.stop_after_sl or self.cfg.stop_after_loss):
             return None
         for engine in self.items.values():
             for t in engine._today_trades:
-                if str(t.get("exitReason")) in SL_REASONS and str(t.get("date") or today) == today:
+                if str(t.get("date") or today) != today:
+                    continue
+                stop = self.cfg.stop_after_sl and str(t.get("exitReason")) in SL_REASONS
+                loss = self.cfg.stop_after_loss and float(t.get("premiumPnl") or 0) < 0
+                if stop or loss:
                     return (f"{t.get('index')} {t.get('direction')} exited {t.get('exitReason')} at "
-                            f"{t.get('exitTime')}")
+                            f"{t.get('exitTime')}" + (f", P/L {t.get('premiumPnl')}" if loss else ""))
         return None
 
     def _next_window_text(self, minute: int) -> str:
@@ -1275,7 +1281,7 @@ class Algo2Group:
         if phase == "market_closed":
             return "Market closed - scanning resumes in the first trade window of the next trading day."
         if phase == "sl_stop":
-            return f"Stop-loss hit today ({self.sl_hit_today(now.date().isoformat())}) - no more trades today."
+            return f"Stop-loss / loss today ({self.sl_hit_today(now.date().isoformat())}) - no more trades today."
         if phase == "trades_done":
             return f"{self.cfg.max_trades} trade(s) done today - no more entries."
         if phase == "news_freeze":
