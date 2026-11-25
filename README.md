@@ -464,6 +464,9 @@ Saved configs are migrated once (`config_version` 4) to: min score 7, window 09:
 2R target, no Data SL / hold rule / trade cap / stop-after-SL. Later Settings edits are kept.
 Config version 6 adds: no entries on the trading day before NIFTY expiry (`skip_expiry_eve`, holidays from
 `backend/app/market_calendar.py`) and a 1R target on expiry day.
+Optional gate `tbs_gate` (default off): the NIFTY future's total buy qty vs total sell qty (from the
+microstructure recorder's live full-packet feed, stale after 60 s) must agree with the side — buyers > sellers for
+CALL, sellers > buyers for PUT. Missing/stale data blocks entries.
 Config version 7 (default `score_model` **v7**, `min_score` **5**) keeps the v5/v6 NIFTY gates (09:45–15:00,
 India VIX, expiry-day 10:45–11:45 block, day-before-expiry skip), 15-min candle stop and 2R/1R targets, but
 scores only 7 conditions from `backend/app/algo2/score_v5.py` (`V7_POS` / `V7_NEG`), entry at **5 of 7**:

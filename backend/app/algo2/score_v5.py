@@ -40,7 +40,7 @@ NEG: Tuple[str, ...] = (
     "f22_inr_strong",
 )
 FEATURES: Tuple[str, ...] = POS + NEG
-GATES: Tuple[str, ...] = ("time_window", "vix", "expiry_block", "expiry_eve")
+GATES: Tuple[str, ...] = ("time_window", "vix", "expiry_block", "expiry_eve", "fut_book")
 
 # v7 (2026-11-22, 2-year per-condition study): only the 7 conditions with a steady edge; same feature
 # inputs as v5 but VIX is inverted (a point when the VIX open is NOT below its 20-day median).
@@ -59,6 +59,7 @@ LABELS: Dict[str, str] = {
     "vix": "India VIX stable (< 3% intraday move against)",
     "expiry_block": "Not expiry day 10:45-11:45",
     "expiry_eve": "Not the trading day before expiry",
+    "fut_book": "Futures total buy qty vs sell qty with the trade (TBS)",
     "oi_unwinding": "Same-side OI unwinding (5 min)",
     "x_flow_delta": "OI flow x delta with the trade (5 min)",
     "x_iv_rising": "ATM IV not falling (15 min change > -0.1)",

@@ -152,6 +152,7 @@ class Algo2Config(AlgoConfig):
     sl_candle_minutes: int = 15       # stop = low/high of the last closed N-min candle (aligned 09:15)
     expiry_block: str = "10:45-11:45"  # v5 gate: no entries in these windows on expiry day ("" = off)
     skip_expiry_eve: bool = True      # v6 gate: no entries on the trading day before expiry
+    tbs_gate: bool = False            # gate: futures totalBuyQty vs totalSellQty must agree with the side
     target_r: float = 2.0             # target = target_r x stop distance
     expiry_target_r: float = 1.0      # target on expiry day
     first_touch_only: bool = True     # evaluate each 5-min candle breakout once per side (as backtested)
@@ -849,7 +850,7 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         raise HTTPException(400, "strike_mode must be 'itm' or 'atm'")
     if cfg.get("sl_candle_minutes") not in (5, 10, 15):
         raise HTTPException(400, "sl_candle_minutes must be 5, 10 or 15")
-    for name in ("first_touch_only", "atm_fallback", "skip_expiry_eve"):
+    for name in ("first_touch_only", "atm_fallback", "skip_expiry_eve", "tbs_gate"):
         if not isinstance(cfg.get(name), bool):
             raise HTTPException(400, f"{name} must be true/false")
     for name in ("target_r", "expiry_target_r"):
@@ -1306,6 +1307,8 @@ class Algo2Group:
             return "day before expiry - no trades"
         if key == "vix":
             return "India VIX moving against"
+        if key == "fut_book":
+            return "futures buy/sell qty against the trade"
         if key == "news":
             return "news freeze"
         return self._labels().get(key, key).split(" (")[0]
@@ -1766,6 +1769,7 @@ class Algo2Group:
         stop = v5.last_closed_candle(spot_candles, now, int(cfg.sl_candle_minutes)) if spot_candles else None
         blocked = self.expiry_blocked(expiry, now)
         eve = self.is_expiry_eve(expiry, now.date())
+        tbs = self.micro.tbs(key)
         oi_before = self.data.strike_oi_ago(key, VELOCITY_WINDOW)
         bank_now = self.data.series_value("IDX_I", BANKNIFTY_ID)
         bank_15 = self.data.series_value("IDX_I", BANKNIFTY_ID, 900)
@@ -1806,6 +1810,8 @@ class Algo2Group:
                      f"expiry {expiry.isoformat() if expiry else 'n/a'}"
                      f"{' - day before expiry, no entries' if eve else ''}"
                      f"{'' if cfg.skip_expiry_eve else ' (rule off)'}"),
+                gate("fut_book", not cfg.tbs_gate or (tbs is not None and (tbs > 0 if side == "CALL" else tbs < 0)),
+                     f"{'n/a' if tbs is None else f'{tbs:+.3f}'}{'' if cfg.tbs_gate else ' (rule off)'}"),
             ]
             for k in v5.model_features(model):
                 raw = feats.get(k)

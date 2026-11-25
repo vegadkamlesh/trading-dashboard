@@ -52,6 +52,7 @@ FLUSH_SECONDS, FLUSH_BYTES = 5.0, 1 << 20
 MIN_FREE_BYTES = 1 << 30                              # pause below 1 GiB free
 ATM_EACH_SIDE = {"feed": 2, "depth20": 1}
 DEPTH20_MAX = 50                                      # Dhan cap per 20-depth connection
+BOOK_MAX_AGE = 60.0                                   # TBS older than this (s) counts as missing
 REC = struct.Struct("<dH")
 SEGMENT_ID = {"IDX_I": 0, "NSE_EQ": 1, "NSE_FNO": 2, "BSE_EQ": 4, "BSE_FNO": 8}
 
@@ -207,6 +208,7 @@ class MicrostructureRecorder:
         self.connected: Dict[str, bool] = {"feed": False, "depth20": False}
         self.paused_for_disk = False
         self.errors: Dict[str, Optional[str]] = {"feed": None, "depth20": None}
+        self.book: Dict[str, Tuple[float, int, int]] = {}   # index -> (at, totalBuyQty, totalSellQty) of its future
         self._tasks: List[asyncio.Task] = []
         self._running = False
         self._next_futures_try = 0.0
@@ -250,6 +252,27 @@ class MicrostructureRecorder:
         self.writers = {s: StreamWriter(os.path.join(self.folder(), f"{s}.bin.gz")) for s in ("feed", "depth20")}
         self.known = {"feed": {}, "depth20": {}}
         self.sent = {"feed": set(), "depth20": set()}
+
+    def note_book(self, msg: bytes, at: Optional[float] = None) -> None:
+        """Keep the latest total buy/sell quantity of each recorded index future (live TBS gate)."""
+        futs = {int(r["securityId"]): r["index"] for r in self.known.get("feed", {}).values()
+                if r.get("kind") == "future"}
+        if not futs:
+            return
+        for pkt in split_feed(msg):
+            if len(pkt) < FULL.size or pkt[0] != 8:
+                continue
+            sid = struct.unpack_from("<i", pkt, 4)[0]
+            if sid in futs:
+                fields = FULL.unpack_from(pkt, 0)
+                self.book[futs[sid]] = (time.time() if at is None else at, fields[10], fields[9])
+
+    def tbs(self, index_key: str, max_age: float = BOOK_MAX_AGE) -> Optional[float]:
+        """(totalBuyQty - totalSellQty) / sum for the index future, None when missing or stale."""
+        row = self.book.get(index_key)
+        if not row or time.time() - row[0] > max_age or row[1] + row[2] <= 0:
+            return None
+        return (row[1] - row[2]) / (row[1] + row[2])
 
     def record(self, stream: str, msg: bytes, at: Optional[float] = None) -> None:
         writer = self.writers.get(stream)
@@ -395,6 +418,11 @@ class MicrostructureRecorder:
                     async for message in ws:
                         if isinstance(message, (bytes, bytearray)):
                             self.record(stream, bytes(message))
+                            if stream == "feed":
+                                try:
+                                    self.note_book(bytes(message))
+                                except Exception:  # noqa: BLE001 - must never break the recorder
+                                    logger.debug("TBS parse failed", exc_info=True)
                         if not self.active(now_ist()):
                             break
             except asyncio.CancelledError:

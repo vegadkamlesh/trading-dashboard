@@ -828,6 +828,29 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("expiry_eve", m["score"]["CALL"]["gatesFailed"])
         self.assertIn("expiry_eve", Algo2Group.entry_blockers(m, "CALL", 0))
 
+    async def test_tbs_gate_follows_futures_book(self):
+        from app.algo2.microstructure import FULL
+        g = self.group
+        g.micro.known["feed"][("NSE_FNO", 61471)] = {"securityId": 61471, "index": "NIFTY", "kind": "future"}
+        pkt = bytearray(162)
+        FULL.pack_into(pkt, 0, 8, 162, 2, 61471, 25300.0, 75, 0, 25300.0, 1000, 400, 600, 0, 0, 0,
+                       0.0, 0.0, 0.0, 0.0)   # sell 400, buy 600 -> TBS +0.2 (buyers)
+        g.micro.note_book(bytes(pkt))
+        self.assertAlmostEqual(g.micro.tbs("NIFTY"), 0.2)
+        g.cfg.skip_expiry_eve, g.cfg.tbs_gate = False, True
+        now = datetime(2026, 11, 16, 10, 0, 5, tzinfo=algo_module.IST)
+        with patch.object(g.data, "spot", return_value=23500.0), \
+                patch.object(g.data, "chain_rows", return_value=CHAIN), \
+                patch.object(g.data, "chain_expiry", return_value="2026-11-17"), \
+                patch.object(g.data, "futures_price", return_value=None):
+            m = g.compute_metrics("NIFTY", now)
+            self.assertNotIn("fut_book", m["score"]["CALL"]["gatesFailed"])
+            self.assertIn("fut_book", m["score"]["PUT"]["gatesFailed"])
+            g.micro.book["NIFTY"] = (0.0, 600, 400)   # stale data blocks both sides
+            m = g.compute_metrics("NIFTY", now)
+        self.assertIn("fut_book", m["score"]["CALL"]["gatesFailed"])
+        self.assertIn("fut_book", m["score"]["PUT"]["gatesFailed"])
+
     async def test_market_calendar_matches_start_gate_list(self):
         import importlib.util
         from app import market_calendar
