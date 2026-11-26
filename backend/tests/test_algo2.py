@@ -1315,6 +1315,49 @@ class MicrostructureRecorderTests(unittest.TestCase):
             msg = json.loads(rec.subscribe_messages("feed", t["feed"][:2])[0])
             self.assertEqual((msg["RequestCode"], msg["InstrumentCount"]), (21, 2))
 
+    def test_depth200_uses_child_for_future_and_atm_and_debounces_strike_switch(self):
+        def snaps(spot):
+            rows = [chain_row(k, 1, 1, 0.5, -0.5) for k in (23450, 23500, 23550)]
+            for r in rows:
+                r["ce"]["securityId"], r["pe"]["securityId"] = int(r["strike"]) * 10, int(r["strike"]) * 10 + 1
+            return {"NIFTY": {"expiry": "2026-11-17", "underlyingLtp": spot, "rows": rows}}.get
+        source = MagicMock(futures={"NIFTY": {"securityId": 5001, "segment": "NSE_FNO", "expiry": "2026-11-25"}})
+        child = MagicMock(dhan_child_client_id="C1", dhan_child_access_token="tok", dhan_client_id="M1",
+                          dhan_access_token="mtok")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(micro, "get_settings", return_value=child):
+            rec = micro.MicrostructureRecorder(tmp, source)
+            rec.roll_day(datetime(2026, 11, 16, 9, 30))
+            with patch.object(micro.chain_engine, "snapshot", snaps(23510.0)):
+                self.assertEqual(sorted(rec.update_depth200(now_ts=100.0)), ["ce", "fut", "pe"])
+            self.assertEqual((rec.d200["fut"]["securityId"], rec.d200["ce"]["securityId"],
+                              rec.d200["pe"]["securityId"]), (5001, 235000, 235001))
+            with patch.object(micro.chain_engine, "snapshot", snaps(23560.0)):
+                self.assertEqual(rec.update_depth200(now_ts=110.0), [])        # new ATM must hold 60 s
+                self.assertEqual(rec.update_depth200(now_ts=169.0), [])
+                self.assertEqual(sorted(rec.update_depth200(now_ts=170.0)), ["ce", "pe"])
+            self.assertEqual(rec.d200["ce"]["strike"], 23550.0)
+            with open(os.path.join(tmp, "2026-11-16", "instruments.jsonl"), encoding="utf-8") as fh:
+                logged = [json.loads(x) for x in fh]
+            self.assertEqual([(r["stream"], r["slot"]) for r in logged][-2:], [("depth200", "ce"), ("depth200", "pe")])
+            msg = json.loads(rec.subscribe_messages("depth200", [rec.d200["fut"]])[0])
+            self.assertEqual(msg, {"RequestCode": 23, "ExchangeSegment": "NSE_FNO", "SecurityId": "5001"})
+            self.assertEqual(rec.depth200_credentials(), ("C1", "tok", True))
+        master_only = MagicMock(dhan_child_client_id="", dhan_child_access_token="", dhan_client_id="M1",
+                                dhan_access_token="mtok")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(micro, "get_settings", return_value=master_only), \
+                patch.object(micro.chain_engine, "snapshot", snaps(23510.0)):
+            rec = micro.MicrostructureRecorder(tmp, source)
+            rec.roll_day(datetime(2026, 11, 16, 9, 30))
+            self.assertEqual(rec.update_depth200(now_ts=1.0), ["fut"])       # Master: future only (5-socket cap)
+
+    def test_depth200_packet_with_200_levels_splits_and_decodes(self):
+        def packet(code, base):
+            body = b"".join(micro.LEVEL20.pack(base + n * 0.05, 75 * n, n) for n in range(200))
+            return micro.DEPTH_HDR.pack(12 + len(body), code, 2, 5001, 200) + body
+        books = [micro.parse_depth20(p) for p in micro.split_depth(packet(41, 100.0) + packet(51, 101.0))]
+        self.assertEqual([(b["side"], len(b["levels"])) for b in books], [("bid", 200), ("ask", 200)])
+        self.assertEqual(books[1]["levels"][199]["qty"], 75 * 199)
+
     def test_low_disk_pauses_recording_without_deleting_and_resumes(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec = micro.MicrostructureRecorder(tmp)

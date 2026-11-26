@@ -761,6 +761,15 @@ and raw microstructure days older than `ARCHIVE_LOCAL_MICRO_DAYS` (3) are remove
 from the 4 GB disk only after a dry-run sync proves S3 has them (moved to
 Glacier IR after 30 days). CloudWatch log groups never expire.
 
+**Raw microstructure recording** (`backend/app/algo2/microstructure.py`, weekdays
+09:10–15:35 IST, into `data/algo2/microstructure/<day>/`): `feed.bin.gz` (Full
+packets incl. total buy/sell qty), `depth20.bin.gz` (20-level book, NIFTY future +
+ATM±1) and `depth200.bin.gz` (200-level book, one socket each for the NIFTY
+current future, ATM CE and ATM PE). 200-level runs on the Child token so Master
+stays under Dhan's 5-WebSocket-per-user limit (without Child: Master, future
+only); the ATM strike switches only after holding 60 s and each switch is logged
+in `instruments.jsonl`. Socket state is in the Algo 2 status `microstructure.depth200`.
+
 **Market-data failover:** if Master's data API fails (rate limit DH-904, auth,
 network, Dhan 5xx), chart/quote/option-chain calls automatically retry on the
 Child token and Telegram reports the switch. Master is re-probed every 30 s and

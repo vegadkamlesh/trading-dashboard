@@ -1,13 +1,18 @@
 """Raw market-microstructure recorder (order book + trade ticks) for future research.
 
 Purpose: build our own history for order-book imbalance and signed-volume (CVD) studies, which
-Dhan/NSE do not sell historically. Read-only market data on the Master token; never places orders
-and never touches the trading feed (it uses its own WebSocket connections).
+Dhan/NSE do not sell historically. Read-only market data (Master token; 200-level depth on the Child
+token); never places orders and never touches the trading feed (it uses its own WebSocket connections).
 
 Streams (Dhan docs: /docs/v2/live-market-feed, /docs/v2/full-market-depth):
   * ``feed``   - Full packets (RequestCode 21): LTP, LTQ, LTT, ATP, volume, total buy/sell qty, OI and
                  5-level depth for current index futures + near-expiry ATM options of NIFTY and SENSEX.
   * ``depth20``- 20-level depth (RequestCode 23, NSE only): NIFTY futures + NIFTY ATM options.
+  * ``depth200``- 200-level depth (RequestCode 23 on the 200-depth socket, 1 instrument per socket):
+                 NIFTY current future + NIFTY ATM CE + ATM PE, one socket each. Uses the Child token
+                 (own Data plan) so Master stays under Dhan's 5-socket limit; without Child it falls
+                 back to Master for the future only. ATM switches only after the new strike holds
+                 ``DEPTH200_SWITCH_SECONDS``; every switch is logged to ``instruments.jsonl``.
 
 Storage: ``<algo2 dir>/microstructure/<day>/<stream>.bin.gz``. Each flush appends one gzip member,
 so the file stays a valid gzip stream. Each record is ``<d H`` (receive epoch seconds float64,
@@ -46,6 +51,9 @@ except Exception:  # pragma: no cover - older layouts
 
 FEED_URL = "wss://api-feed.dhan.co?version=2&token={token}&clientId={client}&authType=2"
 DEPTH_URL = "wss://depth-api-feed.dhan.co/twentydepth?token={token}&clientId={client}&authType=2"
+DEPTH200_URL = "wss://full-depth-api.dhan.co/twohundreddepth?token={token}&clientId={client}&authType=2"
+DEPTH200_SLOTS = ("fut", "ce", "pe")
+DEPTH200_SWITCH_SECONDS = 60.0
 REQ_FULL, REQ_DEPTH20 = 21, 23
 START_MIN, STOP_MIN = 9 * 60 + 10, 15 * 60 + 35       # IST window, weekdays
 FLUSH_SECONDS, FLUSH_BYTES = 5.0, 1 << 20
@@ -209,6 +217,11 @@ class MicrostructureRecorder:
         self.paused_for_disk = False
         self.errors: Dict[str, Optional[str]] = {"feed": None, "depth20": None}
         self.book: Dict[str, Tuple[float, int, int]] = {}   # index -> (at, totalBuyQty, totalSellQty) of its future
+        self.d200: Dict[str, Optional[Dict[str, Any]]] = {k: None for k in DEPTH200_SLOTS}   # active target
+        self.d200_pending: Dict[str, Tuple[Optional[Tuple[str, int]], float]] = {}
+        self.d200_connected: Dict[str, bool] = {k: False for k in DEPTH200_SLOTS}
+        self.d200_ws: Dict[str, Any] = {}
+        self.d200_errors: Dict[str, Optional[str]] = {k: None for k in DEPTH200_SLOTS}
         self._tasks: List[asyncio.Task] = []
         self._running = False
         self._next_futures_try = 0.0
@@ -249,9 +262,12 @@ class MicrostructureRecorder:
             return
         self.flush_all(force=True)
         self.day = day
-        self.writers = {s: StreamWriter(os.path.join(self.folder(), f"{s}.bin.gz")) for s in ("feed", "depth20")}
+        self.writers = {s: StreamWriter(os.path.join(self.folder(), f"{s}.bin.gz"))
+                        for s in ("feed", "depth20", "depth200")}
         self.known = {"feed": {}, "depth20": {}}
         self.sent = {"feed": set(), "depth20": set()}
+        self.d200 = {k: None for k in DEPTH200_SLOTS}
+        self.d200_pending = {}
 
     def note_book(self, msg: bytes, at: Optional[float] = None) -> None:
         """Keep the latest total buy/sell quantity of each recorded index future (live TBS gate)."""
@@ -325,6 +341,9 @@ class MicrostructureRecorder:
 
     @staticmethod
     def subscribe_messages(stream: str, rows: List[Dict[str, Any]]) -> List[str]:
+        if stream == "depth200":
+            return [json.dumps({"RequestCode": REQ_DEPTH20, "ExchangeSegment": r["segment"],
+                                "SecurityId": str(r["securityId"])}) for r in rows]
         code = REQ_FULL if stream == "feed" else REQ_DEPTH20
         size = 100 if stream == "feed" else DEPTH20_MAX
         msgs = []
@@ -335,6 +354,53 @@ class MicrostructureRecorder:
                                                         "SecurityId": str(r["securityId"])} for r in chunk]}))
         return msgs
 
+    # ------------------------------------------------- 200-level depth
+    @staticmethod
+    def depth200_credentials() -> Tuple[str, str, bool]:
+        """(client, token, is_child). Child keeps Master under Dhan's 5-socket-per-user limit."""
+        s = get_settings()
+        client, token = (s.dhan_child_client_id or "").strip(), (s.dhan_child_access_token or "").strip()
+        if client and token and not token.lower().startswith("mock"):
+            return client, token, True
+        return s.dhan_client_id, s.dhan_access_token or "", False
+
+    def depth200_wanted(self) -> Dict[str, Optional[Dict[str, Any]]]:
+        wanted: Dict[str, Optional[Dict[str, Any]]] = {k: None for k in DEPTH200_SLOTS}
+        fut = (getattr(self.futures_source, "futures", None) or {}).get("NIFTY")
+        if fut and fut.get("securityId") and fut.get("segment") == "NSE_FNO":
+            wanted["fut"] = {"segment": "NSE_FNO", "securityId": int(fut["securityId"]), "index": "NIFTY",
+                             "kind": "future", "expiry": fut.get("expiry")}
+        if self.depth200_credentials()[2]:
+            for row in option_targets("NIFTY", chain_engine.snapshot("NIFTY"), 0):
+                wanted[row["type"].lower()] = row
+        return wanted
+
+    def update_depth200(self, now_ts: Optional[float] = None) -> List[str]:
+        """Apply wanted 200-depth targets; a changed strike must hold DEPTH200_SWITCH_SECONDS first.
+
+        Returns the slots whose target changed (their socket must resubscribe)."""
+        now_ts = time.time() if now_ts is None else now_ts
+        changed = []
+        for slot, row in self.depth200_wanted().items():
+            cur = self.d200.get(slot)
+            ident = (row["segment"], int(row["securityId"])) if row else None
+            cur_ident = (cur["segment"], int(cur["securityId"])) if cur else None
+            if ident == cur_ident or row is None:
+                self.d200_pending.pop(slot, None)
+                continue
+            if cur is not None:
+                pend = self.d200_pending.get(slot)
+                if not pend or pend[0] != ident:
+                    self.d200_pending[slot] = (ident, now_ts)
+                    continue
+                if now_ts - pend[1] < DEPTH200_SWITCH_SECONDS:
+                    continue
+            self.d200_pending.pop(slot, None)
+            self.d200[slot] = row
+            self._append_jsonl("instruments.jsonl", {"at": now_ts, "stream": "depth200", "slot": slot, **row})
+            changed.append(slot)
+        return changed
+
     # ----------------------------------------------------- lifecycle
     async def start(self) -> None:
         if self._running:
@@ -343,6 +409,8 @@ class MicrostructureRecorder:
         self._tasks = [asyncio.create_task(self._supervise(), name="micro-supervisor"),
                        asyncio.create_task(self._connection("feed"), name="micro-feed"),
                        asyncio.create_task(self._connection("depth20"), name="micro-depth20")]
+        self._tasks += [asyncio.create_task(self._depth200(slot), name=f"micro-depth200-{slot}")
+                        for slot in DEPTH200_SLOTS]
         logger.info("Microstructure recorder started (%s)", self.dir)
 
     async def stop(self) -> None:
@@ -379,6 +447,10 @@ class MicrostructureRecorder:
                             for msg in self.subscribe_messages(stream, fresh):
                                 await ws.send(msg)
                             self.sent[stream].update((r["segment"], r["securityId"]) for r in fresh)
+                    for slot in self.update_depth200():
+                        ws = self.d200_ws.get(slot)
+                        if ws is not None:
+                            await ws.close()
                 due = [w for w in self.writers.values() if w.due()]
                 for writer in due:
                     await asyncio.to_thread(writer.write, writer.take())
@@ -437,6 +509,44 @@ class MicrostructureRecorder:
             await asyncio.sleep(delay)
             delay = min(delay * 2, 120.0)
 
+    async def _depth200(self, slot: str) -> None:
+        """One 200-level socket per slot; reconnects when the slot's (debounced) target changes."""
+        from ..algo import now_ist
+        delay = 2.0
+        while self._running:
+            row = self.d200.get(slot)
+            if row is None or not self.active(now_ist()):
+                await asyncio.sleep(5.0)
+                continue
+            client, token, is_child = self.depth200_credentials()
+            try:
+                async with ws_connect(DEPTH200_URL.format(token=token, client=client),
+                                      ping_interval=15, ping_timeout=20, max_size=2 ** 22) as ws:
+                    self.d200_ws[slot] = ws
+                    await ws.send(self.subscribe_messages("depth200", [row])[0])
+                    self.d200_connected[slot], self.d200_errors[slot] = True, None
+                    self.event({"event": "connected", "stream": "depth200", "slot": slot,
+                                "securityId": row["securityId"], "account": "child" if is_child else "master"})
+                    logger.info("Microstructure depth200 %s connected (%s)", slot, row["securityId"])
+                    async for message in ws:
+                        if isinstance(message, (bytes, bytearray)):
+                            self.record("depth200", bytes(message))
+                            delay = 2.0
+                        if self.d200.get(slot) is not row or not self.active(now_ist()):
+                            break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - research recorder must never disturb trading
+                self.d200_errors[slot] = f"{type(exc).__name__}: {exc}"[:300]
+                self.event({"event": "error", "stream": "depth200", "slot": slot, "error": self.d200_errors[slot]})
+                logger.warning("Microstructure depth200 %s error (%s); retry in %.0fs", slot, exc, delay)
+            finally:
+                self.d200_ws.pop(slot, None)
+                self.d200_connected[slot] = False
+            if self.d200.get(slot) is row:          # same target: dropped/closed by Dhan -> back off
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 120.0)
+
     def status(self) -> Dict[str, Any]:
         return {
             "day": self.day,
@@ -446,4 +556,7 @@ class MicrostructureRecorder:
             "instruments": {s: len(v) for s, v in self.known.items()},
             "records": {s: w.records for s, w in self.writers.items()},
             "rawBytes": {s: w.bytes_raw for s, w in self.writers.items()},
+            "depth200": {slot: {"securityId": (row or {}).get("securityId"), "strike": (row or {}).get("strike"),
+                                "connected": self.d200_connected.get(slot, False),
+                                "error": self.d200_errors.get(slot)} for slot, row in self.d200.items()},
         }
