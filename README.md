@@ -429,7 +429,7 @@ reconcile and exit code; only the signal, levels and exits below differ.
 | Target at OI wall (`oi_wall_target`) | **OFF** | OFF = target is always 2R (full exit). |
 | Data SL, T1 70% booking, stop after 1st SL | **OFF** | Settings checkboxes; code kept. |
 | Daily trade limit (`trade_limit` / `max_trades`) | **OFF** (2) | OFF = no daily cap; still one trade at a time. |
-| Hold-time rule (`max_hold_minutes`) | **0 = OFF** | e.g. 20 = exit if target not hit in 20 min. |
+| Hold-time rule (`max_hold_minutes`) | default 0 = OFF; **live 15** | exit (`HOLD_<N>M`) if target/stop not hit in N min. |
 | 0.75% capital SL cap | OFF | `capital_sl_cap` / `max_stop_loss_pct`. |
 | 5-min report | 5 | `status_report_minutes`; 0 = off. |
 
@@ -503,7 +503,7 @@ The 24-feature v5 score stays selectable (`score_model: "v5"`). Missing data ear
 | 2 | **Software-only stop:** the app checks live index-spot ticks and sends a MARKET exit when the candle stop is hit. Algo 2 does not submit a broker protective SL order because Dhan converted its SL-M SELL into an immediately marketable LIMIT order. This stop depends on the app and live feed running; it cannot protect the position during an app/feed outage. |
 | 3 | **Target = 2R** (2 × candle stop distance on spot) → full exit; **1R on expiry day** (`target_r` / `expiry_target_r`). Optional (OFF): OI-wall target, 70% partial booking with stop → cost and VWAP / T2 trail. |
 | 4 | Data SL (OFF by default): same-side OI velocity > 0 and ≥ 10 pp ahead of the other side (OI trap) → exit. |
-| 5 | Hold-time rule (OFF by default, `max_hold_minutes`): target not reached in N min → exit. |
+| 5 | Hold-time rule (`max_hold_minutes`, **live = 15** since 27-Nov-2026): target/stop not reached in N min → MARKET exit, reason `HOLD_<N>M`; the next breakout can then be taken. 7-day Rule G backtest: 15 min +₹12,544 (71 trades) vs no limit +₹18,007 (28), but ex-19-Nov +₹9,023 vs +₹6,059. |
 | 6 | **15:15 time exit** if neither SL nor target hit (before Dhan's ~15:18 INTRADAY auto square-off). |
 | 7 | Optional ₹ profit / loss exits (`profit_target_rs`, `stop_loss_rs`). |
 

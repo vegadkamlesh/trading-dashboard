@@ -410,11 +410,14 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("P/L: +Rs 1,300", exit_alert)
         self.assertIn("Today total P/L: +Rs 1,800 (2 trades)", exit_alert)
 
-    async def test_twenty_minute_rule_exits_when_t1_not_hit(self):
-        self.engine.cfg.max_hold_minutes = 20
-        self.engine._position = self.position(entry_confirmed_ts=time.time() - 20 * 60 - 1, spot=23510.0)
+    async def test_hold_rule_exits_when_t1_not_hit(self):
+        self.engine.cfg.max_hold_minutes = 15
+        self.engine._position = self.position(entry_confirmed_ts=time.time() - 14 * 60, spot=23510.0)
         await self.engine._manage_position()
-        self.assertEqual(self.engine._today_trades[-1]["exitReason"], "STAGNANT_20M")
+        self.assertIsNotNone(self.engine._position)
+        self.engine._position.entry_confirmed_ts = time.time() - 15 * 60 - 1
+        await self.engine._manage_position()
+        self.assertEqual(self.engine._today_trades[-1]["exitReason"], "HOLD_15M")
 
     async def test_data_sl_exits_on_call_oi_trap(self):
         self.engine.cfg.data_sl = True

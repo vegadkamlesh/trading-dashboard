@@ -668,7 +668,7 @@ class Algo2Engine(AlgoEngine):
         if not pos.t1_done and self.cfg.max_hold_minutes > 0 and held_for >= self.cfg.max_hold_minutes * 60:
             self._log(f"{pos.index_key}: {self.cfg.max_hold_minutes}-minute rule - T1 not reached "
                       f"(moved {moved:+,.1f} pts) -> exit to avoid theta decay", level="warn", index=pos.index_key)
-            await self._exit_position_locked(pos, "STAGNANT_20M")
+            await self._exit_position_locked(pos, f"HOLD_{self.cfg.max_hold_minutes}M")
             return
 
         if pos.t1_done:
