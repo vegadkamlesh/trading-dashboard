@@ -512,7 +512,9 @@ Example risk: 20-pt candle × 0.7 delta × 390 qty ≈ ₹5,460.
 ### Algo 2: trade count
 
 - **No daily trade limit** by default (`trade_limit` OFF), but only **one position at a time**:
-  a new signal is taken only after the previous trade has closed.
+  a new signal is taken only after the previous trade has closed, and **not in the same minute
+  as that exit** (exit 12:36:29 → next entry from 12:37:00; a touch in the exit minute is spent).
+  Backtest 16–27 Nov: 15-min rule +₹11,438 without vs +₹3,704 with same-minute re-entry.
 - Stop-after-SL is OFF by default; when ON, a stop-loss exit (STOP, DATA_SL, broker SL,
   ₹ loss) blocks further trades that day.
 - **Priority over Algo 1** (LIVE, `priority_over_algo1`, default ON): if Algo 1 holds a LIVE

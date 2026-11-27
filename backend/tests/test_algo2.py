@@ -767,6 +767,14 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         dispatch, _ = await self.run_tick(self.v5_metrics(bar=1300.0))   # second touch of the same candle
         dispatch.assert_not_awaited()
 
+    async def test_no_entry_in_the_minute_of_the_last_exit(self):
+        self.engine._today_trades = [{"date": "2026-11-16", "exitTime": "10:07:12", "exitReason": "HOLD_15M"}]
+        dispatch, _ = await self.run_tick(self.v5_metrics())          # tick at 10:07:30, exit at 10:07:12
+        dispatch.assert_not_awaited()
+        self.engine._today_trades[0]["exitTime"] = "10:06:59"
+        dispatch, _ = await self.run_tick(self.v5_metrics(bar=1300.0))
+        dispatch.assert_awaited_once()
+
     async def test_v5_blocked_first_touch_is_not_retried(self):
         self.group.cfg.min_score = 17
         dispatch, blocked = await self.run_tick(self.v5_metrics(points=16))

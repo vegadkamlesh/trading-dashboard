@@ -1085,6 +1085,12 @@ class Algo2Group:
     def has_position(self) -> bool:
         return any(e._position is not None for e in self.items.values())
 
+    def exited_this_minute(self, now: datetime) -> bool:
+        """True while the clock is still in the minute of today's last exit (no re-entry in that minute)."""
+        today, minute = now.date().isoformat(), now.strftime("%H:%M")
+        return any(str(t.get("date") or today) == today and str(t.get("exitTime") or "")[:5] == minute
+                   for engine in self.items.values() for t in engine._today_trades)
+
     def signals_used(self, today: str) -> int:
         return self.signal_count if self.signal_day == today else 0
 
@@ -1532,7 +1538,7 @@ class Algo2Group:
         self._presubscribe(indices)
         if self._touched_day != today.isoformat():
             self._touched, self._touched_day = {}, today.isoformat()
-        busy = (self.has_position() or not self.enabled or self._dispatching
+        busy = (self.has_position() or not self.enabled or self._dispatching or self.exited_this_minute(now)
                 or self.trades_done(today.isoformat()) or bool(self.sl_hit_today(today.isoformat())))
         first_touch = v5_on and self.cfg.first_touch_only
         if busy and not first_touch:
