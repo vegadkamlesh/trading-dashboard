@@ -467,6 +467,10 @@ Config version 6 adds: no entries on the trading day before NIFTY expiry (`skip_
 Optional gate `tbs_gate` (default off): the NIFTY future's total buy qty vs total sell qty (from the
 microstructure recorder's live full-packet feed, stale after 60 s) must agree with the side — buyers > sellers for
 CALL, sellers > buyers for PUT. Missing/stale data blocks entries.
+Optional `depth200_gate` (default off): sum all 200 NIFTY future bid and ask levels and require the imbalance
+`(bid - ask) / (bid + ask)` to agree with the trade. Both gates can be enabled together. The 200-level future
+socket is shared by Master and Child; disconnected, incomplete, stale (> 60 s), empty, or wrong-future books block
+entries. This is separate from the feed's total buy/sell quantity.
 Config version 7 (default `score_model` **v7**, `min_score` **5**) keeps the v5/v6 NIFTY gates (09:45–15:00,
 India VIX, expiry-day 10:45–11:45 block, day-before-expiry skip), 15-min candle stop and 2R/1R targets, but
 scores only 7 conditions from `backend/app/algo2/score_v5.py` (`V7_POS` / `V7_NEG`), entry at **5 of 7**:
@@ -503,7 +507,7 @@ The 24-feature v5 score stays selectable (`score_model: "v5"`). Missing data ear
 | 2 | **Software-only stop:** the app checks live index-spot ticks and sends a MARKET exit when the candle stop is hit. Algo 2 does not submit a broker protective SL order because Dhan converted its SL-M SELL into an immediately marketable LIMIT order. This stop depends on the app and live feed running; it cannot protect the position during an app/feed outage. |
 | 3 | **Target = 2R** (2 × candle stop distance on spot) → full exit; **1R on expiry day** (`target_r` / `expiry_target_r`). Optional (OFF): OI-wall target, 70% partial booking with stop → cost and VWAP / T2 trail. |
 | 4 | Data SL (OFF by default): same-side OI velocity > 0 and ≥ 10 pp ahead of the other side (OI trap) → exit. |
-| 5 | Hold-time rule (`max_hold_minutes`, **live = 15** since 27-Nov-2026): target/stop not reached in N min → MARKET exit, reason `HOLD_<N>M`; the next breakout can then be taken. 7-day Rule G backtest: 15 min +₹12,544 (71 trades) vs no limit +₹18,007 (28), but ex-19-Nov +₹9,023 vs +₹6,059. |
+| 5 | Hold-time rule (`max_hold_minutes`, **live = 15** since 27-Nov-2026): target/stop not reached in N min → MARKET exit attempt, reason `HOLD_<N>M`, even if index data is stale; the next breakout can then be taken. Broker availability and fills are not guaranteed. 7-day Rule G backtest: 15 min +₹12,544 (71 trades) vs no limit +₹18,007 (28), but ex-19-Nov +₹9,023 vs +₹6,059. |
 | 6 | **15:15 time exit** if neither SL nor target hit (before Dhan's ~15:18 INTRADAY auto square-off). |
 | 7 | Optional ₹ profit / loss exits (`profit_target_rs`, `stop_loss_rs`). |
 

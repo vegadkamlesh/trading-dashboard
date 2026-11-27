@@ -218,6 +218,7 @@ class MicrostructureRecorder:
         self.errors: Dict[str, Optional[str]] = {"feed": None, "depth20": None}
         self.book: Dict[str, Tuple[float, int, int]] = {}   # index -> (at, totalBuyQty, totalSellQty) of its future
         self.d200: Dict[str, Optional[Dict[str, Any]]] = {k: None for k in DEPTH200_SLOTS}   # active target
+        self.d200_book: Dict[int, Tuple[float, int]] = {}   # side code -> (at, sum of 200 quantities)
         self.d200_pending: Dict[str, Tuple[Optional[Tuple[str, int]], float]] = {}
         self.d200_connected: Dict[str, bool] = {k: False for k in DEPTH200_SLOTS}
         self.d200_ws: Dict[str, Any] = {}
@@ -267,6 +268,7 @@ class MicrostructureRecorder:
         self.known = {"feed": {}, "depth20": {}}
         self.sent = {"feed": set(), "depth20": set()}
         self.d200 = {k: None for k in DEPTH200_SLOTS}
+        self.d200_book.clear()
         self.d200_pending = {}
 
     def note_book(self, msg: bytes, at: Optional[float] = None) -> None:
@@ -289,6 +291,55 @@ class MicrostructureRecorder:
         if not row or time.time() - row[0] > max_age or row[1] + row[2] <= 0:
             return None
         return (row[1] - row[2]) / (row[1] + row[2])
+
+    def note_depth200(self, msg: bytes, at: Optional[float] = None) -> None:
+        """Cache full bid and ask quantities for the subscribed NIFTY future."""
+        target = self.d200.get("fut")
+        if not target:
+            return
+        packets = split_depth(msg)
+        if sum(map(len, packets)) != len(msg):
+            self.d200_book.clear()
+            logger.warning("Incomplete 200-level future depth message; entry gate blocked")
+            return
+        updates: Dict[int, Tuple[float, int]] = {}
+        timestamp = time.time() if at is None else at
+        for pkt in packets:
+            if len(pkt) < DEPTH_HDR.size:
+                self.d200_book.clear()
+                logger.warning("Incomplete 200-level future depth packet; entry gate blocked")
+                return
+            length, code, segment, sid, count = DEPTH_HDR.unpack_from(pkt)
+            if code not in (41, 51):
+                continue
+            if (sid != int(target["securityId"]) or segment != SEGMENT_ID["NSE_FNO"]
+                    or length != len(pkt) or count != 200 or length != DEPTH_HDR.size + 200 * LEVEL20.size):
+                self.d200_book.clear()
+                logger.warning("Invalid 200-level future depth packet (side=%s, sid=%s, rows=%s); entry gate blocked",
+                               code, sid, count)
+                return
+            book = parse_depth20(pkt)
+            if book is None:
+                self.d200_book.clear()
+                logger.warning("Cannot decode 200-level future depth packet; entry gate blocked")
+                return
+            updates[code] = (timestamp, sum(level["qty"] for level in book["levels"]))
+        self.d200_book.update(updates)
+
+    def depth200_imbalance(self, index_key: str, max_age: float = BOOK_MAX_AGE) -> Optional[float]:
+        """Full 200-level futures bid/ask imbalance, or None when either side is unusable."""
+        target = self.d200.get("fut")
+        current = (getattr(self.futures_source, "futures", None) or {}).get(index_key)
+        if (index_key != "NIFTY" or not target or not current or not self.d200_connected["fut"]
+                or target.get("securityId") != current.get("securityId")
+                or target.get("segment") != current.get("segment")):
+            return None
+        bid, ask = self.d200_book.get(41), self.d200_book.get(51)
+        now = time.time()
+        if not bid or not ask or not 0 <= now - bid[0] <= max_age or not 0 <= now - ask[0] <= max_age:
+            return None
+        total = bid[1] + ask[1]
+        return (bid[1] - ask[1]) / total if total > 0 else None
 
     def record(self, stream: str, msg: bytes, at: Optional[float] = None) -> None:
         writer = self.writers.get(stream)
@@ -397,6 +448,8 @@ class MicrostructureRecorder:
                     continue
             self.d200_pending.pop(slot, None)
             self.d200[slot] = row
+            if slot == "fut":
+                self.d200_book.clear()
             self._append_jsonl("instruments.jsonl", {"at": now_ts, "stream": "depth200", "slot": slot, **row})
             changed.append(slot)
         return changed
@@ -530,7 +583,10 @@ class MicrostructureRecorder:
                     logger.info("Microstructure depth200 %s connected (%s)", slot, row["securityId"])
                     async for message in ws:
                         if isinstance(message, (bytes, bytearray)):
-                            self.record("depth200", bytes(message))
+                            raw, at = bytes(message), time.time()
+                            self.record("depth200", raw, at=at)
+                            if slot == "fut" and self.d200.get(slot) is row:
+                                self.note_depth200(raw, at=at)
                             delay = 2.0
                         if self.d200.get(slot) is not row or not self.active(now_ist()):
                             break
@@ -543,6 +599,8 @@ class MicrostructureRecorder:
             finally:
                 self.d200_ws.pop(slot, None)
                 self.d200_connected[slot] = False
+                if slot == "fut":
+                    self.d200_book.clear()
             if self.d200.get(slot) is row:          # same target: dropped/closed by Dhan -> back off
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 120.0)

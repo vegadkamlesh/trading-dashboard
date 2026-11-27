@@ -153,6 +153,7 @@ class Algo2Config(AlgoConfig):
     expiry_block: str = "10:45-11:45"  # v5 gate: no entries in these windows on expiry day ("" = off)
     skip_expiry_eve: bool = True      # v6 gate: no entries on the trading day before expiry
     tbs_gate: bool = False            # gate: futures totalBuyQty vs totalSellQty must agree with the side
+    depth200_gate: bool = False       # gate: all 200 futures bid/ask levels must agree with the side
     target_r: float = 2.0             # target = target_r x stop distance
     expiry_target_r: float = 1.0      # target on expiry day
     first_touch_only: bool = True     # evaluate each 5-min candle breakout once per side (as backtested)
@@ -636,11 +637,20 @@ class Algo2Engine(AlgoEngine):
             return 0
         return min(pos.lots - 1, max(1, int(math.floor(pos.lots * self.cfg.t1_pct / 100.0 + 1e-9))))
 
+    async def _exit_on_hold_limit(self, pos: Algo2Position) -> bool:
+        held_for = time.time() - (pos.entry_confirmed_ts or pos.entry_ts)
+        if pos.t1_done or self.cfg.max_hold_minutes <= 0 or held_for < self.cfg.max_hold_minutes * 60:
+            return False
+        self._log(f"{pos.index_key}: {self.cfg.max_hold_minutes}-minute rule - T1 not reached "
+                  f"(held {held_for:.0f}s) -> market exit", level="warn", index=pos.index_key)
+        await self._exit_position_locked(pos, f"HOLD_{self.cfg.max_hold_minutes}M")
+        return True
+
     async def _manage_position(self) -> None:
         pos = self._position
         if await self._maybe_rupee_exit_locked():
             return
-        if not isinstance(pos, Algo2Position) or pos.spot is None or pos.execution_state not in {"open", "attention"}:
+        if not isinstance(pos, Algo2Position) or pos.execution_state not in {"open", "attention"}:
             return
         if pos.t1_pending:
             await self._resolve_t1(pos)
@@ -648,7 +658,8 @@ class Algo2Engine(AlgoEngine):
                 return
         inst = get_index(pos.index_key)
         age = feed.age(inst.sec_id, "IDX_I") if inst else None
-        if age is None or age > MAX_PRICE_AGE:
+        if pos.spot is None or age is None or age > MAX_PRICE_AGE:
+            await self._exit_on_hold_limit(pos)
             return
         sign = 1 if pos.option_type == "CALL" else -1
         moved = sign * (pos.spot - pos.entry_spot)
@@ -664,11 +675,7 @@ class Algo2Engine(AlgoEngine):
                 await self._exit_position_locked(pos, "DATA_SL")
                 return
 
-        held_for = time.time() - (pos.entry_confirmed_ts or pos.entry_ts)
-        if not pos.t1_done and self.cfg.max_hold_minutes > 0 and held_for >= self.cfg.max_hold_minutes * 60:
-            self._log(f"{pos.index_key}: {self.cfg.max_hold_minutes}-minute rule - T1 not reached "
-                      f"(moved {moved:+,.1f} pts) -> exit to avoid theta decay", level="warn", index=pos.index_key)
-            await self._exit_position_locked(pos, f"HOLD_{self.cfg.max_hold_minutes}M")
+        if await self._exit_on_hold_limit(pos):
             return
 
         if pos.t1_done:
@@ -850,7 +857,7 @@ def validate_algo2_config(cfg: Dict[str, Any]) -> None:
         raise HTTPException(400, "strike_mode must be 'itm' or 'atm'")
     if cfg.get("sl_candle_minutes") not in (5, 10, 15):
         raise HTTPException(400, "sl_candle_minutes must be 5, 10 or 15")
-    for name in ("first_touch_only", "atm_fallback", "skip_expiry_eve", "tbs_gate"):
+    for name in ("first_touch_only", "atm_fallback", "skip_expiry_eve", "tbs_gate", "depth200_gate"):
         if not isinstance(cfg.get(name), bool):
             raise HTTPException(400, f"{name} must be true/false")
     for name in ("target_r", "expiry_target_r"):
@@ -1315,6 +1322,8 @@ class Algo2Group:
             return "India VIX moving against"
         if key == "fut_book":
             return "futures buy/sell qty against the trade"
+        if key == "fut_depth200":
+            return "futures 200-level imbalance missing or against the trade"
         if key == "news":
             return "news freeze"
         return self._labels().get(key, key).split(" (")[0]
@@ -1776,6 +1785,7 @@ class Algo2Group:
         blocked = self.expiry_blocked(expiry, now)
         eve = self.is_expiry_eve(expiry, now.date())
         tbs = self.micro.tbs(key)
+        depth200 = self.micro.depth200_imbalance(key)
         oi_before = self.data.strike_oi_ago(key, VELOCITY_WINDOW)
         bank_now = self.data.series_value("IDX_I", BANKNIFTY_ID)
         bank_15 = self.data.series_value("IDX_I", BANKNIFTY_ID, 900)
@@ -1818,6 +1828,10 @@ class Algo2Group:
                      f"{'' if cfg.skip_expiry_eve else ' (rule off)'}"),
                 gate("fut_book", not cfg.tbs_gate or (tbs is not None and (tbs > 0 if side == "CALL" else tbs < 0)),
                      f"{'n/a' if tbs is None else f'{tbs:+.3f}'}{'' if cfg.tbs_gate else ' (rule off)'}"),
+                gate("fut_depth200", not cfg.depth200_gate or (
+                    depth200 is not None and (depth200 > 0 if side == "CALL" else depth200 < 0)),
+                     f"{'n/a' if depth200 is None else f'{depth200:+.3f}'}"
+                     f"{'' if cfg.depth200_gate else ' (rule off)'}"),
             ]
             for k in v5.model_features(model):
                 raw = feats.get(k)

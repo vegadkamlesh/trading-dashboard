@@ -42,6 +42,11 @@ CHAIN = [
 ]
 
 
+def depth200_packet(code, sid, quantities, segment=2):
+    body = b"".join(micro.LEVEL20.pack(100.0 + n, qty, 1) for n, qty in enumerate(quantities))
+    return micro.DEPTH_HDR.pack(micro.DEPTH_HDR.size + len(body), code, segment, sid, len(quantities)) + body
+
+
 class ScoreV5Tests(unittest.TestCase):
     def candles(self, day, n, start=(9, 15)):
         t0 = datetime(day.year, day.month, day.day, *start, tzinfo=v5.IST).timestamp()
@@ -319,6 +324,14 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             json.dump({"dryRun": False, "enabled": True, "configVersion": 8}, fh)
         self.assertFalse(Algo2Group(self.tmp.name).dry_run)   # operator chose LIVE after the v8 move
 
+    def test_depth200_gate_and_hold_settings_persist_for_both_accounts(self):
+        self.group.set_config({"tbs_gate": True, "depth200_gate": True, "max_hold_minutes": 15})
+        restored = Algo2Group(self.tmp.name)
+        for account in ("master", "child"):
+            restored.items[account]._restore()
+            cfg = restored.items[account].cfg
+            self.assertEqual((cfg.tbs_gate, cfg.depth200_gate, cfg.max_hold_minutes), (True, True, 15))
+
     async def test_paper_t1_partial_then_cost_stop_never_calls_broker(self):
         self.engine.cfg.partial_booking = True
         pos = self.position()
@@ -418,6 +431,16 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
         self.engine._position.entry_confirmed_ts = time.time() - 15 * 60 - 1
         await self.engine._manage_position()
         self.assertEqual(self.engine._today_trades[-1]["exitReason"], "HOLD_15M")
+
+    async def test_hold_rule_exits_even_when_index_feed_is_stale_or_missing(self):
+        self.engine.cfg.max_hold_minutes = 15
+        for spot, age in ((23510.0, engine_module.MAX_PRICE_AGE + 1), (None, None)):
+            with self.subTest(spot=spot, age=age):
+                self.engine._position = self.position(entry_confirmed_ts=time.time() - 15 * 60 - 1, spot=spot)
+                with patch.object(engine_module.feed, "age", return_value=age):
+                    await self.engine._manage_position()
+                self.assertIsNone(self.engine._position)
+                self.assertEqual(self.engine._today_trades[-1]["exitReason"], "HOLD_15M")
 
     async def test_data_sl_exits_on_call_oi_trap(self):
         self.engine.cfg.data_sl = True
@@ -861,6 +884,38 @@ class Algo2EngineTests(unittest.IsolatedAsyncioTestCase):
             m = g.compute_metrics("NIFTY", now)
         self.assertIn("fut_book", m["score"]["CALL"]["gatesFailed"])
         self.assertIn("fut_book", m["score"]["PUT"]["gatesFailed"])
+
+    async def test_tbs_and_depth200_must_both_agree_with_the_trade(self):
+        g = self.group
+        g.cfg.skip_expiry_eve, g.cfg.tbs_gate, g.cfg.depth200_gate = False, True, True
+        g.data.futures["NIFTY"] = {"securityId": 5001, "segment": "NSE_FNO"}
+        g.micro.d200["fut"] = {"securityId": 5001, "segment": "NSE_FNO", "index": "NIFTY"}
+        g.micro.d200_connected["fut"] = True
+        now = datetime(2026, 11, 16, 10, 0, 5, tzinfo=algo_module.IST)
+        with patch.object(g.data, "spot", return_value=23500.0), \
+                patch.object(g.data, "chain_rows", return_value=CHAIN), \
+                patch.object(g.data, "chain_expiry", return_value="2026-11-17"), \
+                patch.object(g.data, "futures_price", return_value=None), \
+                patch.object(g.micro, "tbs") as tbs:
+            for value, bid, ask, expected in ((0.2, 3, 1, "CALL"), (0.2, 1, 3, None),
+                                               (-0.2, 1, 3, "PUT"), (0.2, 1, 1, None),
+                                               (0.0, 3, 1, None), (None, 3, 1, None)):
+                with self.subTest(tbs=value, bid=bid, ask=ask):
+                    tbs.return_value = value
+                    g.micro.note_depth200(depth200_packet(41, 5001, [bid] * 200)
+                                          + depth200_packet(51, 5001, [ask] * 200))
+                    metrics = g.compute_metrics("NIFTY", now)
+                    for side in ("CALL", "PUT"):
+                        failed = metrics["score"][side]["gatesFailed"]
+                        self.assertEqual(not ({"fut_book", "fut_depth200"} & set(failed)), side == expected)
+            g.micro.d200_connected["fut"] = False
+            metrics = g.compute_metrics("NIFTY", now)
+            self.assertIn("fut_depth200", metrics["score"]["CALL"]["gatesFailed"])
+            self.assertIn("fut_depth200", metrics["score"]["PUT"]["gatesFailed"])
+            g.cfg.depth200_gate = False
+            metrics = g.compute_metrics("NIFTY", now)
+            self.assertNotIn("fut_depth200", metrics["score"]["CALL"]["gatesFailed"])
+            self.assertNotIn("fut_depth200", metrics["score"]["PUT"]["gatesFailed"])
 
     async def test_market_calendar_matches_start_gate_list(self):
         import importlib.util
@@ -1369,6 +1424,37 @@ class MicrostructureRecorderTests(unittest.TestCase):
         self.assertEqual([(b["side"], len(b["levels"])) for b in books], [("bid", 200), ("ask", 200)])
         self.assertEqual(books[1]["levels"][199]["qty"], 75 * 199)
 
+    def test_depth200_book_sums_all_levels_and_rejects_unusable_data(self):
+        source = MagicMock(futures={"NIFTY": {"securityId": 5001, "segment": "NSE_FNO"}})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(micro.time, "time", return_value=1000.0):
+            rec = micro.MicrostructureRecorder(tmp, source)
+            rec.d200["fut"] = {"securityId": 5001, "segment": "NSE_FNO", "index": "NIFTY"}
+            rec.d200_connected["fut"] = True
+            bid = depth200_packet(41, 5001, [1] * 199 + [201])
+            ask = depth200_packet(51, 5001, [1] * 200)
+            rec.note_depth200(bid)
+            self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+            rec.note_depth200(bid + ask)
+            self.assertAlmostEqual(rec.depth200_imbalance("NIFTY"), (400 - 200) / 600)
+            self.assertIsNone(rec.depth200_imbalance("SENSEX"))
+            with patch.object(micro.time, "time", return_value=1061.0):
+                self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+            for invalid in (depth200_packet(41, 5001, [1] * 20),
+                            depth200_packet(41, 5002, [1] * 200), bid[:-1]):
+                rec.note_depth200(bid + ask)
+                with self.assertLogs("dhan.algo2.micro", level="WARNING"):
+                    rec.note_depth200(invalid)
+                self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+            rec.note_depth200(depth200_packet(41, 5001, [0] * 200)
+                              + depth200_packet(51, 5001, [0] * 200))
+            self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+            rec.note_depth200(bid + ask)
+            rec.d200_connected["fut"] = False
+            self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+            rec.d200_connected["fut"] = True
+            source.futures["NIFTY"]["securityId"] = 5002
+            self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+
     def test_low_disk_pauses_recording_without_deleting_and_resumes(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec = micro.MicrostructureRecorder(tmp)
@@ -1391,6 +1477,40 @@ class MicrostructureRecorderTests(unittest.TestCase):
         self.assertTrue(micro.in_window(datetime(2026, 11, 16, 9, 10)))
         self.assertFalse(micro.in_window(datetime(2026, 11, 16, 15, 35)))
         self.assertFalse(micro.in_window(datetime(2026, 11, 15, 11, 0)))   # Sunday
+
+
+class MicrostructureRecorderAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_future_socket_feeds_gate_and_disconnect_clears_book(self):
+        source = MagicMock(futures={"NIFTY": {"securityId": 5001, "segment": "NSE_FNO"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = micro.MicrostructureRecorder(tmp, source)
+            rec.roll_day(datetime(2026, 11, 16, 10, 0))
+            rec.d200["fut"] = {"securityId": 5001, "segment": "NSE_FNO", "index": "NIFTY"}
+            rec._running = True
+            msg = depth200_packet(41, 5001, [3] * 200) + depth200_packet(51, 5001, [1] * 200)
+            observed = []
+
+            async def stream():
+                yield msg
+                observed.append(rec.depth200_imbalance("NIFTY"))
+                rec._running = False
+
+            ws = MagicMock()
+            ws.send = AsyncMock()
+            ws.__aiter__.side_effect = stream
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=ws)
+            context.__aexit__ = AsyncMock(return_value=False)
+            with patch.object(micro, "ws_connect", return_value=context), \
+                    patch.object(rec, "active", return_value=True), \
+                    patch.object(rec, "depth200_credentials", return_value=("child", "token", True)), \
+                    patch.object(micro.asyncio, "sleep", new_callable=AsyncMock):
+                await rec._depth200("fut")
+            self.assertEqual(observed, [0.5])
+            self.assertFalse(rec.d200_connected["fut"])
+            self.assertIsNone(rec.depth200_imbalance("NIFTY"))
+            rec.flush_all(force=True)
+            self.assertEqual([payload for _, payload in micro.read_records(rec.writers["depth200"].path)], [msg])
 
 
 if __name__ == "__main__":

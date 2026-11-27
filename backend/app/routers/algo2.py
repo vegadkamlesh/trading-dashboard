@@ -39,6 +39,7 @@ class ConfigPatch(BaseModel):
     oi_wall_target: Optional[bool] = None
     skip_expiry_eve: Optional[bool] = None
     tbs_gate: Optional[bool] = None
+    depth200_gate: Optional[bool] = None
     target_r: Optional[float] = None
     expiry_target_r: Optional[float] = None
     max_lots: Optional[int] = None
